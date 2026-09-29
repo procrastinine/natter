@@ -3,8 +3,10 @@ import type { ChatSettingsFieldPatch } from '../core/chat-metadata'
 import type { ChatId } from '../core/types'
 import { configurationApplication } from '../store/configuration-application'
 import { configurationController } from '../store/configuration-controller'
-import type { PreparedConfigurationEdit } from '../store/configuration-domain'
-import type { ConfigurationEditSession } from '../store/presentation-contracts'
+import type {
+  ConfigurationEditSession,
+  PreparedConfigurationEdit,
+} from '../store/presentation-contracts'
 import { useToastStore } from '../store/zustand/toastStore'
 
 interface SettledConfigurationEditOwner<T> {

@@ -2297,13 +2297,13 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   {
     ids: [
       'src/store/browser-workspace-replacement-runner.ts|promote|launchRequiredWorkspaceRuntimeReplacementNow|1',
-      'src/store/browser-workspace-replacement-runner.ts|promoteWhenUnblocked|launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked|1',
+      'src/store/browser-workspace-replacement-runner.ts|promote|tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle|1',
     ],
     scope: 'workspace-replacement-call-edge',
     stage: 'replacement-root-atomic-promotion-and-quiesce',
-    ownership: 'required-synchronous-or-maintenance-awaited',
+    ownership: 'synchronous-revalidation-under-generation-gate',
     bound:
-      'one typed required or event-driven maintenance replacement-root promotion per admitted replacement selection',
+      'one synchronous promotion per generation-gate acquisition; idle waits occur outside the gate without copying again',
     cleanup:
       'the exact promoted authority supplies cancellation to every replacement admission boundary',
   },
@@ -2312,6 +2312,7 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
       'src/store/browser-workspace-replacement-runner.ts|performBrowserWorkspaceReplacementLaunch|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|2',
+      'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|3',
     ],
     scope: 'workspace-replacement-call-edge',
     stage: 'replacement-admission-and-prepromotion-cleanup-state-read',
@@ -2417,18 +2418,6 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
     ownership: 'synchronous-result-captured-and-returned',
     bound: 'one promoted authority for each idle-aware replacement launch attempt',
     cleanup: 'the wrapper returns the authority directly to the replacement orchestrator',
-  },
-  {
-    ids: [
-      'src/store/workspace-runtime-control.ts|launchWorkspaceRuntimeReplacementWhenUnblockedImpl|workspaceRuntimeKernel.launchReplacementWhenUnblocked|1',
-    ],
-    scope: 'runtime-control-internal-call-edge',
-    stage: 'replacement-root-blocker-release-promotion',
-    ownership: 'total-promise-returned',
-    bound:
-      'one retained admission observer and one atomic promotion for the prepared replacement; blocker releases trigger no copy or mutation replay',
-    cleanup:
-      'promotion, runtime transition or caller cancellation removes every root, idle, state and abort listener',
   },
   {
     ids: [
@@ -2921,7 +2910,6 @@ export const LIFECYCLE_PRIMITIVE_MODULES = Object.freeze({
     'finishWorkspaceRuntimeReconciliation',
     'getWorkspaceRuntimeControlSnapshot',
     'installWorkspaceRuntimeResources',
-    'launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked',
     'launchRequiredWorkspaceRuntimeReplacementNow',
     'noteWorkspaceRuntimeGatedChange',
     'resumeWorkspaceRuntimeResources',

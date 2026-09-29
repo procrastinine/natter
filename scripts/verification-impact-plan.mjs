@@ -15,6 +15,7 @@ import {
   VERIFICATION_OBLIGATIONS,
   VERIFICATION_OPAQUE_MODULE_REFERENCE_DISPOSITIONS,
   VERIFICATION_PROOFS,
+  VERIFICATION_STATIC_PROOF_IDS,
   verificationGlobalInputPaths,
 } from './verification-obligation-manifest.mjs'
 import { VERIFICATION_SNAPSHOT_SCHEMA_VERSION } from './verification-snapshot-schema.mjs'
@@ -142,7 +143,10 @@ export function planSliceVerification(options) {
   const impactedObligations = obligations.filter(
     (obligation) =>
       changedGlobalInputs.length > 0 ||
-      obligation.impactModules.some((path) => affectedSet.has(path)),
+      obligation.impactModules.some((path) => affectedSet.has(path)) ||
+      (obligation.impactPrefixes ?? []).some((prefix) =>
+        impact.changedPaths.some((path) => path.startsWith(prefix)),
+      ),
   )
   const registeredImpactClosure = new Set([
     ...dependencyClosure(
@@ -190,6 +194,13 @@ export function planSliceVerification(options) {
   const selectedNodeProofs = selectedProofs
     .filter((proof) => proof.execution.runner === 'node')
     .map((proof) => Object.freeze({ id: proof.id, argv: proof.execution.argv }))
+    .sort((left, right) => {
+      const order = (id) => {
+        const index = VERIFICATION_STATIC_PROOF_IDS.indexOf(id)
+        return index < 0 ? VERIFICATION_STATIC_PROOF_IDS.length : index
+      }
+      return order(left.id) - order(right.id) || compareText(left.id, right.id)
+    })
   const classifiedProduction = moduleClassificationByPath(moduleInventory)
   const changedProductionPaths = impact.changedPaths.filter((path) => path.startsWith('src/'))
   const impactedDomains = uniqueSorted(

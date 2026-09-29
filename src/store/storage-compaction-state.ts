@@ -363,10 +363,6 @@ async function startStorageCompactionIntentOwnerOnce(
 ): Promise<void> {
   if (physicalMutationIntentOwnerController?.signal.aborted) await physicalMutationIntentOwnerTask
   if (controller.signal.aborted) throw storageCompactionError(controller.signal.reason)
-  await recoverStorageCompactionDebtIntents(db, { signal: controller.signal })
-  if (storageCompactionOwnerAborted(controller)) {
-    throw storageCompactionError(controller.signal.reason)
-  }
   physicalMutationIntentOwnerController = controller
   physicalMutationIntentOwnerFailure = null
   let acquired = false
@@ -856,10 +852,6 @@ function waitForStorageCompactionIntentOwnerStop(
     stopped.addEventListener('abort', stop, { once: true })
     ownershipLost?.addEventListener('abort', lose, { once: true })
   })
-}
-
-function storageCompactionOwnerAborted(controller: AbortController): boolean {
-  return controller.signal.aborted
 }
 
 function storageCompactionIntentOwnerFailure(): unknown {

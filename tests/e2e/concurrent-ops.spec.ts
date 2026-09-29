@@ -28,70 +28,90 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
-test('two tabs streaming different chats run in parallel without aborting each other', async ({
+test('an indefinitely pending network request does not block a different chat in another tab', async ({
   page,
   uiJourney,
 }) => {
-  // Tab A: create chat #1, open a slow stream.
-  await mockChatCompletions(page, {
-    delayMs: 1500,
-    body: buildSseBody([{ id: 'a', content: 'tab-a-reply' }, { finish: 'stop' }]),
+  let releaseResponse!: () => void
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve
   })
-  await createChatAndOpen(page)
-  await sendMessage(page, 'hello-A')
-  await expect(page).toHaveURL(/#\/chat\/[^/]+\/message\//u)
-  await uiJourney.start(page, createChatUiJourneyProfile(), 'parallel-tab-primary')
-  await uiJourney.intent(page, { kind: 'follow-bottom', id: 'parallel-tab-follow' })
-
-  // Tab B — second page in the SAME browser context so IndexedDB is shared
-  // (same-origin multi-tab behavior).
-  const second = await page.context().newPage()
-  await second.goto('/')
-  await mockChatCompletions(second, {
-    body: buildSseBody([{ id: 'b', content: 'tab-b-reply', finish: 'stop' }]),
+  let requestSeen!: () => void
+  const requestStarted = new Promise<void>((resolve) => {
+    requestSeen = resolve
   })
-  await second.locator('[data-role="new-chat"]').click()
-  await second.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
-  await second.locator('[data-ui="composer-input"]').fill('hello-B')
-  await second.locator('[data-ui="send"]').click()
-  await expect(
-    second
-      .locator('[data-ui="message"][data-role="assistant"]')
-      .first()
-      .locator('[data-ui="message-body"]'),
-  ).toHaveText('tab-b-reply', { timeout: 5000 })
-
-  // Tab A's slow stream finishes unperturbed — this is the real assertion:
-  // tab B's parallel activity does not interrupt tab A's in-flight request.
-  await expect(
-    page
-      .locator('[data-ui="message"][data-role="assistant"]')
-      .first()
-      .locator('[data-ui="message-body"]'),
-  ).toHaveText('tab-a-reply', { timeout: 5000 })
-
-  // The shared IndexedDB contains at least two distinct chats.
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  const chatCount = await page.evaluate(async (databaseName) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(databaseName)
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    requestSeen()
+    await responseGate
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: buildSseBody([{ id: 'a', content: 'tab-a-reply' }, { finish: 'stop' }]),
     })
-    try {
-      return await new Promise<number>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').count()
+  })
+  try {
+    await createChatAndOpen(page)
+    await sendMessage(page, 'hello-A')
+    await requestStarted
+    await expect(page).toHaveURL(/#\/chat\/[^/]+\/message\//u)
+    await uiJourney.start(page, createChatUiJourneyProfile(), 'parallel-tab-primary')
+    await uiJourney.intent(page, { kind: 'follow-bottom', id: 'parallel-tab-follow' })
+
+    // Tab B — second page in the SAME browser context so IndexedDB is shared
+    // (same-origin multi-tab behavior).
+    const second = await page.context().newPage()
+    await second.goto('/')
+    await mockChatCompletions(second, {
+      body: buildSseBody([{ id: 'b', content: 'tab-b-reply', finish: 'stop' }]),
+    })
+    await second.locator('[data-role="new-chat"]').click()
+    await second.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
+    await second.locator('[data-ui="composer-input"]').fill('hello-B')
+    await second.locator('[data-ui="send"]').click()
+    await expect(
+      second
+        .locator('[data-ui="message"][data-role="assistant"]')
+        .first()
+        .locator('[data-ui="message-body"]'),
+    ).toHaveText('tab-b-reply', { timeout: 5000 })
+
+    await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+    await expect(
+      page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]'),
+    ).not.toContainText('tab-a-reply')
+    releaseResponse()
+    await expect(
+      page
+        .locator('[data-ui="message"][data-role="assistant"]')
+        .first()
+        .locator('[data-ui="message-body"]'),
+    ).toHaveText('tab-a-reply', { timeout: 5000 })
+
+    // The shared IndexedDB contains at least two distinct chats.
+    const databaseName = await activeWorkspaceDatabaseName(page)
+    const chatCount = await page.evaluate(async (databaseName) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(databaseName)
         req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })
-    } finally {
-      db.close()
-    }
-  }, databaseName)
-  expect(chatCount).toBeGreaterThanOrEqual(2)
-  await uiJourney.checkpoint(page, 'parallel-streams-finished')
-  await second.close()
+      try {
+        return await new Promise<number>((resolve, reject) => {
+          const tx = db.transaction('chats', 'readonly')
+          const req = tx.objectStore('chats').count()
+          req.onsuccess = () => resolve(req.result)
+          req.onerror = () => reject(req.error)
+        })
+      } finally {
+        db.close()
+      }
+    }, databaseName)
+    expect(chatCount).toBeGreaterThanOrEqual(2)
+    await uiJourney.checkpoint(page, 'parallel-streams-finished')
+    await second.close()
+  } finally {
+    releaseResponse()
+  }
 })
 
 test('a send that leaves before its first receipt finishes exactly when returning by sidebar', async ({

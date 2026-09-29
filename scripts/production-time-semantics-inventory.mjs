@@ -10,6 +10,25 @@ const covered = (id, semantics, sites) =>
 
 export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
   covered(
+    'preparation-wait-observation',
+    semantics(
+      'Claim settlement and explicit cancellation own the outcome; the timer only presents the last observed preparation stage.',
+      'one tab-local generation submission',
+      'one pending claim',
+      'generation submission diagnostic',
+      'Admission, cancellation or settlement clears the timer and its owned banner.',
+      'One timer and at most one banner per pending claim; no polling or storage reads.',
+      'Preparation phases update the explanation and terminal phases dispose it.',
+      'presentation-policy',
+    ),
+    {
+      schedulers: [
+        'src/app/presentation-interactions.ts|createGenerationPreparationDiagnostic|setTimeout|GENERATION_PREPARATION_NOTICE_MS|1',
+      ],
+      durations: ['src/app/presentation-interactions.ts|GENERATION_PREPARATION_NOTICE_MS|10_000'],
+    },
+  ),
+  covered(
     'generation-admission-publication-settlement',
     semantics(
       'Workspace or new-chat configuration publications, never elapsed time, wake a captured intent; an existing-chat intent enters its authoritative transaction on the first running-workspace evaluation.',
@@ -329,6 +348,25 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
       retryLoops: [
         'src/store/generated-output-localization-capability.ts|awaitGeneratedOutputLocalizationCapabilityIdle|ForStatement|unbounded|1',
         'src/store/generated-output-localization-runtime.ts|awaitGeneratedOutputLocalizationRuntimeIdle|ForStatement|unbounded|1',
+      ],
+    },
+  ),
+  covered(
+    'replacement-readiness-revalidation',
+    semantics(
+      'Readiness is revalidated synchronously under the generation gate; a failed admission releases the gate before waiting again.',
+      'physical workspace replacement only',
+      'origin-wide generation admission during actual replacement',
+      'replacement runner and workspace runtime',
+      'Caller abort removes pending locks and readiness observers; replacement finalization releases admitted ownership.',
+      'One prepared copy and one readiness wait per replacement; no timer, replay or retained generation gate while blocked.',
+      'Generation owner release and local root or child release trigger readiness revalidation.',
+      'none',
+    ),
+    {
+      retryLoops: [
+        'src/store/locks.ts|withExclusiveGenerationLifetime|ForStatement|unbounded|1',
+        'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|ForStatement|unbounded|1',
       ],
     },
   ),

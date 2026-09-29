@@ -2376,7 +2376,11 @@ describe('durable command commit pipeline audit', () => {
     ).toEqual(['idempotence', 'tables'])
   })
 
-  it('reopens every credited table and bound cell when the shared command lifetime breaks', () => {
+  it.each([
+    'cachedFenceInsideAuthoritativeGate',
+    'tabLocalWriteAdmission',
+    'backgroundRecoveryAbortable',
+  ])('reopens credited table and bound cells when command lifetime %s breaks', (invariant) => {
     const facts = sourceFacts as {
       readonly commandLifetimeReceipt: {
         readonly commonKernel: Readonly<Record<string, boolean>>
@@ -2403,7 +2407,7 @@ describe('durable command commit pipeline audit', () => {
         commandLifetimeReceipt: {
           commonKernel: {
             ...facts.commandLifetimeReceipt.commonKernel,
-            cachedFenceInsideAuthoritativeGate: false,
+            [invariant]: false,
           },
         },
       },

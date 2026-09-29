@@ -73,6 +73,239 @@ test('consecutive regenerations finish with nineteen idle tabs on other chats', 
   await Promise.all(peers.map((peer) => peer.close()))
 })
 
+test('one tab can send while compaction waits for an unrelated local command', async ({ page }) => {
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  const requests: CapturedRequest[] = []
+  await mockChatCompletionsCapture(page, requests, [
+    'Original reply.',
+    'Independent new chat.',
+    'Independent regeneration.',
+    'Independent send.',
+  ])
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await sendAndExpectAssistant(page, 'Keep this older chat separate.', 'Original reply.')
+  const chatId = await firstChatId(page)
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const marker = `natter:storage-compaction-intent:v1:single-tab-test-${crypto.randomUUID()}`
+  await page.addInitScript(() => {
+    if (window.location.protocol === 'about:') return
+    const scope = window as typeof window & {
+      __replacementAdmissionProbe?: { reached: boolean; release(): void }
+    }
+    let release!: () => void
+    const hold = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const probe = { reached: false, release }
+    scope.__replacementAdmissionProbe = probe
+    const request = navigator.locks.request.bind(navigator.locks)
+    navigator.locks.request = ((...args: Parameters<LockManager['request']>) => {
+      const options = args[1]
+      if (
+        args[0] === 'workspace:generation-lifetime' &&
+        typeof options === 'object' &&
+        options.mode === 'exclusive' &&
+        !probe.reached
+      ) {
+        probe.reached = true
+        return hold.then(() => request(...args))
+      }
+      return request(...args)
+    }) as LockManager['request']
+  })
+  await page.evaluate(
+    ({ marker, databaseName }) => {
+      localStorage.setItem(
+        marker,
+        JSON.stringify({
+          formatVersion: 2,
+          nonce: marker,
+          exactDebt: [[databaseName, 66 * 1024 * 1024]],
+        }),
+      )
+    },
+    { marker, databaseName },
+  )
+  try {
+    await page.reload()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as typeof window & { __replacementAdmissionProbe?: { reached: boolean } })
+              .__replacementAdmissionProbe?.reached,
+        ),
+      )
+      .toBe(true)
+    await page.evaluate(
+      (chatId) =>
+        new Promise<void>((ready) => {
+          const scope = window as typeof window & { __releaseBlockedChatCommand?: () => void }
+          void navigator.locks.request(
+            `chat-meta:${chatId}`,
+            () =>
+              new Promise<void>((resolve) => {
+                scope.__releaseBlockedChatCommand = resolve
+                ready()
+              }),
+          )
+        }),
+      chatId,
+    )
+    await page.locator('[data-role="chat-title-edit"]').click()
+    await page.locator('[data-ui="chat-title-editor"]').fill('Pending older chat title')
+    await page.locator('[data-ui="chat-title-editor"]').press('Enter')
+    await expect
+      .poll(() =>
+        page.evaluate(
+          async (chatId) =>
+            (await navigator.locks.query()).pending?.some(
+              (lock) => lock.name === `chat-meta:${chatId}`,
+            ),
+          chatId,
+        ),
+      )
+      .toBe(true)
+    await page.evaluate(() => {
+      ;(
+        window as typeof window & { __replacementAdmissionProbe?: { release(): void } }
+      ).__replacementAdmissionProbe?.release()
+      window.location.hash = '#/new'
+    })
+    await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('New chat')
+    await sendAndExpectAssistant(
+      page,
+      'Send with the older command still pending.',
+      'Independent new chat.',
+    )
+    const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+    await assistant.getByRole('button', { name: 'Regenerate response', exact: true }).click()
+    await expect(assistant.locator('[data-ui="message-body"]')).toHaveText(
+      'Independent regeneration.',
+    )
+    await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
+    await sendAndExpectAssistant(
+      page,
+      'Send again before releasing the older command.',
+      'Independent send.',
+    )
+    expect(requests).toHaveLength(4)
+    expect(page.context().pages()).toHaveLength(1)
+    expect(
+      await page.evaluate(
+        async (chatId) =>
+          (await navigator.locks.query()).pending?.some(
+            (lock) => lock.name === `chat-meta:${chatId}`,
+          ),
+        chatId,
+      ),
+    ).toBe(true)
+  } finally {
+    await page.evaluate((marker) => {
+      const scope = window as typeof window & {
+        __replacementAdmissionProbe?: { release(): void }
+        __releaseBlockedChatCommand?: () => void
+      }
+      scope.__replacementAdmissionProbe?.release()
+      scope.__releaseBlockedChatCommand?.()
+      localStorage.removeItem(marker)
+    }, marker)
+  }
+  await expect.poll(() => activeWorkspaceDatabaseName(page)).not.toBe(databaseName)
+  await expect(page.locator('[data-ui="app-shell"]')).toHaveAttribute(
+    'data-workspace-runtime-state',
+    'RUNNING',
+  )
+})
+
+for (const action of ['regenerate', 'send', 'new-chat send'] as const) {
+  test(`${action} does not await compaction recovery in an unrelated new-chat tab`, async ({
+    page,
+  }) => {
+    const originalRequests: CapturedRequest[] = []
+    await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+    await mockChatCompletionsCapture(page, originalRequests, ['Original reply.'])
+    await seedFirstRun(page, {
+      model: OR_CHAT_MODEL,
+      disablePrivacyFilter: false,
+      corsProxyUrl: '/_or_scrape',
+    })
+    await sendAndExpectAssistant(page, 'Keep regeneration local to this chat.', 'Original reply.')
+    const chatUrl = page.url()
+    const databaseName = await activeWorkspaceDatabaseName(page)
+    const recoveryIntentKey = `natter:storage-compaction-intent:v1:crashed-test-${crypto.randomUUID()}`
+    const peer = await page.context().newPage()
+    await mockOpenRouterDiscovery(peer, OR_CHAT_MODEL)
+    const target = await page.context().newPage()
+    const requests: CapturedRequest[] = []
+    await mockOpenRouterDiscovery(target, OR_CHAT_MODEL)
+    await mockChatCompletionsCapture(target, requests, [
+      'Independent first reply.',
+      'Independent send.',
+      'Independent new chat.',
+    ])
+    try {
+      await peer.goto('/#/new')
+      await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText('New chat')
+      await peer.evaluate(
+        () =>
+          new Promise<void>((ready) => {
+            void navigator.locks.request(
+              'natter:coordination:storage-compaction-recovery:v1',
+              () =>
+                new Promise<void>(() => {
+                  ready()
+                }),
+            )
+          }),
+      )
+      await peer.evaluate(
+        ({ key, databaseName }) =>
+          localStorage.setItem(
+            key,
+            JSON.stringify({ formatVersion: 2, nonce: key, exactDebt: [[databaseName, 17]] }),
+          ),
+        { key: recoveryIntentKey, databaseName },
+      )
+      await target.goto(action === 'new-chat send' ? '/#/new' : chatUrl)
+      const assistant = target.locator('[data-ui="message"][data-role="assistant"]').last()
+      if (action !== 'new-chat send') await expect(assistant).toContainText('Original reply.')
+      if (action === 'regenerate') {
+        await assistant.getByRole('button', { name: 'Regenerate response', exact: true }).click()
+        await expect(assistant.locator('[data-ui="message-body"]')).toContainText(
+          'Independent first reply.',
+        )
+      } else {
+        await sendAndExpectAssistant(
+          target,
+          'First write with recovery held.',
+          'Independent first reply.',
+        )
+      }
+      await expect(
+        target.getByRole('button', { name: 'Cancel preparing', exact: true }),
+      ).toHaveCount(0)
+      await sendAndExpectAssistant(target, 'Send with the unrelated tab open.', 'Independent send.')
+      await createChatAndOpen(target)
+      await sendAndExpectAssistant(
+        target,
+        'New chat with the unrelated tab open.',
+        'Independent new chat.',
+      )
+      expect(requests).toHaveLength(3)
+      expect(await peer.evaluate(() => location.hash)).toBe('#/new')
+    } finally {
+      await peer.close()
+      await page.evaluate((key) => localStorage.removeItem(key), recoveryIntentKey)
+      await target.close()
+    }
+  })
+}
+
 test('context edits persist through regeneration, preset save, continuation and reload without stranded preparation', async ({
   page,
 }) => {
@@ -104,7 +337,9 @@ test('context edits persist through regeneration, preset save, continuation and 
 
   await openSettingsPanel(page)
   await page.getByRole('tab', { name: 'Context', exact: true }).click()
-  const contextNumber = page.locator('[data-ui="slider-number"]').first()
+  const contextNumber = page
+    .locator('[data-ui="context-routing-dependent"]:not([inert]) [data-ui="slider-number"]')
+    .first()
   await contextNumber.fill('8192')
   await contextNumber.press('Enter')
   const contextSlider = page.locator('[data-ui="slider"]').first()
@@ -148,7 +383,15 @@ test('context edits persist through regeneration, preset save, continuation and 
 
 test('cancel preparing releases a settings-blocked send and a later send uses the saved edit', async ({
   page,
+  expectRuntimeDiagnostic,
 }) => {
+  expectRuntimeDiagnostic({
+    category: 'console-other',
+    source: 'console',
+    level: 'warning',
+    message: '^\\[generation-submit\\]\\[generation-submit-\\d+\\] Preparation still pending',
+    count: 1,
+  })
   const requests: CapturedRequest[] = []
   await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
   await mockChatCompletionsCapture(page, requests, ['Original reply.', 'Retry reply.'])
@@ -163,15 +406,25 @@ test('cancel preparing releases a settings-blocked send and a later send uses th
   await page.getByRole('tab', { name: 'Context', exact: true }).click()
   const input = page.locator('[data-ui="composer-input"]')
   await input.fill('Keep this pending draft.')
+  const contextNumber = page
+    .locator('[data-ui="context-routing-dependent"]:not([inert]) [data-ui="slider-number"]')
+    .first()
+  await contextNumber.fill('8192')
+  await expect(contextNumber).toBeFocused()
+  await expect(input).toHaveValue('Keep this pending draft.')
   const releaseSettings = await holdIndexedDbStoreGate(page, ['chats'])
   try {
-    const contextNumber = page.locator('[data-ui="slider-number"]').first()
-    await contextNumber.fill('8192')
     await contextNumber.press('Enter')
     await input.press('Enter')
     const cancel = page.getByRole('button', { name: 'Cancel preparing', exact: true })
     await expect(cancel).toBeVisible()
-    await cancel.click()
+    const notice = page.locator('[data-ui="banner"][data-kind="generation-preparation"]')
+    await expect(notice).toContainText('Preparation is taking longer than expected.', {
+      timeout: 15_000,
+    })
+    await expect(notice).toContainText('Waiting for chat settings or conversation state.')
+    await notice.getByRole('button', { name: 'Cancel preparing', exact: true }).click()
+    await expect(notice).toHaveCount(0)
     await expect(cancel).toHaveCount(0)
     await expect(input).toHaveValue('Keep this pending draft.')
     expect(requests).toHaveLength(1)
@@ -1320,7 +1573,7 @@ async function openConnectionDetail(page: Page): Promise<void> {
 
 async function sendAndExpectAssistant(page: Page, prompt: string, expected: string): Promise<void> {
   const before = await page.locator('[data-ui="message"][data-role="assistant"]').count()
-  const composer = page.locator('[data-ui="composer-input"]')
+  const composer = page.locator('[data-ui="composer"]:not([inert]) [data-ui="composer-input"]')
   await composer.fill(prompt)
   await composer.press('Enter')
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').nth(before)

@@ -36,6 +36,7 @@ export type {
   ConfigurationSnapshot,
 } from './configuration-controller'
 export type { ConfigurationDiscoveryChannelStatus } from './configuration-discovery-coordinator'
+export type { PreparedConfigurationEdit } from './configuration-domain'
 export type {
   ConfigurationConnectionProbeInput,
   ConnectionProbeState,

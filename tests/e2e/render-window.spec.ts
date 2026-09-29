@@ -1,3 +1,4 @@
+import { writeFile } from 'node:fs/promises'
 import {
   appendChatCatalogFixturesThroughUi,
   configureWorkspaceThroughUi,
@@ -1000,8 +1001,10 @@ test('a folder larger than one page expands gap-free without stealing the top-fi
   await expect(folder.locator('[data-ui="folder-count"]')).toHaveText(String(folderChatCount + 1))
   await expect(folderButton).toHaveAttribute('aria-expanded', 'true')
   const movePerformance = await finishFolderMoveRecorder(page)
+  const evidencePath = testInfo.outputPath('folder-move-performance.json')
+  await writeFile(evidencePath, `${JSON.stringify(movePerformance, null, 2)}\n`)
   await testInfo.attach('folder-move-performance.json', {
-    body: Buffer.from(JSON.stringify(movePerformance)),
+    path: evidencePath,
     contentType: 'application/json',
   })
   expect(movePerformance.elapsedMs).toBeLessThan(1_000)
@@ -1075,7 +1078,7 @@ test('virtualized sidebar bottom tracks mixed folder and tag row heights', async
 
 test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow', async ({
   page,
-}) => {
+}, testInfo) => {
   await seedSidebarScrollMutationFixture(page)
   await page.goto('/')
   await page.reload()
@@ -1108,6 +1111,12 @@ test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow'
     farFolderButton,
     'aria-expanded',
   )
+  const evidencePath = testInfo.outputPath('folder-toggle-performance.json')
+  await writeFile(evidencePath, `${JSON.stringify({ expandLatency, collapseLatency }, null, 2)}\n`)
+  await testInfo.attach('folder-toggle-performance.json', {
+    path: evidencePath,
+    contentType: 'application/json',
+  })
   expect(collapseLatency).toBeLessThan(100)
   await expect(farFolderButton).toHaveAttribute('aria-expanded', 'false')
   await page.waitForTimeout(80)

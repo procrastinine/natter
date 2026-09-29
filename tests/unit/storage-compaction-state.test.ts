@@ -890,6 +890,24 @@ describe('storage compaction state', () => {
     ).toBe(0)
   })
 
+  it('admits writes without examining another tab compaction intents', async () => {
+    db = createDbForTests(`natter-compaction-independent-admission-${crypto.randomUUID()}`)
+    await db.open()
+    const key = storageCompactionRecoveryIntentKey('unrelated-tab')
+    localStorage.setItem(key, 'unrelated-intent')
+    const enumerate = vi.spyOn(localStorage, 'key').mockImplementation(() => {
+      throw new Error('UnrelatedCompactionIntentRead')
+    })
+
+    activateStorageCompactionWriteAdmission(db)
+    await expect(awaitStorageCompactionWriteAdmission()).resolves.toMatchObject({
+      databaseName: db.name,
+      commandPhysicalReads: 0,
+    })
+    expect(enumerate).not.toHaveBeenCalled()
+    expect(localStorage.getItem(key)).toBe('unrelated-intent')
+  })
+
   it('starts write admission once and makes every command await the same zero-I/O receipt', async () => {
     const currentDb = createDbForTests(`natter-compaction-admission-${crypto.randomUUID()}`)
     db = currentDb

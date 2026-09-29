@@ -153,7 +153,7 @@ export const ARCHITECTURE_PROOFS = Object.freeze([
     'concurrent-tabs-browser-tests',
     'browser-test',
     'tests/e2e/concurrent-ops.spec.ts',
-    "test('two tabs streaming different chats run in parallel without aborting each other'",
+    "test('an indefinitely pending network request does not block a different chat in another tab'",
     ['application-shell', 'conversation', 'generation', 'workspace'],
     ['behavioral-tests', 'browser-performance-tests'],
   ),

@@ -24,6 +24,44 @@ afterEach(async () => {
 
 describe('fake stream server', () => {
   it.skipIf(loopbackBindDenied)(
+    'holds terminal output after content until explicitly released',
+    async () => {
+      const server = await startServer()
+      const scenario = await putScenario(server.url, 'terminal-held', {
+        targetChars: 5,
+        reasoningChars: 0,
+        chunkChars: 5,
+        delayMs: 0,
+        holdBeforeFinish: true,
+      })
+      const response = await fetch(`${scenario.providerBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'natter/fake-stream', stream: true }),
+      })
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('Expected streaming response')
+      const first = await reader.read()
+      const content = new TextDecoder().decode(first.value)
+      expect(content).toContain('"content":"Lorem"')
+      expect(content).not.toContain('[DONE]')
+      await expect(getScenario(server.url, 'terminal-held')).resolves.toMatchObject({
+        activeStreams: 1,
+        releaseOpen: false,
+      })
+      await releaseScenario(server.url, 'terminal-held')
+      let terminal = ''
+      for (;;) {
+        const next = await reader.read()
+        if (next.done) break
+        terminal += new TextDecoder().decode(next.value)
+      }
+      expect(terminal).toContain('"finish_reason":"stop"')
+      expect(terminal).toContain('[DONE]')
+    },
+  )
+
+  it.skipIf(loopbackBindDenied)(
     'isolates bounded scenarios and streams exact reasoning and content lengths',
     async () => {
       const server = await startServer()

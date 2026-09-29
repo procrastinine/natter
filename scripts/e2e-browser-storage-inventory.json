@@ -515,15 +515,15 @@
       "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
       "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
       "siteIds": [
-        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
-        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
-        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.count::mode=readonly::store=chats::occurrence=1",
-        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
-        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Aan%20indefinitely%20pending%20network%20request%20does%20not%20block%20a%20different%20chat%20in%20another%20tab::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Aan%20indefinitely%20pending%20network%20request%20does%20not%20block%20a%20different%20chat%20in%20another%20tab::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Aan%20indefinitely%20pending%20network%20request%20does%20not%20block%20a%20different%20chat%20in%20another%20tab::operation=indexeddb.count::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Aan%20indefinitely%20pending%20network%20request%20does%20not%20block%20a%20different%20chat%20in%20another%20tab::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Aan%20indefinitely%20pending%20network%20request%20does%20not%20block%20a%20different%20chat%20in%20another%20tab::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
       ],
       "cleanupEvidence": {
         "siteIds": [
-          "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+          "tests/e2e/concurrent-ops.spec.ts::owner=test%3Aan%20indefinitely%20pending%20network%20request%20does%20not%20block%20a%20different%20chat%20in%20another%20tab::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
         ],
         "fixtureOwners": [],
         "processOwned": false
@@ -1391,6 +1391,46 @@
         "fixtureOwners": [
           "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AprofileActiveStreamReload"
         ],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "web-storage",
+        "targets": ["one uniquely named crashed-tab compaction recovery intent in localStorage"]
+      },
+      "cleanupRestoreObligation": "Remove the exact crash marker in finally; the isolated Playwright browser context owns all remaining fixture data.",
+      "publicUiCannotExpress": "A crashed tab recovery marker and a suspended recovery lock owner cannot be created deterministically through the public UI. The fixture proves unrelated-tab recovery cannot block first Send, new-chat Send or Regenerate.",
+      "siteIds": [
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=%3Cmodule%3E::operation=web-storage.setItem::mode=-::store=localStorage::occurrence=1",
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=%3Cmodule%3E::operation=web-storage.removeItem::mode=-::store=localStorage::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/advanced-generation-routing.spec.ts::owner=%3Cmodule%3E::operation=web-storage.removeItem::mode=-::store=localStorage::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "web-storage",
+        "targets": ["one uniquely named crashed-tab compaction intent in localStorage"]
+      },
+      "cleanupRestoreObligation": "Remove the exact uniquely named stale compaction intent in finally.",
+      "publicUiCannotExpress": "A simulated crashed compaction owner must request maintenance before a deliberately held unrelated local command.",
+      "siteIds": [
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=test%3Aone%20tab%20can%20send%20while%20compaction%20waits%20for%20an%20unrelated%20local%20command::operation=web-storage.setItem::mode=-::store=localStorage::occurrence=1",
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=test%3Aone%20tab%20can%20send%20while%20compaction%20waits%20for%20an%20unrelated%20local%20command::operation=web-storage.removeItem::mode=-::store=localStorage::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/advanced-generation-routing.spec.ts::owner=test%3Aone%20tab%20can%20send%20while%20compaction%20waits%20for%20an%20unrelated%20local%20command::operation=web-storage.removeItem::mode=-::store=localStorage::occurrence=1"
+        ],
+        "fixtureOwners": [],
         "processOwned": false
       }
     }

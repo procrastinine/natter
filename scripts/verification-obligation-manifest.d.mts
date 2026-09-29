@@ -26,10 +26,12 @@ export interface VerificationObligation {
   readonly id: string
   readonly status: 'covered' | 'open'
   readonly impactModules: readonly string[]
+  readonly impactPrefixes?: readonly string[]
   readonly proofIds: readonly string[]
 }
 
 export const VERIFICATION_OBLIGATION_SCHEMA_VERSION: number
+export const VERIFICATION_STATIC_PROOF_IDS: readonly string[]
 export const VERIFICATION_PROOFS: readonly VerificationProof[]
 export const VERIFICATION_OBLIGATIONS: readonly VerificationObligation[]
 export function verificationGlobalInputPaths(options?: {

@@ -29,7 +29,12 @@ interface Toast {
   actionState?: NoticeActionState<'undo'>
 }
 
-type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit' | 'stale-reasoning'
+type BannerKind =
+  | 'chat-not-found'
+  | 'mutation-conflict'
+  | 'stale-edit'
+  | 'stale-reasoning'
+  | 'generation-preparation'
 type BannerAction = () => void | boolean | Promise<void> | Promise<boolean>
 
 interface Banner {

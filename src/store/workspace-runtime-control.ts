@@ -472,14 +472,6 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
     return runtime.launchReplacementNow(kind, options, prepareReplacementQuiesce)
   }
 
-  function launchWorkspaceRuntimeReplacementWhenUnblockedImpl(
-    kind: WorkspaceReplacementRootKind,
-    options: WorkspaceRuntimeActionOptions & { readonly requireIdle: boolean },
-  ): Promise<WorkspaceReconcileAuthority | null> {
-    assertResourceManifestInstalled()
-    return runtime.launchReplacementWhenUnblocked(kind, options, prepareReplacementQuiesce)
-  }
-
   function prepareReplacementQuiesce(): void {
     capabilityCycle += 1
     quiesceMode = 'graceful'
@@ -958,8 +950,6 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
     tryBeginWorkspaceRuntimeQuiesceIfIdle: tryBeginWorkspaceRuntimeQuiesceIfIdleImpl,
     awaitWorkspaceRuntimeQuiesced: awaitWorkspaceRuntimeQuiescedImpl,
     launchWorkspaceRuntimeReplacementNow: launchWorkspaceRuntimeReplacementNowImpl,
-    launchWorkspaceRuntimeReplacementWhenUnblocked:
-      launchWorkspaceRuntimeReplacementWhenUnblockedImpl,
     beginWorkspaceRuntimeReconciliation: beginWorkspaceRuntimeReconciliationImpl,
     resumeWorkspaceRuntimeResources: resumeWorkspaceRuntimeResourcesImpl,
     noteWorkspaceRuntimeGatedChange: noteWorkspaceRuntimeGatedChangeImpl,
@@ -988,26 +978,6 @@ function createWorkspaceReplacementAdmission<const Kind extends WorkspaceReplace
   admission: WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementNow'],
 ): WorkspaceRootAdmissionCapability<
   (options?: WorkspaceReplacementAuthorityOptions<Kind>) => WorkspaceReconcileAuthority | null,
-  { readonly fixedKind: Kind }
->
-function createWorkspaceReplacementAdmission<const Kind extends WorkspaceReplacementRootKind>(
-  kind: Kind,
-  requireIdle: WorkspaceReplacementAdmissionRequiresIdle<Kind>,
-  admission: WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementWhenUnblocked'],
-): WorkspaceRootAdmissionCapability<
-  (options?: WorkspaceRuntimeActionOptions) => Promise<WorkspaceReconcileAuthority | null>,
-  { readonly fixedKind: Kind }
->
-function createWorkspaceReplacementAdmission<const Kind extends WorkspaceReplacementRootKind>(
-  kind: Kind,
-  requireIdle: WorkspaceReplacementAdmissionRequiresIdle<Kind>,
-  admission:
-    | WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementNow']
-    | WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementWhenUnblocked'],
-): WorkspaceRootAdmissionCapability<
-  (
-    options?: WorkspaceRuntimeActionOptions,
-  ) => WorkspaceReconcileAuthority | null | Promise<WorkspaceReconcileAuthority | null>,
   { readonly fixedKind: Kind }
 > {
   const fixedAdmission = (options?: WorkspaceRuntimeActionOptions) =>
@@ -1075,13 +1045,6 @@ export const tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle =
     'maintenance',
     true,
     productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
-  )
-
-export const launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked =
-  createWorkspaceReplacementAdmission(
-    'maintenance',
-    true,
-    productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementWhenUnblocked,
   )
 
 export function beginWorkspaceRuntimeReconciliation(

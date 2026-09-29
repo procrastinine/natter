@@ -258,7 +258,7 @@ async function handleControlRequest(request, response, scenarioId, action) {
       activeStreams: 0,
       requestCount: 0,
       requests: [],
-      releaseOpen: !definition.config.holdUntilReleased,
+      releaseOpen: !(definition.config.holdUntilReleased || definition.config.holdBeforeFinish),
       releaseWaiters: new Set(),
     }
     entry.config = definition.config
@@ -268,7 +268,7 @@ async function handleControlRequest(request, response, scenarioId, action) {
     entry.lastTouchedAt = now
     entry.requestCount = 0
     entry.requests = []
-    entry.releaseOpen = !definition.config.holdUntilReleased
+    entry.releaseOpen = !(definition.config.holdUntilReleased || definition.config.holdBeforeFinish)
     storedScenarioBytes = nextStoredScenarioBytes
     scenarios.set(scenarioId, entry)
     sendJson(response, existing ? 200 : 201, controlSnapshot(entry))
@@ -359,6 +359,7 @@ function parseScenarioDefinition(value) {
     'initialDelayMs',
     'delayMs',
     'holdUntilReleased',
+    'holdBeforeFinish',
     'usage',
     'responses',
   ])
@@ -367,6 +368,9 @@ function parseScenarioDefinition(value) {
   }
   if (value.holdUntilReleased !== undefined && typeof value.holdUntilReleased !== 'boolean') {
     throw new HttpError(400, 'holdUntilReleased must be a boolean')
+  }
+  if (value.holdBeforeFinish !== undefined && typeof value.holdBeforeFinish !== 'boolean') {
+    throw new HttpError(400, 'holdBeforeFinish must be a boolean')
   }
   const chunkChars = boundedInteger(
     value.chunkChars ?? options.defaults.chunkChars,
@@ -411,6 +415,7 @@ function parseScenarioDefinition(value) {
       LIMITS.delayMs,
     ),
     holdUntilReleased: value.holdUntilReleased === true,
+    holdBeforeFinish: value.holdBeforeFinish === true,
     usage: parseUsageDefinition(value.usage, targetChars, reasoningChars),
   }
   const rawResponses = value.responses ?? []
@@ -830,6 +835,10 @@ async function sendStreamingCompletion(request, response, requestId, body, confi
       delayMs: config.delayMs,
       chunkIndex,
     })
+    if (abortController.signal.aborted) return
+    if (config.holdBeforeFinish && selected.entry) {
+      await waitForScenarioRelease(selected.entry, abortController.signal)
+    }
     if (abortController.signal.aborted) return
     const finalFrame = {
       id: requestId,

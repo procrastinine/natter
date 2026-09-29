@@ -67,13 +67,14 @@ import {
   tryRunWorkspaceActionIfIdle,
   type WorkspaceReconcileAuthority,
   type WorkspaceRuntimeActionOptions,
+  waitForWorkspaceRuntimeReplacementBlockers,
   workspaceForegroundDemandInterruptionSignal,
 } from './workspace-runtime'
 import {
   awaitWorkspaceRuntimeQuiesced,
   getWorkspaceRuntimeControlSnapshot,
-  launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked,
   launchRequiredWorkspaceRuntimeReplacementNow,
+  tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle,
 } from './workspace-runtime-control'
 
 let reopenBrowserWorkspace: (() => Promise<void>) | null = null
@@ -95,7 +96,7 @@ type BrowserWorkspaceReplacementLaunchPolicy =
   | {
       readonly admission: 'if-idle'
       readonly admissionOptions: WorkspaceRuntimeActionOptions
-      readonly promoteWhenUnblocked: () => Promise<WorkspaceReconcileAuthority | null>
+      readonly promote: () => WorkspaceReconcileAuthority | null
     }
 
 interface BrowserWorkspaceReplacementPromoted<T> {
@@ -188,11 +189,8 @@ export function tryStartBrowserWorkspaceOnlineReplacementIfIdle<Prepared, T>(
         {
           admission: 'if-idle',
           admissionOptions,
-          promoteWhenUnblocked: () =>
-            launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked({
-              signal: permit.signal,
-              lineageId: permit.lineageId,
-            }),
+          promote: () =>
+            tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle({ lineageId: permit.lineageId }),
         },
         preflight,
         onlineBrowserWorkspaceReplacementWork(operation),
@@ -337,7 +335,7 @@ async function runGatedBrowserWorkspaceReplacementAttempt<T>(
     replacementEpoch: snapshot.replacementEpoch,
   })
   if (!browserWorkspaceSlotSwitchingSupported()) {
-    const authority = await awaitReplacementAuthority(policy)
+    const authority = launchReplacementAuthority(policy)
     if (!authority) return { kind: 'blocked' }
     onPromoted()
     const transition = await runUnslottedBrowserWorkspaceReplacement(
@@ -377,32 +375,40 @@ async function runGatedBrowserWorkspaceReplacementAttempt<T>(
             policy.admissionOptions.signal,
           )
         : undefined
-    return await withExclusiveGenerationLifetime(
-      async () => {
-        const authority = await awaitReplacementAuthority(policy)
-        if (!authority) {
-          await abandonUnpromotedSlottedReplacement(journal, work)
-          return { kind: 'cleanup-required' }
-        }
-        postBrowserWorkspaceSlotQuiesce(journal)
-        onPromoted()
-        const transition = await runSlottedBrowserWorkspaceReplacement(
-          selection,
-          authority,
-          journal,
-          originalWorkspace,
-          work,
-          onlinePrepared,
-        ).catch((error: unknown) => {
-          throw browserWorkspaceReplacementStageError('execution', error)
-        })
-        await transition.settleSelection().catch((error: unknown) => {
-          throw browserWorkspaceReplacementStageError('selection-settlement', error)
-        })
-        return { kind: 'promoted', transition }
-      },
-      policy.admissionOptions.signal ? { signal: policy.admissionOptions.signal } : {},
-    )
+    for (;;) {
+      await waitForWorkspaceRuntimeReplacementBlockers({
+        ...policy.admissionOptions,
+        requireIdle: policy.admission === 'if-idle',
+      })
+      if (getWorkspaceRuntimeControlSnapshot().state !== 'RUNNING') {
+        await abandonUnpromotedSlottedReplacement(journal, work)
+        return { kind: 'cleanup-required' }
+      }
+      const result = await withExclusiveGenerationLifetime(
+        async () => {
+          const authority = launchReplacementAuthority(policy)
+          if (!authority) return null
+          postBrowserWorkspaceSlotQuiesce(journal)
+          onPromoted()
+          const transition = await runSlottedBrowserWorkspaceReplacement(
+            selection,
+            authority,
+            journal,
+            originalWorkspace,
+            work,
+            onlinePrepared,
+          ).catch((error: unknown) => {
+            throw browserWorkspaceReplacementStageError('execution', error)
+          })
+          await transition.settleSelection().catch((error: unknown) => {
+            throw browserWorkspaceReplacementStageError('selection-settlement', error)
+          })
+          return { kind: 'promoted' as const, transition }
+        },
+        policy.admissionOptions.signal ? { signal: policy.admissionOptions.signal } : {},
+      )
+      if (result) return result
+    }
   } catch (error) {
     if (getWorkspaceRuntimeControlSnapshot().state === 'RUNNING') {
       try {
@@ -420,17 +426,10 @@ async function runGatedBrowserWorkspaceReplacementAttempt<T>(
 }
 
 function launchReplacementAuthority(
-  policy: Extract<BrowserWorkspaceReplacementLaunchPolicy, { readonly admission: 'required' }>,
+  policy: BrowserWorkspaceReplacementLaunchPolicy,
 ): WorkspaceReconcileAuthority | null {
   if (policy.admissionOptions.signal?.aborted) throw policy.admissionOptions.signal.reason
   return policy.promote()
-}
-
-async function awaitReplacementAuthority(
-  policy: BrowserWorkspaceReplacementLaunchPolicy,
-): Promise<WorkspaceReconcileAuthority | null> {
-  if (policy.admission === 'if-idle') return policy.promoteWhenUnblocked()
-  return launchReplacementAuthority(policy)
 }
 
 async function runUnslottedBrowserWorkspaceReplacement<T>(

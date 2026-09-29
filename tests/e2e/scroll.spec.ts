@@ -855,6 +855,7 @@ test("Save & Send from a pinned earlier message follows this tab's new streaming
     chunkChars: 2_000,
     initialDelayMs: 100,
     delayMs: 80,
+    holdBeforeFinish: true,
   })
   try {
     await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
@@ -930,6 +931,12 @@ test("Save & Send from a pinned earlier message follows this tab's new streaming
 
     await region.hover()
     const followDistance = await scrollDistanceFromBottom(region)
+    const retainedPrefix = await page.locator('[data-ui="message"]').evaluateAll((nodes) =>
+      nodes.map((node, index) => {
+        node.setAttribute('data-save-send-wheel-identity', String(index))
+        return { id: node.getAttribute('data-message-id'), identity: String(index) }
+      }),
+    )
     await page.mouse.wheel(0, -400)
     await page.mouse.wheel(0, -400)
     await page.mouse.wheel(0, -400)
@@ -937,7 +944,13 @@ test("Save & Send from a pinned earlier message follows this tab's new streaming
       .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
       .toBeGreaterThan(followDistance + 200)
     await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+    for (const row of retainedPrefix) {
+      await expect(
+        page.locator(`[data-ui="message"][data-message-id="${row.id}"]`),
+      ).toHaveAttribute('data-save-send-wheel-identity', row.identity)
+    }
     const pinnedDistance = await scrollDistanceFromBottom(region)
+    await scenario.release()
     await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
     await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
     await expect

@@ -25,6 +25,30 @@ const NODE_PROOF_FILE = 'scripts/audit-production-coordination.mjs'
 const NODE_PROOF_DEPENDENCY = 'scripts/production-coordination-inventory.mjs'
 
 describe('verification slice impact planner', () => {
+  it('selects every hosted structural audit for a production source change', () => {
+    const current = buildVerificationSnapshot()
+    const candidate = mutateFile(
+      current,
+      'src/hooks/useSettledConfigurationEdit.ts',
+      'changed-boundary',
+    )
+    const plan = planSliceVerification({ base: current, current: candidate })
+    const obligation = VERIFICATION_OBLIGATIONS.find(
+      (item) => item.id === 'production-static-contracts',
+    )
+    if (!obligation) throw new Error('ProductionStaticContractsMissing')
+    const selected = new Set(plan.tasks.node.map((task) => task.id))
+    expect(obligation.proofIds.length).toBeGreaterThan(3)
+    for (const id of obligation.proofIds) expect(selected.has(id), id).toBe(true)
+    expect([...selected]).toEqual(
+      expect.arrayContaining([
+        'presentation-store-boundary',
+        'production-time',
+        'production-time-semantics',
+      ]),
+    )
+  }, 15_000)
+
   it('turns one producer change into one batched reverse-dependent proof set', () => {
     const base = snapshot({
       files: {

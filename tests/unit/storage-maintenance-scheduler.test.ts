@@ -113,9 +113,16 @@ it('owns online replacement preparation before preflight and pauses it for foreg
       gatedAttempt.indexOf('await preflight(session)') + 1,
     ),
   ).toBeLessThan(gatedAttempt.indexOf('tryBeginBrowserWorkspaceDatabaseReplacement()'))
-  expect(gatedAttempt).toMatch(/const authority = await awaitReplacementAuthority\(policy\)/u)
+  expect(gatedAttempt).toMatch(/const authority = launchReplacementAuthority\(policy\)/u)
+  expect(
+    slottedPrepared.indexOf('await waitForWorkspaceRuntimeReplacementBlockers('),
+  ).toBeGreaterThan(-1)
+  expect(slottedPrepared.indexOf('await waitForWorkspaceRuntimeReplacementBlockers(')).toBeLessThan(
+    slottedPrepared.indexOf('withExclusiveGenerationLifetime('),
+  )
+  expect(slottedPrepared).not.toContain('awaitReplacementAuthority')
   expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
-    slottedPrepared.indexOf('await awaitReplacementAuthority(policy)'),
+    slottedPrepared.indexOf('launchReplacementAuthority(policy)'),
   )
   expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
     slottedPrepared.indexOf('postBrowserWorkspaceSlotQuiesce(journal)'),

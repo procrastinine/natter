@@ -23,6 +23,14 @@ const COUNT_BUDGET_NAME =
 const NON_ABORTABLE_DESTRUCTIVE_PHASES = new Set(['origin-storage-wipe', 'fresh-database-verify'])
 
 const TEMPORAL_INVENTORY = {
+  'preparation-wait-notice': {
+    rationale:
+      'One observational notice for a still-pending request; elapsed time never cancels work, releases authority or determines its outcome.',
+    schedulers: [
+      'src/app/presentation-interactions.ts|createGenerationPreparationDiagnostic|setTimeout|GENERATION_PREPARATION_NOTICE_MS|1',
+    ],
+    durations: ['src/app/presentation-interactions.ts|GENERATION_PREPARATION_NOTICE_MS|10_000'],
+  },
   'external-deadline-ttl': {
     rationale:
       'A remote/browser boundary, expiring cache fact, persisted retry, or recurring logical-retention deadline; elapsed time is part of the external contract, not local ordering.',
@@ -342,7 +350,10 @@ const CLOCK_INVENTORY = {
       'src/store/configuration-domain.ts|unarchiveConnection|Date.now|1',
       'src/store/configuration-domain.ts|deleteConnection|Date.now|1',
       'src/store/configuration-domain.ts|patchChatSettings|Date.now|1',
-      'src/store/configuration-domain.ts|patchChatSettingsFields|Date.now|1',
+      'src/store/configuration-domain.ts|prepareChatSettingsFields|Date.now|1',
+      'src/store/configuration-domain.ts|preparePromptText|Date.now|1',
+      'src/store/configuration-domain.ts|prepareTextTemplateConfig|Date.now|1',
+      'src/store/configuration-domain.ts|prepareGlobalPreference|Date.now|1',
       'src/store/configuration-domain.ts|replaceChatSettings|Date.now|1',
       'src/store/configuration-domain.ts|switchChatProfile|Date.now|1',
       'src/store/configuration-domain.ts|createAndLinkChatPreset|Date.now|1',
@@ -664,6 +675,8 @@ const RETRY_LOOP_INVENTORY = {
       'Coordination acquisition retries only after a durable lease check or an explicit infrastructure failure; fencing tokens and ownership-loss signals, not retry count, establish exclusivity.',
     ids: [
       'src/store/locks.ts|acquire|ForStatement|unbounded|1',
+      'src/store/locks.ts|withExclusiveGenerationLifetime|ForStatement|unbounded|1',
+      'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|ForStatement|unbounded|1',
       'src/store/storage-maintenance-runtime.ts|#runOwnershipLifecycle|WhileStatement|bounded|1',
     ],
   },
@@ -764,7 +777,10 @@ const TEMPORAL_INPUT_INVENTORY = {
       'src/store/configuration-domain.ts|unarchiveConnection|now|Date.now()|1',
       'src/store/configuration-domain.ts|deleteConnection|now|options.now ?? Date.now()|1',
       'src/store/configuration-domain.ts|patchChatSettings|now|options.now ?? Date.now()|1',
-      'src/store/configuration-domain.ts|patchChatSettingsFields|now|options.now ?? Date.now()|1',
+      'src/store/configuration-domain.ts|prepareChatSettingsFields|now|options.now ?? Date.now()|1',
+      'src/store/configuration-domain.ts|preparePromptText|now|Date.now()|1',
+      'src/store/configuration-domain.ts|prepareTextTemplateConfig|now|Date.now()|1',
+      'src/store/configuration-domain.ts|prepareGlobalPreference|now|Date.now()|1',
       'src/store/configuration-domain.ts|replaceChatSettings|now|options.now ?? Date.now()|1',
       'src/store/configuration-domain.ts|switchChatProfile|now|input.now ?? Date.now()|1',
       'src/store/configuration-model-resolution-capability.ts|drainTarget|now|Date.now()|1',

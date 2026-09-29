@@ -1,3 +1,4 @@
+import { writeFile } from 'node:fs/promises'
 import { expect, test } from './fixtures'
 import {
   buildSseBody,
@@ -132,8 +133,10 @@ test('bounds every warm existing-chat preparation phase and provider dispatch', 
     scope.__sendCriticalPathRuntimeObserver?.disconnect()
     return scope.__sendCriticalPathEvents ?? []
   })
+  const evidencePath = testInfo.outputPath('send-critical-path-events.json')
+  await writeFile(evidencePath, `${JSON.stringify(events, null, 2)}\n`)
   await testInfo.attach('send-critical-path-events.json', {
-    body: Buffer.from(JSON.stringify(events, null, 2)),
+    path: evidencePath,
     contentType: 'application/json',
   })
   const click = events.find((event) => event.kind === 'send-click')

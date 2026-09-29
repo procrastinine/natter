@@ -511,15 +511,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     )
   }, [currentUserScrollRevision, generationContinuityIntent, renderableMessageIndexById])
   useEffect(() => {
-    if (
-      !generationContinuityIntent ||
-      currentUserScrollRevision <= generationContinuityIntent.userScrollRevision
-    ) {
-      return
-    }
-    releaseGenerationContinuity(generationContinuityIntent.revision)
-  }, [currentUserScrollRevision, generationContinuityIntent, releaseGenerationContinuity])
-  useEffect(() => {
     if (generationContinuityIntent?.phase !== 'releasing') return
     const revision = generationContinuityIntent.revision
     setGenerationContinuityIntent((current) =>
@@ -660,12 +651,18 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       const messageId = node
         ?.querySelector<HTMLElement>('[data-ui="message"][data-message-id]')
         ?.getAttribute('data-message-id')
-      if (node && messageId) {
-        generationContinuityIntentRef.current?.messageIds.add(messageId)
+      const intent = generationContinuityIntentRef.current
+      if (
+        node &&
+        messageId &&
+        intent &&
+        (scrollRegionCommands?.getUserScrollRevision() ?? 0) <= intent.userScrollRevision
+      ) {
+        intent.messageIds.add(messageId)
       }
       messageVirtualizer.measureElement(node)
     },
-    [messageVirtualizer],
+    [messageVirtualizer, scrollRegionCommands],
   )
   const bindVirtualMessage = useCallback(
     (node: HTMLDivElement | null) => {

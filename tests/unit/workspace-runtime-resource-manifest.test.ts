@@ -842,13 +842,14 @@ describe('workspace runtime resource manifest', () => {
       { lineageId: 'generation:late-copy-blocker' },
     )
     let promoted = false
-    const promotion = control
-      .launchWorkspaceRuntimeReplacementWhenUnblocked('workspace-replacement', {
-        lineageId: 'foreground-import',
-        requireIdle: false,
-      })
-      .then((authority) => {
-        promoted = true
+    const promotion = runtime
+      .waitForWorkspaceRuntimeReplacementBlockers({ lineageId: 'foreground-import' })
+      .then(() => {
+        const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
+          lineageId: 'foreground-import',
+          requireIdle: false,
+        })
+        promoted = authority !== null
         return authority
       })
 
@@ -869,6 +870,49 @@ describe('workspace runtime resource manifest', () => {
     await control.awaitWorkspaceRuntimeQuiesced()
   })
 
+  it('waits for maintenance readiness without admitting replacement or blocking unrelated generation', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'workspace-maintenance-readiness', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let releaseRecovery!: () => void
+    const recoveryGate = new Promise<void>((resolve) => {
+      releaseRecovery = resolve
+    })
+    const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', async (permit) => {
+      const recovery = runtime.runWorkspaceAction('stream-recovery', () => recoveryGate)
+      let ready = false
+      const waiting = runtime
+        .waitForWorkspaceRuntimeReplacementBlockers({
+          lineageId: permit.lineageId,
+          signal: permit.signal,
+          requireIdle: true,
+        })
+        .then(() => {
+          ready = true
+        })
+      try {
+        await runtime.runWorkspaceAction('conversation-generation', () => 'sent')
+        expect(ready).toBe(false)
+        expect(runtime.getWorkspaceRuntimeState()).toBe('RUNNING')
+      } finally {
+        releaseRecovery()
+        await recovery
+      }
+      await waiting
+      expect(
+        control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+          lineageId: permit.lineageId,
+          requireIdle: true,
+        }),
+      ).not.toBeNull()
+    })
+    if (!maintenance) throw new Error('Expected maintenance admission')
+    await maintenance
+    await control.awaitWorkspaceRuntimeQuiesced()
+  })
+
   it('promotes maintenance from the settled release of one overlapping local root', async () => {
     const { control, runtime } = createRuntimeHarness()
     installNoopResourceManifest(control)
@@ -883,14 +927,18 @@ describe('workspace runtime resource manifest', () => {
 
     const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', async (permit) => {
       const localRoot = runtime.runWorkspaceAction('chat-metadata', () => localRootGate)
-      const promotion = control
-        .launchWorkspaceRuntimeReplacementWhenUnblocked('maintenance', {
+      const promotion = runtime
+        .waitForWorkspaceRuntimeReplacementBlockers({
           signal: permit.signal,
           lineageId: permit.lineageId,
           requireIdle: true,
         })
-        .then((authority) => {
-          promoted = true
+        .then(() => {
+          const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+            lineageId: permit.lineageId,
+            requireIdle: true,
+          })
+          promoted = authority !== null
           return authority
         })
 
@@ -911,35 +959,67 @@ describe('workspace runtime resource manifest', () => {
     await control.awaitWorkspaceRuntimeQuiesced()
   })
 
-  it('cancels a foreground replacement wait without touching its blocking generation', async () => {
-    const { runtime } = createRuntimeHarness()
-    const fence = { workspaceId: 'workspace-replacement-blocker-cancel', replacementEpoch: 0 }
+  it('rechecks idle admission after readiness and wakes when the last reserved child releases', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'workspace-replacement-readiness-race', replacementEpoch: 0 }
     runtime.workspaceRuntimeInternal.beginReconciliation(fence)
     runtime.workspaceRuntimeInternal.finishReconciliation(fence)
-    let releaseGeneration!: () => void
-    const generationGate = new Promise<void>((resolve) => {
-      releaseGeneration = resolve
-    })
-    let generationAborted = false
-    const generation = runtime.runWorkspaceAction('conversation-generation', async (permit) => {
-      permit.signal.addEventListener('abort', () => {
-        generationAborted = true
+    const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', async (permit) => {
+      const options = { lineageId: permit.lineageId, signal: permit.signal, requireIdle: true }
+      await runtime.waitForWorkspaceRuntimeReplacementBlockers(options)
+      const child = await runtime.runWorkspaceAction('chat-metadata', (parent) =>
+        runtime.reserveWorkspaceChild(parent, 'post-commit'),
+      )
+      expect(control.launchWorkspaceRuntimeReplacementNow('maintenance', options)).toBeNull()
+      let ready = false
+      const waiting = runtime.waitForWorkspaceRuntimeReplacementBlockers(options).then(() => {
+        ready = true
       })
-      await generationGate
+      await Promise.resolve()
+      expect(ready).toBe(false)
+      await runtime.runWorkspacePhase(child, () => undefined)
+      await waiting
+      expect(control.launchWorkspaceRuntimeReplacementNow('maintenance', options)).not.toBeNull()
     })
-    const foreground = new AbortController()
-    const reason = new Error('delete-cancelled')
-    const waiting = runtime.waitForWorkspaceRuntimeReplacementBlockers({
-      signal: foreground.signal,
-    })
-
-    foreground.abort(reason)
-    await expect(waiting).rejects.toBe(reason)
-    expect(generationAborted).toBe(false)
-
-    releaseGeneration()
-    await generation
+    if (!maintenance) throw new Error('Expected maintenance admission')
+    await maintenance
+    await control.awaitWorkspaceRuntimeQuiesced()
   })
+
+  it.each([false, true])(
+    'cancels replacement readiness with requireIdle=%s without touching its blocker',
+    async (requireIdle) => {
+      const { runtime } = createRuntimeHarness()
+      const fence = { workspaceId: 'workspace-replacement-blocker-cancel', replacementEpoch: 0 }
+      runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+      runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+      let releaseGeneration!: () => void
+      const generationGate = new Promise<void>((resolve) => {
+        releaseGeneration = resolve
+      })
+      let generationAborted = false
+      const generation = runtime.runWorkspaceAction('conversation-generation', async (permit) => {
+        permit.signal.addEventListener('abort', () => {
+          generationAborted = true
+        })
+        await generationGate
+      })
+      const foreground = new AbortController()
+      const reason = new Error('delete-cancelled')
+      const waiting = runtime.waitForWorkspaceRuntimeReplacementBlockers({
+        signal: foreground.signal,
+        requireIdle,
+      })
+
+      foreground.abort(reason)
+      await expect(waiting).rejects.toBe(reason)
+      expect(generationAborted).toBe(false)
+
+      releaseGeneration()
+      await generation
+    },
+  )
 
   it('keeps caller cancellation linked after promotion to replacement authority', () => {
     const { control, runtime } = createRuntimeHarness()

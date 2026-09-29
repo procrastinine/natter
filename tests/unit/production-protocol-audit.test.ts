@@ -117,7 +117,7 @@ describe('production workspace protocol audit', () => {
       roots: {
         variants: 16,
         exclusiveVariants: 2,
-        admissionFunctions: 7,
+        admissionFunctions: 6,
         finiteAdmissions: 113,
         unboundedAdmissions: 0,
         capabilityEscapes: 0,
@@ -157,11 +157,6 @@ describe('production workspace protocol audit', () => {
           source: 'fixed',
           allowedKinds: ['maintenance'],
         }),
-        expect.objectContaining({
-          name: 'launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked',
-          source: 'fixed',
-          allowedKinds: ['maintenance'],
-        }),
       ]),
     )
     expect(report.roots.admissions).toEqual(
@@ -173,7 +168,7 @@ describe('production workspace protocol audit', () => {
         }),
         expect.objectContaining({
           path: 'src/store/browser-workspace-replacement-runner.ts',
-          admission: 'launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked',
+          admission: 'tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle',
           kinds: ['maintenance'],
         }),
       ]),

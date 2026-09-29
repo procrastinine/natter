@@ -136,6 +136,7 @@ import {
   type ConversationMutationSettlement,
   conversationMutationInteraction,
   conversationMutationTarget,
+  createGenerationPreparationDiagnostic,
   type GenerationSubmitIntent,
   generationSubmitDiagnosticTarget,
   generationSubmitInteraction,
@@ -143,7 +144,7 @@ import {
   reportConversationMutationFailure,
   reportConversationMutationPhase,
   reportGenerationSubmissionFailure,
-  reportGenerationSubmissionPhase,
+  type reportGenerationSubmissionPhase,
 } from './presentation-interactions'
 import {
   beginRouteIntent,
@@ -932,6 +933,10 @@ export function Shell() {
       })
       const diagnosticStartedAt = performance.now()
       let diagnosticPreviousAt = diagnosticStartedAt
+      const preparationDiagnostic = createGenerationPreparationDiagnostic((claimId) => {
+        const current = generationSubmissionClaimsRef.current.get(target)
+        if (current?.id === claimId) current.cancel()
+      })
       const reportPhase = (
         claimId: number,
         phase: Parameters<typeof reportGenerationSubmissionPhase>[0]['phase'],
@@ -941,7 +946,7 @@ export function Shell() {
         > = {},
       ) => {
         const now = performance.now()
-        reportGenerationSubmissionPhase({
+        preparationDiagnostic.phase({
           claimId,
           target: diagnosticTarget,
           phase,

@@ -7279,6 +7279,7 @@ function configurationEntityRowCommonKernelFacts(
 function commandLifetimeReceiptFacts(program, browserRepoSource, outputProblems) {
   const lifecycleSource = exactSource(program, BROWSER_WORKSPACE_LIFECYCLE_PATH)
   const compactionSource = exactSource(program, STORAGE_COMPACTION_STATE_PATH)
+  const maintenanceSource = exactSource(program, STORAGE_MAINTENANCE_RUNTIME_PATH)
   const semanticSource = exactSource(program, SEMANTIC_OPERATION_CAPABILITY_PATH)
   const executeText = findMethod(
     browserRepoSource,
@@ -7421,10 +7422,16 @@ function commandLifetimeReceiptFacts(program, browserRepoSource, outputProblems)
       awaitAdmissionText.includes('storageCompactionWriteAdmission !== admission') &&
       awaitAdmissionText.includes('storageCompactionIntentOwnerFailure()') &&
       awaitAdmissionText.includes('!physicalMutationIntentOwnerController'),
-    recoveryAbortable:
-      startOwnerText.includes(
-        'recoverStorageCompactionDebtIntents(db, { signal: controller.signal })',
-      ) &&
+    tabLocalWriteAdmission:
+      !startOwnerText.includes('recoverStorageCompactionDebtIntents(') &&
+      !startOwnerText.includes('localStorage') &&
+      startOwnerText.includes('storageCompactionIntentOwnerResourceName(physicalMutationTabId)'),
+    backgroundRecoveryAbortable:
+      findClass(maintenanceSource, 'StorageMaintenanceController')
+        .getText(maintenanceSource)
+        .includes(
+          'recoverStorageCompactionDebtIntents(database, { signal: this.#ownerSignal() })',
+        ) &&
       countOccurrences(recoverText, 'options.signal?.aborted') >= 4 &&
       recoverText.includes('...(options.signal ? { signal: options.signal } : {})'),
   })

@@ -12,6 +12,7 @@ export interface FakeStreamScenarioConfig {
   initialDelayMs?: number
   delayMs?: number
   holdUntilReleased?: boolean
+  holdBeforeFinish?: boolean
   usage?: {
     promptTokens?: number
     completionTokens?: number

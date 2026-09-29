@@ -3,11 +3,13 @@ import { relative, resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   conversationMutationTarget,
+  createGenerationPreparationDiagnostic,
   generationSubmitTarget,
   reportConversationMutationFailure,
   reportGenerationSubmissionFailure,
   reportGenerationSubmissionPhase,
 } from '../../src/app/presentation-interactions'
+import { useToastStore } from '../../src/store/zustand/toastStore'
 
 const SRC_ROOT = resolve(__dirname, '../../src')
 
@@ -718,6 +720,65 @@ describe('generation request path audit', () => {
       info.mockRestore()
     }
   })
+
+  it('reports a stalled preparation without cancelling it and removes its notice on settlement', async () => {
+    vi.useFakeTimers()
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    useToastStore.getState().reset()
+    try {
+      const cancel = vi.fn()
+      const diagnostic = createGenerationPreparationDiagnostic(cancel)
+      const request = { claimId: 47, target: 'chat:older:generation' }
+      diagnostic.phase({ ...request, phase: 'workspace-requested' })
+      vi.advanceTimersByTime(9_999)
+      expect(useToastStore.getState().banners).toHaveLength(0)
+      vi.advanceTimersByTime(1)
+      expect(cancel).not.toHaveBeenCalled()
+      expect(warn).toHaveBeenCalledWith(
+        '[generation-submit][generation-submit-47] Preparation still pending',
+        { phase: 'workspace-requested' },
+      )
+      expect(useToastStore.getState().banners[0]?.text).toContain('Waiting for storage access.')
+      diagnostic.phase({ ...request, phase: 'repository-requested' })
+      const banners = useToastStore.getState().banners
+      expect(banners).toHaveLength(1)
+      expect(banners[0]?.text).toContain('Saving the message before sending.')
+      await banners[0]?.primary?.action()
+      expect(cancel).toHaveBeenCalledExactlyOnceWith(47)
+      diagnostic.phase({ ...request, phase: 'settled', outcome: 'cancelled' })
+      expect(useToastStore.getState().banners).toHaveLength(0)
+      expect(vi.getTimerCount()).toBe(0)
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      useToastStore.getState().reset()
+      info.mockRestore()
+      warn.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['admitted', 'settled', 'cancelling'] as const)(
+    'clears preparation observation at %s without a stale warning',
+    (phase) => {
+      vi.useFakeTimers()
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        const diagnostic = createGenerationPreparationDiagnostic(vi.fn())
+        const request = { claimId: 48, target: 'new-chat' }
+        diagnostic.phase({ ...request, phase: 'workspace-requested' })
+        diagnostic.phase({ ...request, phase })
+        vi.advanceTimersByTime(60_000)
+        expect(warn).not.toHaveBeenCalled()
+        expect(vi.getTimerCount()).toBe(0)
+      } finally {
+        info.mockRestore()
+        warn.mockRestore()
+        vi.useRealTimers()
+      }
+    },
+  )
 
   it('keeps saved template sources in point-addressed rows outside compatibility envelopes', () => {
     const allowedLegacySetting = new Set([

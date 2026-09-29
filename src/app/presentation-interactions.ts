@@ -163,6 +163,72 @@ export function reportGenerationSubmissionPhase(input: {
   )
 }
 
+const GENERATION_PREPARATION_NOTICE_MS = 10_000
+
+export function createGenerationPreparationDiagnostic(cancel: (claimId: number) => void): {
+  phase(input: Parameters<typeof reportGenerationSubmissionPhase>[0]): void
+} {
+  let latest: Parameters<typeof reportGenerationSubmissionPhase>[0] | undefined
+  let bannerId: string | undefined
+  let stalled = false
+  let finished = false
+  const dismiss = () => {
+    if (bannerId) useToastStore.getState().dismissBanner(bannerId)
+    bannerId = undefined
+  }
+  const describeWait = () => {
+    switch (latest?.phase) {
+      case 'workspace-requested':
+        return 'Waiting for storage access.'
+      case 'workspace-admitted':
+      case 'ownership-requested':
+        return 'Waiting to start this reply.'
+      case 'repository-requested':
+      case 'local-applied':
+        return 'Saving the message before sending.'
+      case undefined:
+      case 'claimed':
+      case 'admitted':
+      case 'settled':
+      case 'waiting':
+      case 'cancelling':
+        return 'Waiting for chat settings or conversation state.'
+    }
+  }
+  const present = () => {
+    if (!latest) return
+    dismiss()
+    const claimId = latest.claimId
+    const diagnosticId = `generation-submit-${latest.claimId}`
+    bannerId = useToastStore.getState().pushBanner({
+      kind: 'generation-preparation',
+      text: `Preparation is taking longer than expected. ${describeWait()} You can cancel and retry. Reference: ${diagnosticId}.`,
+      primary: { label: 'Cancel preparing', action: () => cancel(claimId) },
+    })
+  }
+  const timer = setTimeout(() => {
+    if (finished || !latest) return
+    stalled = true
+    console.warn(
+      `[generation-submit][generation-submit-${latest.claimId}] Preparation still pending`,
+      { phase: latest.phase, ...(latest.owner ? { owner: latest.owner } : {}) },
+    )
+    present()
+  }, GENERATION_PREPARATION_NOTICE_MS)
+  return {
+    phase(input) {
+      reportGenerationSubmissionPhase(input)
+      if (finished) return
+      latest = input
+      if (input.phase === 'admitted' || input.phase === 'settled' || input.phase === 'cancelling') {
+        finished = true
+        clearTimeout(timer)
+        dismiss()
+      } else if (stalled) present()
+    },
+  }
+}
+
 export function reportConversationMutationPhase(input: {
   readonly claimId: number
   readonly target: string

@@ -1,4 +1,5 @@
 import { PROTOCOL_CONTRACT_STAGE } from './protocol-contract-descriptor.mjs'
+import { VERIFICATION_STAGES } from './run-verification.mjs'
 import { PUBLICATION_CONSUMER_FILES } from './tab-cross-tab-locality-inventory.mjs'
 import { DECLARED_TEST_DOMAINS } from './test-evidence-manifest.mjs'
 import {
@@ -8,7 +9,7 @@ import {
 
 export const VERIFICATION_OBLIGATION_SCHEMA_VERSION = 2
 
-export const VERIFICATION_PROOFS = Object.freeze([
+const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   proof('workspace-runtime-resources', 'unit', {
     runner: 'vitest',
     files: ['tests/unit/workspace-runtime-resource-manifest.test.ts'],
@@ -286,7 +287,36 @@ export const VERIFICATION_PROOFS = Object.freeze([
   }),
 ])
 
+const staticStages = VERIFICATION_STAGES.filter(
+  (stage) => stage.argv[0] === 'node' && stage.argv[1]?.startsWith('scripts/audit-'),
+)
+const sameNodeExecution = (proof, stage) =>
+  proof.execution.runner === 'node' &&
+  JSON.stringify(proof.execution.argv) === JSON.stringify(stage.argv.slice(1))
+export const VERIFICATION_PROOFS = Object.freeze([
+  ...EXPLICIT_VERIFICATION_PROOFS,
+  ...staticStages
+    .filter(
+      (stage) => !EXPLICIT_VERIFICATION_PROOFS.some((proof) => sameNodeExecution(proof, stage)),
+    )
+    .map((stage) => proof(stage.id, 'static', { runner: 'node', argv: stage.argv.slice(1) })),
+])
+
+export const VERIFICATION_STATIC_PROOF_IDS = Object.freeze(
+  staticStages.map(
+    (stage) => VERIFICATION_PROOFS.find((proof) => sameNodeExecution(proof, stage)).id,
+  ),
+)
+
 export const VERIFICATION_OBLIGATIONS = Object.freeze([
+  Object.freeze({
+    ...obligation(
+      'production-static-contracts',
+      staticStages.map((stage) => stage.argv[1]),
+      VERIFICATION_STATIC_PROOF_IDS,
+    ),
+    impactPrefixes: Object.freeze(['src/']),
+  }),
   obligation(
     'configuration-target-presentation',
     [

@@ -998,7 +998,7 @@ export const REMOTE_LOCALITY_BROWSER_OUTCOME_MATRIX = Object.freeze([
     [
       remoteBrowserJourney(
         'tests/e2e/concurrent-ops.spec.ts',
-        "test('two tabs streaming different chats run in parallel without aborting each other'",
+        "test('an indefinitely pending network request does not block a different chat in another tab'",
       ),
       remoteBrowserJourney(
         'tests/e2e/stream-ownership-admission.spec.ts',
