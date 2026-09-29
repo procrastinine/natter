@@ -690,6 +690,7 @@ describe('storage retention', () => {
       releaseCopy = resolve
     })
     const sourceDatabaseName = getDb().name
+    const warning = vi.spyOn(console, 'warn')
     const blocker = new NatterDb(sourceDatabaseName)
     await blocker.open()
     const holdSourceCopy = blocker.transaction('rw', blocker.textTemplates, async () => {
@@ -731,6 +732,7 @@ describe('storage retention', () => {
       })
       releaseCopy()
       await holdSourceCopy
+      blocker.close()
       await expect(foreground).resolves.toMatchObject({
         kind: 'chat-preset-saved',
         preset: { id: preset.id, name: 'Caught up preset' },
@@ -762,14 +764,15 @@ describe('storage retention', () => {
           (context) => (context as typeof tablePrototype | undefined)?.name === journalName,
         ),
       ).toHaveLength(0)
+      await vi.waitFor(async () => {
+        expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
+      })
+      expect(warning).not.toHaveBeenCalled()
     } finally {
       releaseCopy()
       await holdSourceCopy.catch(() => undefined)
       blocker.close()
     }
-    await vi.waitFor(async () => {
-      expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
-    })
     closeStorageMaintenanceRuntime()
     await awaitStorageMaintenanceRuntimeIdle()
   }, 15_000)

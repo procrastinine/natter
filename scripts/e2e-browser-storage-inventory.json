@@ -845,10 +845,12 @@
         "kind": "none",
         "targets": []
       },
-      "cleanupRestoreObligation": "Observe one transaction-completion event without mutating browser storage.",
+      "cleanupRestoreObligation": "Observe exact transaction completion and abort with once-only listeners; retain transaction metadata weakly and mutate no browser storage.",
       "publicUiCannotExpress": "Exact startup transaction-completion timing is browser instrumentation and is not a public UI surface.",
       "siteIds": [
-        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AinstallStartupProbe::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=1"
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AinstallStartupProbe::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AinstallStartupProbe%3Efunction%3AobserveControlTransaction::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AinstallStartupProbe%3Efunction%3AobserveControlTransaction::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=2"
       ]
     },
     {
@@ -1429,6 +1431,45 @@
       "cleanupEvidence": {
         "siteIds": [
           "tests/e2e/advanced-generation-routing.spec.ts::owner=test%3Aone%20tab%20can%20send%20while%20compaction%20waits%20for%20an%20unrelated%20local%20command::operation=web-storage.removeItem::mode=-::store=localStorage::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "database-schema",
+        "targets": [
+          "natter-control in the isolated control-probe document",
+          "manifests and compactionStates synthetic rows"
+        ]
+      },
+      "cleanupRestoreObligation": "Close the exact native database in finally; the isolated Playwright context tears down the synthetic database and all recorder instrumentation.",
+      "publicUiCannotExpress": "The recorder proof must sample before and after native transaction completion callbacks without launching the application or depending on incidental maintenance scheduling.",
+      "siteIds": [
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=compactionStates::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=manifests::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries%3Efunction%3Awrite::operation=indexeddb.database.transaction::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.delete::mode=<dynamic>::store=compactionStates::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.delete::mode=<dynamic>::store=compactionStates::occurrence=2",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.put::mode=<dynamic>::store=compactionStates::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.put::mode=<dynamic>::store=compactionStates::occurrence=2",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.put::mode=<dynamic>::store=manifests::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.put::mode=<dynamic>::store=manifests::occurrence=2",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.transaction.object-store::mode=<dynamic>::store=compactionStates::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.transaction.object-store::mode=<dynamic>::store=compactionStates::occurrence=2",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.transaction.object-store::mode=<dynamic>::store=compactionStates::occurrence=3",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.transaction.object-store::mode=<dynamic>::store=compactionStates::occurrence=4",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.transaction.object-store::mode=<dynamic>::store=manifests::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.transaction.object-store::mode=<dynamic>::store=manifests::occurrence=2"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/large-workspace-startup.spec.ts::owner=test%3Aforeground%20recorder%20preserves%20native%20transaction%20identity%20across%20observation%20boundaries::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1"
         ],
         "fixtureOwners": [],
         "processOwned": false

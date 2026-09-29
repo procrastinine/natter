@@ -78,6 +78,13 @@ test('foreground fork accounting distinguishes bounded replacement activation', 
       'objectStore.replacementCatchup__messageBodies.openCursor.bounded': 1,
       'objectStore.replacementCatchup__messages.openCursor.bounded': 1,
     },
+    controlMutations: [
+      controlMutation(3, 'compactionStates,manifests', 'manifests', 'put', 'workspace', {
+        activeDatabaseName: 'natter',
+        pendingPhase: 'cleanup',
+      }),
+      controlMutation(3, 'compactionStates,manifests', 'compactionStates', 'put', 'natter'),
+    ],
     settingMutations: [
       {
         method: 'put',
@@ -87,6 +94,66 @@ test('foreground fork accounting distinguishes bounded replacement activation', 
     ],
   })
   expect(() => assertForegroundFork('activated', activated)).not.toThrow()
+  const pending = foregroundForkProfileFixture({
+    idbCalls: activated.idbCalls,
+    controlMutations: activated.controlMutations.map((mutation) => ({
+      ...mutation,
+      outcome: 'pending',
+    })),
+  })
+  expect(() => assertForegroundFork('pending activation at interval end', pending)).not.toThrow()
+  const crossing = foregroundForkProfileFixture({
+    destinationDatabaseName: 'natter',
+    carriedControlMutations: activated.controlMutations,
+  })
+  expect(() => assertForegroundFork('activation issued before interval', crossing)).not.toThrow()
+  const overlapping = foregroundForkProfileFixture({
+    destinationDatabaseName: activated.destinationDatabaseName,
+    settingMutations: activated.settingMutations,
+    idbCalls: {
+      ...activated.idbCalls,
+      'database.transaction:compactionStates:readwrite': 4,
+      'objectStore.compactionStates.put.bounded': 2,
+      'objectStore.compactionStates.delete.bounded': 3,
+    },
+    controlMutations: [
+      controlMutation(0, 'compactionStates', 'compactionStates', 'put', 'natter-workspace-b'),
+      controlMutation(1, 'compactionStates', 'compactionStates', 'delete', 'natter-workspace-a'),
+      controlMutation(2, 'compactionStates', 'compactionStates', 'delete', 'natter'),
+      ...activated.controlMutations,
+      controlMutation(4, 'compactionStates', 'compactionStates', 'delete', 'natter-workspace-b'),
+    ],
+  })
+  expect(() => assertForegroundFork('accounting and cleanup overlap', overlapping)).not.toThrow()
+  expect(() =>
+    assertForegroundForkStorageOverlap('missing transaction partner', {
+      ...activated,
+      controlMutations: activated.controlMutations.slice(1),
+    }),
+  ).toThrow(/complete control mutation evidence/u)
+  expect(() =>
+    assertForegroundForkStorageOverlap('duplicate activation', {
+      ...activated,
+      idbCalls: {
+        ...activated.idbCalls,
+        'objectStore.compactionStates.put.bounded': 2,
+        'objectStore.manifests.put.bounded': 2,
+      },
+      controlMutations: [
+        ...activated.controlMutations,
+        ...activated.controlMutations.map((mutation) => ({ ...mutation, transactionId: 5 })),
+      ],
+    }),
+  ).toThrow(/activation changes active slot/u)
+  expect(() =>
+    assertForegroundForkStorageOverlap('active state deletion', {
+      ...stable,
+      idbCalls: { ...stable.idbCalls, 'objectStore.compactionStates.delete.bounded': 1 },
+      controlMutations: [
+        controlMutation(1, 'compactionStates', 'compactionStates', 'delete', 'natter-workspace-b'),
+      ],
+    }),
+  ).toThrow(/only inactive compaction state deletion/u)
   expect(() =>
     assertForegroundForkStorageOverlap('unproven activation', {
       ...stable,
@@ -99,6 +166,91 @@ test('foreground fork accounting distinguishes bounded replacement activation', 
       destinationDatabaseName: 'natter-untracked',
     }),
   ).toThrow(/known destination database/u)
+})
+
+test('foreground recorder preserves native transaction identity across observation boundaries', async ({
+  page,
+  context,
+}) => {
+  await installStartupProbe(context, { kind: 'empty' })
+  await page.route('**/control-probe', (route) =>
+    route.fulfill({
+      contentType: 'text/html',
+      body: '<!doctype html><title>Control recorder probe</title>',
+    }),
+  )
+  await page.goto('/control-probe')
+  const observations = await page.evaluate(async () => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('natter-control', 1)
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore('manifests', { keyPath: 'id' })
+        request.result.createObjectStore('compactionStates', { keyPath: 'databaseName' })
+      }
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    const snapshot = () =>
+      (
+        window as typeof window & {
+          __natterStartupScaleProbe: { snapshot(): StartupProbeSnapshot }
+        }
+      ).__natterStartupScaleProbe.snapshot()
+    const write = (stores: string[], mutate: (transaction: IDBTransaction) => void) =>
+      new Promise<void>((resolve, reject) => {
+        const transaction = database.transaction(stores, 'readwrite')
+        transaction.oncomplete = () => resolve()
+        transaction.onabort = () => reject(transaction.error)
+        mutate(transaction)
+      })
+    try {
+      await write(['manifests'], (transaction) =>
+        transaction.objectStore('manifests').put({
+          id: 'workspace',
+          activeDatabaseName: 'natter-workspace-b',
+        }),
+      )
+      const before = snapshot()
+      await write(['compactionStates'], (transaction) =>
+        transaction.objectStore('compactionStates').put({
+          databaseName: 'natter-workspace-b',
+        }),
+      )
+      await write(['compactionStates'], (transaction) =>
+        transaction.objectStore('compactionStates').delete('natter-workspace-a'),
+      )
+      const activation = write(['compactionStates', 'manifests'], (transaction) => {
+        transaction.objectStore('manifests').put({
+          id: 'workspace',
+          activeDatabaseName: 'natter',
+          pending: { phase: 'cleanup' },
+        })
+        transaction.objectStore('compactionStates').put({ databaseName: 'natter' })
+      })
+      const pending = snapshot()
+      await activation
+      const committed = snapshot()
+      await write(['compactionStates'], (transaction) =>
+        transaction.objectStore('compactionStates').delete('natter-workspace-b'),
+      )
+      return { before, pending, committed, after: snapshot() }
+    } finally {
+      database.close()
+    }
+  })
+  expect(
+    observations.pending.controlMutations.filter((mutation) => mutation.outcome === 'pending'),
+  ).toHaveLength(2)
+  expect(observations.committed.activeDatabaseName).toBe('natter')
+  for (const [name, before, after] of [
+    ['whole overlap', observations.before, observations.after],
+    ['pending at interval end', observations.before, observations.pending],
+    ['pending at interval start', observations.pending, observations.committed],
+  ] as const) {
+    expect(() =>
+      assertForegroundForkStorageOverlap(name, foregroundForkStorageObservation(before, after)),
+    ).not.toThrow()
+  }
 })
 
 test('startup work and first interaction stay cardinality-bounded in a 4k-chat workspace', async ({
@@ -300,6 +452,8 @@ interface StartupMilestone {
 }
 
 interface StartupProbeSnapshot {
+  readonly activeDatabaseName: string | null
+  readonly controlMutations: readonly ControlMutation[]
   readonly milestones: {
     readonly shellCommitted: StartupMilestone
     readonly gestureDispatched: StartupMilestone
@@ -407,6 +561,17 @@ interface StartupProfile {
   readonly foregroundFork: ForegroundForkProfile
 }
 
+interface ControlMutation {
+  readonly outcome: 'pending' | 'committed' | 'aborted'
+  readonly transactionId: number
+  readonly stores: string
+  readonly store: string
+  readonly method: string
+  readonly key: string
+  readonly activeDatabaseName: string | null
+  readonly pendingPhase: string | null
+}
+
 interface ForegroundForkProfile {
   readonly sourceDatabaseName: string
   readonly destinationDatabaseName: string
@@ -419,6 +584,8 @@ interface ForegroundForkProfile {
   readonly idbRequests: number
   readonly idbCalls: Readonly<Record<string, number>>
   readonly settingMutations: readonly StartupProbeSnapshot['settingMutations'][number][]
+  readonly carriedControlMutations: readonly ControlMutation[]
+  readonly controlMutations: readonly ControlMutation[]
 }
 
 interface FreshStartupProfile {
@@ -855,6 +1022,15 @@ async function installStartupProbe(
         total += 1
       }
       const idbSnapshot = () => ({ total, calls: { ...calls } })
+      const controlTransactions = new WeakMap<
+        IDBTransaction,
+        {
+          id: number
+          mutations: { outcome: ControlMutation['outcome'] }[]
+          activeDatabaseName: string | null
+        }
+      >()
+      let controlTransactionSequence = 0
       const state = {
         milestones: {} as Record<string, { at: number; idb: ReturnType<typeof idbSnapshot> }>,
         gesture: {
@@ -872,7 +1048,37 @@ async function installStartupProbe(
         gestureAttempted: false,
         workspacePreflightOpenSuccesses: 0,
         controlManifestReads: 0,
+        activeDatabaseName: null as string | null,
+        controlMutations: [] as ControlMutation[],
         settingMutations: [] as { method: string; key: string; at: number }[],
+      }
+      const observeControlTransaction = (transaction: IDBTransaction) => {
+        const existing = controlTransactions.get(transaction)
+        if (existing) return existing
+        const observation = {
+          id: ++controlTransactionSequence,
+          mutations: [] as { outcome: ControlMutation['outcome'] }[],
+          activeDatabaseName: null as string | null,
+        }
+        controlTransactions.set(transaction, observation)
+        transaction.addEventListener(
+          'complete',
+          () => {
+            for (const mutation of observation.mutations) mutation.outcome = 'committed'
+            if (observation.activeDatabaseName !== null) {
+              state.activeDatabaseName = observation.activeDatabaseName
+            }
+          },
+          { once: true },
+        )
+        transaction.addEventListener(
+          'abort',
+          () => {
+            for (const mutation of observation.mutations) mutation.outcome = 'aborted'
+          },
+          { once: true },
+        )
+        return observation
       }
       const mark = (name: string) => {
         if (state.milestones[name]) return
@@ -918,7 +1124,17 @@ async function installStartupProbe(
         (_receiver, args) => `factory.open:${String(args[0])}`,
         (_receiver, args, result) => {
           const databaseName = String(args[0])
-          if (databaseName === controlDatabaseName) mark('databaseSelectionStarted')
+          if (databaseName === controlDatabaseName) {
+            mark('databaseSelectionStarted')
+            const request = result as IDBOpenDBRequest
+            request.addEventListener(
+              'upgradeneeded',
+              () => {
+                observeControlTransaction(request.transaction as IDBTransaction)
+              },
+              { once: true },
+            )
+          }
           if (!['natter', 'natter-workspace-a', 'natter-workspace-b'].includes(databaseName)) return
           const authoredOpen = args[1] !== undefined
           if (authoredOpen) mark('schemaPreflightCompleted')
@@ -960,6 +1176,7 @@ async function installStartupProbe(
               : Array.from((args[0] as Iterable<string> | undefined) ?? [])
           ).sort()
           const transaction = result as IDBTransaction
+          if (database.name === controlDatabaseName) observeControlTransaction(transaction)
           transaction.addEventListener(
             'complete',
             () => {
@@ -1007,6 +1224,51 @@ async function installStartupProbe(
           },
           (receiver, args, result) => {
             const store = receiver as IDBObjectStore
+            if (store.transaction.db.name === controlDatabaseName) {
+              const observation = observeControlTransaction(store.transaction)
+              const row = args[0] as Record<string, unknown> | undefined
+              if (method === 'put' || method === 'delete') {
+                const mutation = {
+                  outcome: 'pending' as ControlMutation['outcome'],
+                  transactionId: observation.id,
+                  stores: Array.from(store.transaction.objectStoreNames).sort().join(','),
+                  store: store.name,
+                  method,
+                  key: String(
+                    method === 'delete'
+                      ? args[0]
+                      : store.name === 'manifests'
+                        ? row?.id
+                        : row?.databaseName,
+                  ),
+                  activeDatabaseName:
+                    typeof row?.activeDatabaseName === 'string' ? row.activeDatabaseName : null,
+                  pendingPhase:
+                    typeof row?.pending === 'object' &&
+                    row.pending !== null &&
+                    'phase' in row.pending
+                      ? String(row.pending.phase)
+                      : null,
+                }
+                state.controlMutations.push(mutation)
+                observation.mutations.push(mutation)
+              }
+              if (store.name === 'manifests' && (method === 'get' || method === 'put')) {
+                const request = result as IDBRequest
+                request.addEventListener(
+                  'success',
+                  () => {
+                    const manifest = (method === 'get' ? request.result : row) as
+                      | { activeDatabaseName?: unknown }
+                      | undefined
+                    const databaseName = manifest?.activeDatabaseName
+                    if (typeof databaseName === 'string')
+                      observation.activeDatabaseName = databaseName
+                  },
+                  { once: true },
+                )
+              }
+            }
             if (
               store.name === 'settings' &&
               (method === 'add' || method === 'put' || method === 'delete')
@@ -1195,6 +1457,8 @@ async function installStartupProbe(
               maxDuration: Math.max(0, ...state.longTasks),
             },
             settingMutations: state.settingMutations,
+            activeDatabaseName: state.activeDatabaseName,
+            controlMutations: state.controlMutations,
             idb: idbSnapshot(),
           }) as unknown as StartupProbeSnapshot
         },
@@ -1406,7 +1670,6 @@ async function measureForegroundFork(
   await expect(target).toBeVisible({ timeout: HANG_BOUND_MS })
   const fork = target.getByRole('button', { name: 'Branch this chat from here' })
   await expect(fork).toBeEnabled({ timeout: HANG_BOUND_MS })
-  const sourceDatabaseName = await activeWorkspaceDatabaseName(page)
   const before = await startupProbeSnapshot(page)
   await page.evaluate(() => {
     const state = {
@@ -1466,21 +1729,17 @@ async function measureForegroundFork(
     }
   })
   const after = await startupProbeSnapshot(page)
-  const destinationDatabaseName = await activeWorkspaceDatabaseName(page)
   const [sourceMessages, destinationMessages] = await Promise.all([
     readMessages(page, GENERATED_WORKSPACE_ACTIVE_CHAT_ID),
     readMessages(page, destinationChatId),
   ])
   return {
-    sourceDatabaseName,
-    destinationDatabaseName,
+    ...foregroundForkStorageObservation(before, after),
     destinationChatId,
     ...heartbeat,
     sourceMessageCount: sourceMessages.length,
     destinationMessageCount: destinationMessages.length,
     idbRequests: after.idb.total - before.idb.total,
-    idbCalls: idbCallDelta(before.idb.calls, after.idb.calls),
-    settingMutations: after.settingMutations.slice(before.settingMutations.length),
   }
 }
 
@@ -1817,8 +2076,50 @@ function foregroundForkPrimaryWriteCalls(
 
 type ForegroundForkStorageOverlap = Pick<
   ForegroundForkProfile,
-  'sourceDatabaseName' | 'destinationDatabaseName' | 'idbCalls' | 'settingMutations'
+  | 'sourceDatabaseName'
+  | 'destinationDatabaseName'
+  | 'idbCalls'
+  | 'settingMutations'
+  | 'carriedControlMutations'
+  | 'controlMutations'
 >
+
+function foregroundForkStorageObservation(
+  before: StartupProbeSnapshot,
+  after: StartupProbeSnapshot,
+): ForegroundForkStorageOverlap {
+  if (before.activeDatabaseName === null) throw new Error('ForegroundForkSourceManifestMissing')
+  if (after.activeDatabaseName === null) throw new Error('ForegroundForkDestinationManifestMissing')
+  const pendingTransactionIds = new Set(
+    before.controlMutations
+      .filter((mutation) => mutation.outcome === 'pending')
+      .map((mutation) => mutation.transactionId),
+  )
+  return {
+    sourceDatabaseName: before.activeDatabaseName,
+    destinationDatabaseName: after.activeDatabaseName,
+    idbCalls: idbCallDelta(before.idb.calls, after.idb.calls),
+    settingMutations: after.settingMutations.slice(before.settingMutations.length),
+    carriedControlMutations: after.controlMutations
+      .slice(0, before.controlMutations.length)
+      .filter((mutation) => pendingTransactionIds.has(mutation.transactionId)),
+    controlMutations: after.controlMutations.slice(before.controlMutations.length),
+  }
+}
+
+function controlMutation(
+  transactionId: number,
+  stores: string,
+  store: string,
+  method: string,
+  key: string,
+  manifest: Pick<ControlMutation, 'activeDatabaseName' | 'pendingPhase'> = {
+    activeDatabaseName: null,
+    pendingPhase: null,
+  },
+): ControlMutation {
+  return { outcome: 'committed', transactionId, stores, store, method, key, ...manifest }
+}
 
 function foregroundForkProfileFixture(
   overrides: Partial<ForegroundForkProfile> = {},
@@ -1839,6 +2140,8 @@ function foregroundForkProfileFixture(
     destinationMessageCount: 87,
     idbRequests: Object.values(idbCalls).reduce((sum, count) => sum + count, 0),
     settingMutations: [],
+    controlMutations: [],
+    carriedControlMutations: [],
     ...overrides,
     idbCalls,
   }
@@ -1864,6 +2167,7 @@ function assertForegroundForkStorageOverlap(
       FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES.has(key.slice('factory.open:'.length)),
   )
   const replacementActivity =
+    profile.carriedControlMutations.length > 0 ||
     (profile.idbCalls['objectStore.compactionStates.put.bounded'] ?? 0) > 0 ||
     (profile.idbCalls['objectStore.manifests.put.bounded'] ?? 0) > 0 ||
     Object.entries(profile.idbCalls).some(
@@ -1902,23 +2206,9 @@ function assertForegroundForkStorageOverlap(
       ),
       `${name} database change only opens the activated slot`,
     ).toBe(true)
-    expect(
-      profile.idbCalls[`factory.open:${profile.destinationDatabaseName}`] ?? 0,
-      `${name} activated database open`,
-    ).toBeGreaterThan(0)
-    expect(
-      profile.idbCalls['database.transaction:compactionStates,manifests:readwrite'] ?? 0,
-      `${name} atomic manifest activation`,
-    ).toBe(1)
-    expect(
-      profile.idbCalls['objectStore.compactionStates.put.bounded'] ?? 0,
-      `${name} compaction state publication`,
-    ).toBe(1)
-    expect(
-      profile.idbCalls['objectStore.manifests.put.bounded'] ?? 0,
-      `${name} active manifest publication`,
-    ).toBe(1)
   }
+
+  assertForegroundControlMutations(name, profile)
 
   const allowedControlAccountingCalls = new Set([
     'database.transaction:compactionStates,manifests:readonly',
@@ -1927,6 +2217,7 @@ function assertForegroundForkStorageOverlap(
     'database.transaction:manifests:readonly',
     'objectStore.compactionStates.get.bounded',
     'objectStore.compactionStates.put.bounded',
+    'objectStore.compactionStates.delete.bounded',
     'objectStore.manifests.get.bounded',
     'objectStore.manifests.put.bounded',
   ])
@@ -1951,6 +2242,104 @@ function assertForegroundForkStorageOverlap(
     replacementActivity ? 1 : 0,
   )
   return replacementActivity
+}
+
+function assertForegroundControlMutations(
+  name: string,
+  profile: ForegroundForkStorageOverlap,
+): void {
+  const transactions = new Map<number, ControlMutation[]>()
+  const calls: Record<string, number> = {}
+  for (const mutation of [...profile.carriedControlMutations, ...profile.controlMutations]) {
+    const group = transactions.get(mutation.transactionId) ?? []
+    group.push(mutation)
+    transactions.set(mutation.transactionId, group)
+  }
+  for (const mutation of profile.controlMutations) {
+    const key = `objectStore.${mutation.store}.${mutation.method}.bounded`
+    calls[key] = (calls[key] ?? 0) + 1
+  }
+  expect(calls, `${name} complete control mutation evidence`).toEqual(
+    Object.fromEntries(
+      Object.entries(profile.idbCalls).filter(
+        ([key, count]) =>
+          count > 0 &&
+          /^objectStore\.(?:compactionStates|manifests)\.(?:put|delete)\.bounded$/u.test(key),
+      ),
+    ),
+  )
+  let activeDatabaseName = profile.sourceDatabaseName
+  let activations = 0
+  let committedActivations = 0
+  for (const mutations of transactions.values()) {
+    const stores = mutations[0]?.stores
+    const outcome = mutations[0]?.outcome
+    expect(new Set(mutations.map((mutation) => mutation.outcome)).size).toBe(1)
+    expect(['pending', 'committed'], `${name} successful or pending control transaction`).toContain(
+      outcome,
+    )
+    expect(new Set(mutations.map((mutation) => mutation.stores)).size).toBe(1)
+    expect(['compactionStates', 'compactionStates,manifests', 'manifests']).toContain(stores)
+    for (const mutation of mutations) {
+      expect(['put', 'delete']).toContain(mutation.method)
+      if (mutation.store === 'compactionStates') {
+        expect(
+          FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES.has(mutation.key),
+          `${name} known compaction state key`,
+        ).toBe(true)
+        if (mutation.method === 'delete') {
+          expect(mutation.key, `${name} only inactive compaction state deletion`).not.toBe(
+            activeDatabaseName,
+          )
+        }
+      } else {
+        expect(mutation.store).toBe('manifests')
+        expect(mutation.method).toBe('put')
+        expect(mutation.key).toBe('workspace')
+        expect(
+          FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES.has(mutation.activeDatabaseName ?? ''),
+        ).toBe(true)
+      }
+    }
+    if (stores === 'compactionStates') {
+      expect(mutations, `${name} one bounded accounting or cleanup mutation`).toHaveLength(1)
+      expect(mutations[0]?.store).toBe('compactionStates')
+      continue
+    }
+    const manifest = mutations.find((mutation) => mutation.store === 'manifests')
+    expect(manifest, `${name} manifest transaction publication`).toBeDefined()
+    if (stores === 'manifests') {
+      expect(mutations).toHaveLength(1)
+      expect(manifest?.activeDatabaseName).toBe(activeDatabaseName)
+      expect(manifest?.pendingPhase).toBe('discard')
+      continue
+    }
+    expect(mutations, `${name} paired atomic control publication`).toHaveLength(2)
+    const compaction = mutations.find((mutation) => mutation.store === 'compactionStates')
+    expect(compaction, `${name} paired atomic compaction publication`).toBeDefined()
+    if (compaction?.method === 'put') {
+      expect(manifest?.pendingPhase, `${name} activation phase`).toBe('cleanup')
+      expect(compaction.key, `${name} activation state matches manifest`).toBe(
+        manifest?.activeDatabaseName,
+      )
+      expect(compaction.key, `${name} activation changes active slot`).not.toBe(activeDatabaseName)
+      activations += 1
+      if (outcome === 'committed') {
+        activeDatabaseName = compaction.key
+        committedActivations += 1
+      }
+    } else {
+      expect(manifest?.activeDatabaseName).toBe(activeDatabaseName)
+      expect([null, 'preparing']).toContain(manifest?.pendingPhase)
+    }
+  }
+  expect(activations, `${name} at most one activation`).toBeLessThanOrEqual(1)
+  if (profile.sourceDatabaseName !== profile.destinationDatabaseName) {
+    expect(committedActivations, `${name} exact atomic manifest activation`).toBe(1)
+  }
+  expect(activeDatabaseName, `${name} control manifest at observation end`).toBe(
+    profile.destinationDatabaseName,
+  )
 }
 
 const FOREGROUND_FORK_CATCHUP_CALLS = Object.freeze({

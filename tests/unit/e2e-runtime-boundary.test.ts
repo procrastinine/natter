@@ -24,7 +24,7 @@ const HARDCODED_PHYSICAL_WORKSPACE_PATTERN =
 const EXPECTED_RAW_E2E_DATABASE_MUTATIONS = {
   'error-boundary.spec.ts': 1,
   'helpers.ts': 2,
-  'large-workspace-startup.spec.ts': 1,
+  'large-workspace-startup.spec.ts': 7,
   'orphan-recovery.spec.ts': 2,
   'startup-recovery.spec.ts': 13,
   'storage-reclamation.spec.ts': 2,
@@ -32,7 +32,7 @@ const EXPECTED_RAW_E2E_DATABASE_MUTATIONS = {
 const EXPECTED_RAW_E2E_READWRITE_TRANSACTIONS = {
   'error-boundary.spec.ts': 1,
   'helpers.ts': 2,
-  'large-workspace-startup.spec.ts': 1,
+  'large-workspace-startup.spec.ts': 2,
   'orphan-recovery.spec.ts': 1,
   'startup-recovery.spec.ts': 4,
   'storage-reclamation.spec.ts': 2,
