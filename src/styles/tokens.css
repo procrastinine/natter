@@ -5,6 +5,38 @@
  * tests/unit/tokens-css.test.ts. Themes may change values, not names.
  */
 
+@font-face {
+  font-family: "Inter";
+  src: url("../assets/fonts/InterVariable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("../assets/fonts/InterVariable-Italic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("../assets/fonts/SourceSerif4Variable-Roman.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 200 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Source Serif 4";
+  src: url("../assets/fonts/SourceSerif4Variable-Italic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 200 900;
+  font-display: swap;
+}
+
 :root {
   /* --- Color tokens (§10.21.1) --- */
   --color-bg-app: #fbfbfb;
@@ -76,7 +108,7 @@
   --color-selection: rgba(37, 99, 235, 0.25);
 
   /* --- Typography (§10.21.2) --- */
-  --font-sans: system-ui, sans-serif;
+  --font-sans: "Inter", system-ui, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --font-size-xs: 12px;
   --font-size-sm: 13px;

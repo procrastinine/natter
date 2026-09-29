@@ -125,7 +125,7 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   userProfilePicture: 'default-person',
   assistantProfilePicture: 'default-robot',
   chatMaxWidth: 920,
-  fontFamily: 'system',
+  fontFamily: 'inter',
   baseFontSize: 15,
   autoScrollOnStream: true,
   pinnedModels: [...LATEST_OPENROUTER_MODEL_IDS],
@@ -380,6 +380,11 @@ export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   stack: string
 }> = [
   {
+    value: 'inter',
+    label: 'Inter (default)',
+    stack: '"Inter", system-ui, sans-serif',
+  },
+  {
     value: 'system',
     label: 'System',
     stack: 'system-ui, sans-serif',
@@ -391,18 +396,13 @@ export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   },
   {
     value: 'serif',
-    label: 'Serif (Times / Charter)',
-    stack: 'Charter, Georgia, "Times New Roman", Times, serif',
+    label: 'Serif (Source Serif 4)',
+    stack: '"Source Serif 4", serif',
   },
   {
     value: 'monospace',
     label: 'Monospace (Menlo / Consolas)',
     stack: '"SF Mono", Menlo, Consolas, "Liberation Mono", "Courier New", monospace',
-  },
-  {
-    value: 'inter',
-    label: 'Inter (if installed)',
-    stack: '"Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   },
   {
     value: 'georgia',

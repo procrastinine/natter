@@ -19,6 +19,10 @@ There are some relatively specific features that I could not get from other fron
 
 # Local development
 
+Inter 4.1 and Source Serif 4.005 are bundled. Their SIL Open Font licenses are in
+`public/fonts/`. Both families are served by Natter itself, with no external font
+service or installed-font lookup. Inter is the default; Serif is available in Appearance.
+
 | script | purpose |
 |---|---|
 | `pnpm dev` | Vite dev server |
