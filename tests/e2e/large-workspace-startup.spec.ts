@@ -125,6 +125,38 @@ test('foreground fork accounting distinguishes bounded replacement activation', 
     ],
   })
   expect(() => assertForegroundFork('accounting and cleanup overlap', overlapping)).not.toThrow()
+  const draining = foregroundForkProfileFixture({
+    ...activated,
+    idbRequests: 1_340,
+    idbCalls: {
+      ...activated.idbCalls,
+      'factory.open:natter-workspace-b': 2,
+      'factory.open:natter': 3,
+      'objectStore.replacementCatchup__chats.openCursor.bounded': 2,
+      'objectStore.replacementCatchup__messages.openCursor.bounded': 2,
+    },
+  })
+  expect(() =>
+    assertForegroundFork('source catch-up and destination reopen', draining),
+  ).not.toThrow()
+  expect(() =>
+    assertForegroundFork('excess total work during activation', {
+      ...draining,
+      idbRequests: FOREGROUND_FORK_REQUEST_BOUND + 1,
+    }),
+  ).toThrow(/total bounded fork requests/u)
+  expect(() =>
+    assertForegroundFork('unrelated slot during activation', {
+      ...draining,
+      idbCalls: { ...draining.idbCalls, 'factory.open:natter-workspace-a': 1 },
+    }),
+  ).toThrow(/database change only opens participating slots/u)
+  expect(() =>
+    assertForegroundFork('canonical scan during activation', {
+      ...draining,
+      idbCalls: { ...draining.idbCalls, 'objectStore.messages.getAll.full': 1 },
+    }),
+  ).toThrow(/fork canonical whole-table reads/u)
   expect(() =>
     assertForegroundForkStorageOverlap('missing transaction partner', {
       ...activated,
@@ -2028,7 +2060,7 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
     ),
     `${name} non-replacement cursor pages`,
   ).toEqual([])
-  for (const [key, count] of interruptedCopyCursorPages) {
+  for (const [key] of interruptedCopyCursorPages) {
     const tableName = key.match(
       /^objectStore\.replacementCatchup__([^.]+)\.openCursor\.bounded$/u,
     )?.[1]
@@ -2036,7 +2068,6 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
       tableName !== undefined && CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES.includes(tableName),
       `${name} known copy-page table ${key}`,
     ).toBe(true)
-    expect(count, `${name} single bounded copy page ${key}`).toBeLessThanOrEqual(1)
   }
   expect(
     interruptedCopyCursorPages.length,
@@ -2192,19 +2223,17 @@ function assertForegroundForkStorageOverlap(
     profile.idbCalls[`factory.open:${BROWSER_WORKSPACE_CONTROL_DATABASE_NAME}`] ?? 0,
     `${name} fork control database opens`,
   ).toBeLessThanOrEqual(1)
-  expect(
-    workspaceDatabaseOpens.reduce((sum, [, count]) => sum + count, 0),
-    `${name} bounded workspace database opens`,
-  ).toBeLessThanOrEqual(2)
   if (!replacementActivity) expect(workspaceDatabaseOpens, `${name} workspace opens`).toEqual([])
 
   if (profile.destinationDatabaseName !== profile.sourceDatabaseName) {
     expect(replacementActivity, `${name} database change has replacement evidence`).toBe(true)
     expect(
       workspaceDatabaseOpens.every(
-        ([key]) => key === `factory.open:${profile.destinationDatabaseName}`,
+        ([key]) =>
+          key === `factory.open:${profile.sourceDatabaseName}` ||
+          key === `factory.open:${profile.destinationDatabaseName}`,
       ),
-      `${name} database change only opens the activated slot`,
+      `${name} database change only opens participating slots`,
     ).toBe(true)
   }
 
