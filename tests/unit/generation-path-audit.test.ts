@@ -286,26 +286,10 @@ describe('generation request path audit', () => {
     expect(failures, failures.join('\n')).toEqual([])
   })
 
-  it('captures discovery baselines once at prepare and never re-reads them while planning', () => {
-    const protocol = withoutComments(
-      readFileSync(resolve(SRC_ROOT, 'store/workspace-protocol.ts'), 'utf8'),
-    )
-    const mutationRuntime = withoutComments(
-      readFileSync(resolve(SRC_ROOT, 'store/browser-mutation-runtime.ts'), 'utf8'),
-    )
+  it('keeps generation planning on its captured discovery snapshot', () => {
     const reader = withoutComments(
       readFileSync(resolve(SRC_ROOT, 'store/generation-planning-reader.ts'), 'utf8'),
     )
-    const captureStart = mutationRuntime.indexOf('async function captureGenerationPlanningSnapshot')
-    const captureEnd = mutationRuntime.indexOf(
-      'export async function runBrowserMutation',
-      captureStart,
-    )
-    const capture = mutationRuntime.slice(captureStart, captureEnd)
-    expect(protocol).toContain('discovery: {')
-    expect(captureStart).toBeGreaterThanOrEqual(0)
-    expect(captureEnd).toBeGreaterThan(captureStart)
-    expect(capture.match(/readDiscoveryCacheRow\s*\(/gu)).toHaveLength(3)
     expect(reader).toContain('this.snapshot.discovery')
     expect(reader).toContain('baseline: captured')
     expect(reader).not.toContain('readModelsDiscoveryCache')

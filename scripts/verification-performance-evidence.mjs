@@ -19,17 +19,23 @@ export async function persistVerificationPerformanceEvidence(options) {
   const runDirectory = resolve(options.runDirectory)
   assertDescendant(artifactRoot, runDirectory, 'VerificationPerformanceRunDirectoryOutsideRoot')
   await mkdir(runDirectory, { recursive: true })
-  const byId = new Map(options.stages.map((stage) => [stage.id, stage]))
+  const byId = new Map(options.stages.map((stage) => [stage.stageId ?? stage.id, stage]))
   const stages = VERIFICATION_PERFORMANCE_REQUIRED_STAGE_IDS.map((id) => {
-    const stage = byId.get(id)
+    const executionStageId = options.stageAliases?.[id] ?? id
+    const stage = byId.get(executionStageId)
     const stdoutArtifact = PROFILE_STAGE_IDS.has(id)
       ? boundedSiblingArtifact(artifactRoot, runDirectory, stage?.stdoutPath ?? null)
       : null
     return Object.freeze({
       id,
+      executionStageId,
       status: stage?.status ?? 'planned',
       exitCode: stage?.exitCode ?? null,
-      timing: stage?.timing ? Object.freeze({ ...stage.timing }) : null,
+      timing: stage?.timing
+        ? Object.freeze({ ...stage.timing })
+        : typeof stage?.wallMs === 'number'
+          ? Object.freeze({ wallMs: stage.wallMs, runnerCpuUserMs: null, runnerCpuSystemMs: null })
+          : null,
       stdoutArtifact,
     })
   })
@@ -80,6 +86,8 @@ export function validateVerificationPerformanceEvidence(value, expectedRunId) {
     if (
       !isRecord(stage) ||
       stage.id !== expectedId ||
+      typeof stage.executionStageId !== 'string' ||
+      stage.executionStageId.length === 0 ||
       !STAGE_STATUSES.has(stage.status) ||
       !(stage.exitCode === null || Number.isSafeInteger(stage.exitCode)) ||
       !validTiming(stage.timing)
@@ -135,8 +143,8 @@ function validTiming(value) {
   return (
     isRecord(value) &&
     finiteNonNegative(value.wallMs) &&
-    finiteNonNegative(value.runnerCpuUserMs) &&
-    finiteNonNegative(value.runnerCpuSystemMs)
+    (value.runnerCpuUserMs === null || finiteNonNegative(value.runnerCpuUserMs)) &&
+    (value.runnerCpuSystemMs === null || finiteNonNegative(value.runnerCpuSystemMs))
   )
 }
 

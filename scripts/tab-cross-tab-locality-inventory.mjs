@@ -490,6 +490,37 @@ export const CONVERSATION_ROUTE_DELIVERY_LOCALITY = records(
   TAB_LOCAL_POLICY,
 )
 
+export const WORKSPACE_SLOT_MESSAGE_LOCALITY = mergeRecords(
+  records(['quiesce'], {
+    initiatingOwner: 'exact-slot-transition-coordinator',
+    durableScope: 'one-journal-admitted-physical-slot-transition',
+    lockTransactionScope: 'selection-admission-then-physical-slot-leases',
+    localPresentationEffect: 'reconcile-the-current-workspace-binding',
+    crossTabPublication: 'nonce-and-source-destination-slot-addressed',
+    forbiddenRemoteSteering: FORBID_REMOTE_STEERING,
+    activeStreamOwnership: 'preserved-by-runtime-root-dispositions',
+    expectedOtherTabBehavior:
+      'peers-validate-the-exact-durable-transition-before-reconciling-the-current-workspace-binding',
+    status: 'observed',
+    evidence:
+      'browser-workspace-slot-coordination.ts receiveSlotMessage validates the journal before reconciling; browser-workspace-slot-coordination.test.ts rejects unadmitted and old-owner transitions.',
+  }),
+  records(['foreground-demand'], {
+    initiatingOwner: 'reconciling-peer-foreground-owner',
+    durableScope: 'one-current-outbound-slot-transition',
+    lockTransactionScope: 'none-notification-runs-outside-the-inbound-reconciliation-queue',
+    localPresentationEffect: 'preserve-pending-local-foreground-intent',
+    crossTabPublication: 'nonce-and-source-destination-slot-addressed',
+    forbiddenRemoteSteering: FORBID_REMOTE_STEERING,
+    activeStreamOwnership: 'no-stream-ownership-transfer',
+    expectedOtherTabBehavior:
+      'matching-current-owner-preempts-maintenance-only-stale-or-completed-transitions-are-ignored',
+    status: 'observed',
+    evidence:
+      'browser-workspace-slot-coordination.test.ts routes demand only to the current replacement and reports demand before/during pending reconciliation; workspace runtime tests preserve explicit user replacement.',
+  }),
+)
+
 export const WORKSPACE_CHANGE_LOCALITY = mergeRecords(
   records(['commit', 'invalidate'], {
     initiatingOwner: 'background-or-committing-tab',
@@ -829,6 +860,7 @@ export const OWNER_PATH_CLASSIFICATIONS = Object.freeze({
     'src/store/browser-repo.ts',
     'src/store/browser-workspace-replacement-runner.ts',
     'src/store/browser-workspace-lifecycle.ts',
+    'src/store/browser-workspace-slot-coordination.ts',
     'src/store/byte-owner-mutation.ts',
     'src/store/chat-row-transition.ts',
     'src/store/child-list-projection.ts',

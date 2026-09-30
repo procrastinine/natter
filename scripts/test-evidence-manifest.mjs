@@ -1,3 +1,5 @@
+import { verificationStageReference } from './verification-stage-contract.mjs'
+
 export const DECLARED_TEST_DOMAINS = Object.freeze({
   'tests/e2e/abort.spec.ts': ['conversation', 'generation', 'workspace'],
   'tests/e2e/advanced-generation-routing.spec.ts': [
@@ -48,6 +50,12 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
   ],
   'tests/e2e/generated-workspace-state.ts': ['build-environment', 'workspace'],
   'tests/e2e/helpers.ts': ['build-environment', 'workspace'],
+  'tests/e2e/workspace-seed.ts': [
+    'build-environment',
+    'interchange',
+    'provider-configuration',
+    'workspace',
+  ],
   'tests/e2e/indexeddb-dump-provider-picker.spec.ts': [
     'provider-configuration',
     'schema-evolution',
@@ -132,6 +140,8 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
   ],
   'tests/integration/committed-write-delivery.test.ts': ['workspace'],
   'tests/helpers/protocol-contract-facts.ts': ['build-environment', 'shared-contracts'],
+  'tests/helpers/web-locks.ts': ['build-environment', 'workspace'],
+  'tests/setup-node.ts': ['build-environment'],
   'tests/unit/architecture-coverage-audit.test.ts': ['build-environment', 'shared-contracts'],
   'tests/unit/architecture-inventory-closure-audit.test.ts': [
     'build-environment',
@@ -166,6 +176,17 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
   'tests/unit/interaction-inventory.test.ts': ['application-shell', 'presentation-system'],
   'tests/unit/legacy-test-migration-ledger.test.ts': ['build-environment'],
   'tests/unit/local-module-graph.test.ts': ['build-environment', 'shared-contracts'],
+  'tests/unit/native-workspace-storage-fixture.test.ts': [
+    'build-environment',
+    'storage-administration',
+    'workspace',
+  ],
+  'tests/unit/workspace-seed.test.ts': [
+    'build-environment',
+    'interchange',
+    'provider-configuration',
+    'workspace',
+  ],
   'tests/unit/navigation-boundary.test.ts': [
     'application-shell',
     'presentation-state',
@@ -199,6 +220,7 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
     'shared-runtime',
     'workspace',
   ],
+  'tests/unit/playwright-proof.test.ts': ['build-environment', 'shared-contracts'],
   'tests/unit/run-slice-verification.test.ts': ['build-environment', 'shared-contracts'],
   'tests/unit/run-checkpoint-verification.test.ts': ['build-environment', 'shared-contracts'],
   'tests/unit/launch-slice-verification.test.ts': ['build-environment', 'shared-contracts'],
@@ -222,6 +244,8 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
   'tests/unit/style-discipline.test.ts': ['presentation-system'],
   'tests/unit/test-runtime-isolation.test.ts': ['build-environment', 'workspace'],
   'tests/unit/test-evidence-audit.test.ts': ['build-environment'],
+  'tests/unit/vitest-projects.test.ts': ['build-environment'],
+  'tests/unit/vitest-sequencer.test.ts': ['build-environment'],
   'tests/unit/tokens-css.test.ts': ['presentation-system'],
   'tests/unit/ui-journey-invariant-recorder.test.ts': ['presentation-state', 'presentation-system'],
   'tests/unit/verification-runner.test.ts': ['build-environment'],
@@ -330,17 +354,18 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
           "test('visibility leaves the live workspace attached and the first foreground gesture exact'",
       },
       {
-        path: 'playwright.config.ts',
+        path: 'scripts/playwright-projects.mjs',
         locator: "name: 'chromium-headed-visibility'",
       },
       {
         path: 'playwright.config.ts',
         locator: 'headless: false',
       },
-      {
-        path: 'scripts/run-verification.mjs',
-        locator: "stage(\n    'headed-hidden-tab-visual-continuity',",
-      },
+      verificationStageReference('headed-hidden-tab-visual-continuity', {
+        policy: 'blocking',
+        kind: 'playwright',
+        browserProjects: ['chromium-headed-visibility'],
+      }),
       {
         path: 'tests/e2e/reactive-storage-stress.spec.ts',
         locator: 'expect(diff.changedPixelRatio).toBeLessThanOrEqual(0.25)',
@@ -543,17 +568,22 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
           "test('public startup, generation, view roundtrip, and reload use one runtime path'",
       },
       {
-        path: 'playwright.config.ts',
+        path: 'scripts/playwright-projects.mjs',
         locator: "name: 'chromium-preview-parity'",
       },
       {
-        path: 'playwright.config.ts',
+        path: 'scripts/playwright-projects.mjs',
         locator: "name: 'chromium-dev-parity'",
       },
       {
-        path: 'scripts/run-verification.mjs',
-        locator: "'dev-preview-parity',",
+        path: 'playwright.config.ts',
+        locator: 'projects: selectedPlaywrightProjects(process.env)',
       },
+      verificationStageReference('dev-preview-parity', {
+        policy: 'blocking',
+        kind: 'playwright',
+        browserProjects: ['chromium-preview-parity', 'chromium-dev-parity'],
+      }),
     ],
   },
   {
@@ -567,10 +597,7 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
         path: 'tests/unit/verification-runner.test.ts',
         locator: "it('keeps peer dependency drift advisory and makes repository hygiene blocking'",
       },
-      {
-        path: 'scripts/run-verification.mjs',
-        locator: "stage('formatting', 'Check formatting and Biome lint', 'blocking'",
-      },
+      verificationStageReference('formatting', { policy: 'blocking', kind: 'node' }),
     ],
   },
   {
@@ -613,17 +640,16 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
           "test('a folder larger than one page expands gap-free without stealing the top-first viewport'",
       },
       {
-        path: 'playwright.config.ts',
+        path: 'scripts/playwright-projects.mjs',
         locator: "name: 'chromium-send-performance'",
       },
       {
-        path: 'playwright.config.ts',
+        path: 'scripts/playwright-projects.mjs',
         locator: "name: 'firefox-send-performance'",
       },
       {
-        path: 'tests/unit/e2e-runtime-boundary.test.ts',
-        locator:
-          "expect(config).toContain('testMatch: [sendPerformanceSpec, renderWindowPerformanceSpec]')",
+        path: 'tests/unit/playwright-proof.test.ts',
+        locator: 'preserves setup ownership and the checkpoint dependency order',
       },
     ],
   },

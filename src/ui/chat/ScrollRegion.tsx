@@ -20,6 +20,127 @@ import type {
 
 export type ScrollState = 'follow' | 'pinned'
 
+function installNativeControlActivation(container: HTMLElement) {
+  const active = new Map<
+    number,
+    {
+      control: WeakRef<HTMLElement>
+      pointerType: string
+      bounds: DOMRect
+      cancelled: boolean
+    }
+  >()
+  const available = (control: HTMLElement | undefined) =>
+    control !== undefined &&
+    container.contains(control) &&
+    !control.closest('[inert], :disabled, [aria-disabled="true"]') &&
+    control.checkVisibility()
+  const cancelPointer = (pointerId: number) => {
+    const claim = active.get(pointerId)
+    if (!claim) return
+    claim.cancelled = true
+    const control = claim.control.deref()
+    if (control?.hasPointerCapture(pointerId)) control.releasePointerCapture(pointerId)
+  }
+  const cancel = () => {
+    for (const pointerId of active.keys()) cancelPointer(pointerId)
+  }
+  const onDown = (event: PointerEvent) => {
+    if (!event.isPrimary) return
+    for (const [pointerId, claim] of active) {
+      if (claim.pointerType !== event.pointerType) continue
+      cancelPointer(pointerId)
+      active.delete(pointerId)
+    }
+    if (event.button !== 0 || event.defaultPrevented) return
+    const target = event.target instanceof Element ? event.target : null
+    if (
+      target?.closest(
+        'input, textarea, select, [contenteditable="true"], [draggable="true"], [role="slider"], [role="separator"]',
+      )
+    ) {
+      return
+    }
+    const control = target?.closest<HTMLElement>('button, a[href], summary, [role="button"]')
+    if (!control || !available(control)) return
+    active.set(event.pointerId, {
+      control: new WeakRef(control),
+      pointerType: event.pointerType,
+      bounds: control.getBoundingClientRect(),
+      cancelled: false,
+    })
+    control.setPointerCapture(event.pointerId)
+  }
+  const onMoveOrUp = (event: PointerEvent) => {
+    const claim = active.get(event.pointerId)
+    if (!claim || claim.cancelled) return
+    const { bounds } = claim
+    const control = claim.control.deref()
+    if (
+      event.clientX < bounds.left ||
+      event.clientX > bounds.right ||
+      event.clientY < bounds.top ||
+      event.clientY > bounds.bottom ||
+      !available(control)
+    ) {
+      cancelPointer(event.pointerId)
+      if (event.type === 'pointermove' && available(control)) active.delete(event.pointerId)
+    }
+    // Native click targeting uses capture at pointer-up, even after implicit release.
+  }
+  const onClick = (event: PointerEvent) => {
+    const claim = active.get(event.pointerId)
+    if (!claim || event.detail === 0) return
+    active.delete(event.pointerId)
+    const control = claim.control.deref()
+    if (
+      claim.cancelled ||
+      control === undefined ||
+      !available(control) ||
+      !event.composedPath().includes(control)
+    ) {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+    }
+  }
+  const onCancel = (event: PointerEvent) => {
+    cancelPointer(event.pointerId)
+    active.delete(event.pointerId)
+  }
+  const onLostCapture = (event: PointerEvent) => {
+    const claim = active.get(event.pointerId)
+    if (claim && !claim.cancelled && event.buttons !== 0) active.delete(event.pointerId)
+  }
+  const onVisibility = () => {
+    if (document.visibilityState !== 'visible') cancel()
+  }
+  window.addEventListener('pointerdown', onDown, true)
+  window.addEventListener('pointermove', onMoveOrUp, true)
+  window.addEventListener('pointerup', onMoveOrUp, true)
+  window.addEventListener('click', onClick, true)
+  window.addEventListener('pointercancel', onCancel, true)
+  window.addEventListener('lostpointercapture', onLostCapture, true)
+  window.addEventListener('dragstart', cancel, true)
+  window.addEventListener('blur', cancel)
+  document.addEventListener('visibilitychange', onVisibility)
+  return {
+    cancel,
+    dispose() {
+      cancel()
+      active.clear()
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('pointermove', onMoveOrUp, true)
+      window.removeEventListener('pointerup', onMoveOrUp, true)
+      window.removeEventListener('click', onClick, true)
+      window.removeEventListener('pointercancel', onCancel, true)
+      window.removeEventListener('lostpointercapture', onLostCapture, true)
+      window.removeEventListener('dragstart', cancel, true)
+      window.removeEventListener('blur', cancel)
+      document.removeEventListener('visibilitychange', onVisibility)
+    },
+  }
+}
+
 interface ScrollRegionProps {
   children: ReactNode
   // Hidden retained views keep their DOM and state, but they cannot consume
@@ -548,6 +669,25 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   thresholdRef.current = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
   autoScrollOnStreamRef.current = autoScrollOnStream
   streamActiveRef.current = streamActive
+
+  const nativeActivationRef = useRef<ReturnType<typeof installNativeControlActivation> | null>(null)
+  useLayoutEffect(() => {
+    if (!viewportActive) return
+    const container = containerRef.current
+    if (!container) return
+    const owner = installNativeControlActivation(container)
+    nativeActivationRef.current = owner
+    return () => {
+      owner.dispose()
+      nativeActivationRef.current = null
+    }
+  }, [viewportActive])
+  useLayoutEffect(() => {
+    void workspaceEpoch
+    void resetKey
+    void selectionKey
+    nativeActivationRef.current?.cancel()
+  }, [workspaceEpoch, resetKey, selectionKey])
 
   const debugScroll = useCallback(
     (event: ScrollDebugEvent, details: Record<string, unknown> = {}) => {
@@ -1924,6 +2064,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     const container = containerRef.current
     if (!container) return
     const markUserScrollIntent = (event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard') => {
+      nativeActivationRef.current?.cancel()
       userScrollIntentRef.current = true
       userScrollRevisionRef.current += 1
       didOpenRef.current = true
@@ -1981,7 +2122,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (
         !['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key) ||
         target?.closest(
-          'button, a, input, textarea, select, [contenteditable="true"], [role="button"]',
+          'button, a, summary, input, textarea, select, [contenteditable="true"], [role="button"]',
         )
       ) {
         return

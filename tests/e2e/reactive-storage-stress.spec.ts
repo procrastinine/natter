@@ -823,7 +823,7 @@ async function mockOpenRouterDiscovery(page: Page): Promise<void> {
     output_modalities: ['text'],
     tokenizer: 'gemini',
   }
-  await page.context().route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -1149,95 +1149,87 @@ async function readReactiveState(
     abortReason: string | undefined
   }>
 }> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      const readRow = (storeName: string, key: IDBValidKey) =>
-        new Promise<unknown>((resolve, reject) => {
-          const transaction = db.transaction(storeName, 'readonly')
-          const request = transaction.objectStore(storeName).get(key)
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      const readRows = (storeName: string, indexName: string, key: IDBValidKey | IDBKeyRange) =>
-        new Promise<unknown[]>((resolve, reject) => {
-          const transaction = db.transaction(storeName, 'readonly')
-          const request = transaction.objectStore(storeName).index(indexName).getAll(key)
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      try {
-        const [chat, headers, bodies, leases, chunks] = await Promise.all([
-          readRow('chats', id),
-          readRows('messages', 'chatId', id),
-          readRows('messageBodies', 'chatId', id),
-          readRows(
-            'streamLeases',
-            '[chatId+streamId]',
-            IDBKeyRange.bound([id, ''], [id, '\uffff']),
-          ),
-          readRows('streamChunks', 'chatId', id),
-        ])
-        const chatRow = chat as {
-          title: string
-          settings?: { systemPrompt?: string }
-          metaVersion: number
-          summaryVersion: number
-        }
-        const bodyById = new Map(
-          (bodies as Array<{ id: string; content?: unknown }>).map((body) => [body.id, body]),
-        )
-        type Header = {
-          id: string
-          parentId: string | null
-          role: string
-          createdAt: number
-          turnIndex: number
-          generation?: { abortReason?: string }
-        }
-        const headerRows = headers as Header[]
-        const headerById = new Map(headerRows.map((header) => [header.id, header]))
-        const depthById = new Map<string, number>()
-        const depth = (header: Header): number => {
-          const known = depthById.get(header.id)
-          if (known !== undefined) return known
-          const parent = header.parentId ? headerById.get(header.parentId) : undefined
-          const value: number = parent ? depth(parent) + 1 : 0
-          depthById.set(header.id, value)
-          return value
-        }
-        const messages = headerRows
-          .sort((left, right) => {
-            return (
-              depth(left) - depth(right) ||
-              left.turnIndex - right.turnIndex ||
-              left.createdAt - right.createdAt ||
-              left.id.localeCompare(right.id)
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          const readRow = (storeName: string, key: IDBValidKey) =>
+            request<unknown>(db.transaction(storeName, 'readonly').objectStore(storeName).get(key))
+          const readRows = (storeName: string, indexName: string, key: IDBValidKey | IDBKeyRange) =>
+            request(
+              db
+                .transaction(storeName, 'readonly')
+                .objectStore(storeName)
+                .index(indexName)
+                .getAll(key),
             )
-          })
-          .map((header) => ({
-            role: header.role,
-            content: bodyById.get(header.id)?.content,
-            abortReason: header.generation?.abortReason,
-          }))
-        return {
-          title: chatRow.title,
-          systemPrompt: chatRow.settings?.systemPrompt,
-          metaVersion: chatRow.metaVersion,
-          summaryVersion: chatRow.summaryVersion,
-          streamLeaseCount: leases.length,
-          streamChunkCount: chunks.length,
-          messages,
-        }
-      } finally {
-        db.close()
-      }
+
+          const [chat, headers, bodies, leases, chunks] = await Promise.all([
+            readRow('chats', id),
+            readRows('messages', 'chatId', id),
+            readRows('messageBodies', 'chatId', id),
+            readRows(
+              'streamLeases',
+              '[chatId+streamId]',
+              IDBKeyRange.bound([id, ''], [id, '\uffff']),
+            ),
+            readRows('streamChunks', 'chatId', id),
+          ])
+          const chatRow = chat as {
+            title: string
+            settings?: { systemPrompt?: string }
+            metaVersion: number
+            summaryVersion: number
+          }
+          const bodyById = new Map(
+            (bodies as Array<{ id: string; content?: unknown }>).map((body) => [body.id, body]),
+          )
+          type Header = {
+            id: string
+            parentId: string | null
+            role: string
+            createdAt: number
+            turnIndex: number
+            generation?: { abortReason?: string }
+          }
+          const headerRows = headers as Header[]
+          const headerById = new Map(headerRows.map((header) => [header.id, header]))
+          const depthById = new Map<string, number>()
+          const depth = (header: Header): number => {
+            const known = depthById.get(header.id)
+            if (known !== undefined) return known
+            const parent = header.parentId ? headerById.get(header.parentId) : undefined
+            const value: number = parent ? depth(parent) + 1 : 0
+            depthById.set(header.id, value)
+            return value
+          }
+          const messages = headerRows
+            .sort((left, right) => {
+              return (
+                depth(left) - depth(right) ||
+                left.turnIndex - right.turnIndex ||
+                left.createdAt - right.createdAt ||
+                left.id.localeCompare(right.id)
+              )
+            })
+            .map((header) => ({
+              role: header.role,
+              content: bodyById.get(header.id)?.content,
+              abortReason: header.generation?.abortReason,
+            }))
+          return {
+            title: chatRow.title,
+            systemPrompt: chatRow.settings?.systemPrompt,
+            metaVersion: chatRow.metaVersion,
+            summaryVersion: chatRow.summaryVersion,
+            streamLeaseCount: leases.length,
+            streamChunkCount: chunks.length,
+            messages,
+          }
+        },
+      )
     },
-    { databaseName, id: chatId },
+    { id: chatId },
   )
 }

@@ -85,7 +85,7 @@ describe('BranchControls accessibility', () => {
     ])
   })
 
-  it('owns a primary pointer jump before click without dispatching it twice', () => {
+  it('activates a variant once on native click and leaves pointer-down cancellable', () => {
     const first = message('message-a', 0)
     const second = message('message-b', 1)
     const context = createActiveBranchSpine({
@@ -114,6 +114,7 @@ describe('BranchControls accessibility', () => {
 
     const next = screen.getByRole('link', { name: 'Next variant' })
     fireEvent.pointerDown(next, { button: 0 })
+    expect(cursor.navigateMessage).not.toHaveBeenCalled()
     fireEvent.click(next, { button: 0, detail: 1 })
 
     expect(cursor.navigateMessage).toHaveBeenCalledTimes(1)

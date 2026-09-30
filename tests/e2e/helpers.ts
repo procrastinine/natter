@@ -4,11 +4,15 @@
 // on `process.env.RUN_LIVE === '1'`.
 
 import {
-  configureWorkspaceThroughUi,
   importPortableChatThroughUi,
   waitForWorkspaceRunning as waitForWorkspaceFixtureRunning,
 } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Page } from './fixtures'
+import {
+  addFirstRunConnection,
+  type SeedOptions,
+  seedWorkspaceFromTemplate,
+} from './workspace-seed'
 
 export interface IndexedDbDump {
   dbName: string
@@ -36,200 +40,34 @@ export async function confirmPresentationDialog(page: Page): Promise<void> {
 }
 
 export async function activeWorkspaceDatabaseName(page: Page): Promise<string> {
-  return page.evaluate(async () => {
-    const knownNames =
-      typeof indexedDB.databases === 'function'
-        ? (await indexedDB.databases()).flatMap((database) =>
-            database.name === undefined ? [] : [database.name],
-          )
-        : []
-    if (!knownNames.includes('natter-control')) return 'natter'
-    const control = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter-control')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      return await new Promise<string>((resolve, reject) => {
-        const request = control
-          .transaction('manifests', 'readonly')
-          .objectStore('manifests')
-          .get('workspace')
-        request.onsuccess = () => {
-          const name = (request.result as { activeDatabaseName?: unknown } | undefined)
-            ?.activeDatabaseName
-          if (typeof name !== 'string') {
-            reject(new Error('BrowserWorkspaceControlManifestInvalid'))
-            return
-          }
-          resolve(name)
-        }
-        request.onerror = () => reject(request.error)
-      })
-    } finally {
-      control.close()
-    }
-  })
+  return page.evaluate(
+    async () => (await globalThis.__natterNativeStorageFixture.readActiveIdentity()).databaseName,
+  )
 }
 
 export async function holdIndexedDbStoreGate(
   page: Page,
   storeNames: readonly string[],
 ): Promise<() => Promise<void>> {
-  if (storeNames.length === 0) throw new Error('IndexedDbStoreGateRequiresStore')
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  const gateId = `indexeddb-store-gate:${Date.now()}:${Math.random()}`
-  await page.evaluate(
-    async ({ databaseName, gateId, storeNames }) => {
-      type Gate = { release(): void; readonly complete: Promise<void> }
-      const scope = window as typeof window & {
-        __e2eIndexedDbStoreGates?: Map<string, Gate>
-      }
-      const gates = scope.__e2eIndexedDbStoreGates ?? new Map<string, Gate>()
-      scope.__e2eIndexedDbStoreGates = gates
-      let released = false
-      let readySettled = false
-      let resolveReady: () => void = () => undefined
-      let rejectReady: (error: unknown) => void = () => undefined
-      const ready = new Promise<void>((resolve, reject) => {
-        resolveReady = resolve
-        rejectReady = reject
-      })
-      const complete = navigator.locks.request(
-        'natter:workspace-slot-selection:v1',
-        { mode: 'shared' },
-        () =>
-          navigator.locks.request(
-            `natter:workspace-slot:${databaseName}`,
-            { mode: 'shared' },
-            async () => {
-              const database = await new Promise<IDBDatabase>((resolve, reject) => {
-                const request = indexedDB.open(databaseName)
-                request.onsuccess = () => resolve(request.result)
-                request.onerror = () => reject(request.error)
-              })
-              let resolveTransaction: () => void = () => undefined
-              let rejectTransaction: (error: unknown) => void = () => undefined
-              const transactionComplete = new Promise<void>((resolve, reject) => {
-                resolveTransaction = resolve
-                rejectTransaction = reject
-              })
-              const transaction = database.transaction(storeNames, 'readwrite')
-              const fail = (error: unknown) => {
-                if (!readySettled) {
-                  readySettled = true
-                  rejectReady(error)
-                }
-                rejectTransaction(error)
-                database.close()
-              }
-              transaction.oncomplete = () => {
-                resolveTransaction()
-                database.close()
-              }
-              transaction.onerror = () =>
-                fail(transaction.error ?? new Error('IndexedDbStoreGateError'))
-              transaction.onabort = () =>
-                fail(transaction.error ?? new Error('IndexedDbStoreGateAbort'))
-              const store = transaction.objectStore(storeNames[0] as string)
-              const keepAlive = () => {
-                const request = store.get('__e2e_gate__')
-                request.onsuccess = () => {
-                  if (!readySettled) {
-                    readySettled = true
-                    resolveReady()
-                  }
-                  if (!released) keepAlive()
-                }
-                request.onerror = () =>
-                  fail(request.error ?? new Error('IndexedDbStoreGateReadError'))
-              }
-              keepAlive()
-              await transactionComplete
-            },
-          ),
-      )
-      void complete.catch((error: unknown) => {
-        if (readySettled) return
-        readySettled = true
-        rejectReady(error)
-      })
-      gates.set(gateId, {
-        release: () => {
-          released = true
-        },
-        complete,
-      })
-      await ready
-    },
-    { databaseName, gateId, storeNames: [...storeNames] },
+  const { id } = await page.evaluate(
+    (stores) => globalThis.__natterNativeStorageFixture.holdActiveStores(stores),
+    [...storeNames],
   )
-  let released = false
-  return async () => {
-    if (released) return
-    released = true
-    await page.evaluate(async (gateId) => {
-      const scope = window as typeof window & {
-        __e2eIndexedDbStoreGates?: Map<
-          string,
-          { release(): void; readonly complete: Promise<void> }
-        >
-      }
-      const gate = scope.__e2eIndexedDbStoreGates?.get(gateId)
-      if (!gate) throw new Error(`IndexedDbStoreGateMissing:${gateId}`)
-      gate.release()
-      try {
-        await gate.complete
-      } finally {
-        scope.__e2eIndexedDbStoreGates?.delete(gateId)
-      }
-    }, gateId)
-  }
+  let releasePromise: Promise<void> | undefined
+  return () =>
+    (releasePromise ??= page.evaluate(
+      (id) => globalThis.__natterNativeStorageFixture.release(id),
+      id,
+    ))
 }
 
-interface SeedOptions {
-  apiKey?: string
-  model?: string
-  disablePrivacyFilter?: boolean
-  corsProxyUrl?: string
-}
-
-const DEFAULT_E2E_MODEL = 'google/gemini-3.5-flash'
-const DEFAULT_E2E_API_KEY = 'sk-or-v1-test-00000000000000000000000000000000000000000000'
-
-async function addFirstRunConnection(page: Page, apiKey: string): Promise<void> {
-  const currentUrl = new URL(page.url())
-  if (currentUrl.pathname !== '/' || currentUrl.hash) await page.goto('/')
-  await page.locator('[data-ui="connection-add"]').click()
-  const input = page.locator('[data-ui="connection-setup-key"]')
-  await input.fill(apiKey)
-  await page.locator('[data-ui="connection-setup-submit"]').click()
-  await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
-  await page.locator('[data-ui="connection-empty-action"]').waitFor({
-    state: 'detached',
-  })
-}
-
-// Open the first-run Add connection action and submit a stub key. `apiKey`
-// defaults to a harmless placeholder because the route-mocked specs never hit
-// OpenRouter. Use `seedReal(page)` when the spec needs the real key from
-// `key.txt`.
 export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<void> {
-  const apiKey = opts.apiKey ?? DEFAULT_E2E_API_KEY
-  const model = opts.model ?? DEFAULT_E2E_MODEL
-  await addFirstRunConnection(page, apiKey)
-  await configureWorkspaceThroughUi(page, {
-    model,
-    ...(opts.disablePrivacyFilter === false ? {} : { paretoFilter: false }),
-    ...(opts.corsProxyUrl === undefined
-      ? {}
-      : { workspaceSettings: { 'global:cors-proxy-url': opts.corsProxyUrl } }),
-  })
+  await seedWorkspaceFromTemplate(page, opts)
   await createChatAndOpen(page)
 }
 
 export async function seedFirstRunFromOnboarding(page: Page): Promise<void> {
-  await addFirstRunConnection(page, DEFAULT_E2E_API_KEY)
+  await addFirstRunConnection(page)
   await createChatAndOpen(page)
 }
 
@@ -242,12 +80,19 @@ export async function createChatAndOpen(page: Page): Promise<void> {
   await page.waitForFunction(() => window.location.hash === '#/new')
 }
 
-export async function sendMessage(page: Page, text: string): Promise<void> {
+export async function sendMessage(
+  page: Page,
+  text: string,
+  gesture: 'click' | 'enter' = 'click',
+): Promise<void> {
   const composer = interactiveComposer(page)
   await expect(composer).toBeVisible()
   await composer.locator('[data-ui="composer-input"]').fill(text)
   const materializesChat = await page.evaluate(() => window.location.hash === '#/new')
-  await composer.locator('[data-ui="send"]').click()
+  const submit = composer.locator('[data-ui="send"][type="submit"]')
+  await expect(submit).toBeEnabled()
+  if (gesture === 'enter') await composer.locator('[data-ui="composer-input"]').press('Enter')
+  else await submit.click()
   if (materializesChat) await expect(page).toHaveURL(/#\/chat\/[^/]+\/message\/[^/]+$/)
 }
 
@@ -408,48 +253,28 @@ export async function readMessages(
   page: Page,
   chatId: string,
 ): Promise<Array<Record<string, unknown>>> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   const rows = await page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open(databaseName)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
           const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
-          const messageStore = tx.objectStore('messages')
-          const bodyStore = tx.objectStore('messageBodies')
-          const index = messageStore.index('chatId')
-          const req = index.getAll(id)
-          req.onsuccess = () => {
-            const headers = req.result as Array<Record<string, unknown>>
-            if (headers.length === 0) {
-              resolve([])
-              return
-            }
-            const bodyReq = bodyStore.getAll()
-            bodyReq.onsuccess = () => {
-              const byId = new Map(
-                (bodyReq.result as Array<Record<string, unknown>>).map((row) => [row.id, row]),
-              )
-              resolve(
-                headers.map((header) => {
-                  const body = byId.get(header.id)
-                  return body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header
-                }),
-              )
-            }
-            bodyReq.onerror = () => reject(bodyReq.error)
-          }
-          req.onerror = () => reject(req.error)
-        })
-      } finally {
-        db.close()
-      }
+          const headers = (await request(
+            tx.objectStore('messages').index('chatId').getAll(id),
+          )) as Array<Record<string, unknown>>
+          if (headers.length === 0) return []
+          const bodies = (await request(
+            tx.objectStore('messageBodies').index('chatId').getAll(id),
+          )) as Array<Record<string, unknown>>
+          const byId = new Map(bodies.map((row) => [row.id, row]))
+          return headers.map((header) => {
+            const body = byId.get(header.id)
+            return body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header
+          })
+        },
+      )
     },
-    { databaseName, id: chatId },
+    { id: chatId },
   )
   return orderStoredMessageRows(rows)
 }
@@ -695,33 +520,21 @@ export async function waitForMessageGenerationFinished(
 }
 
 export async function firstChatId(page: Page): Promise<string> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   let chatId = ''
   await expect
     .poll(async () => {
-      chatId = await page.evaluate(async (databaseName) => {
-        const db = await new Promise<IDBDatabase>((resolve, reject) => {
-          const req = indexedDB.open(databaseName)
-          req.onsuccess = () => resolve(req.result)
-          req.onerror = () => reject(req.error)
-        })
-        try {
-          return await new Promise<string>((resolve, reject) => {
-            const tx = db.transaction('chats', 'readonly')
-            const store = tx.objectStore('chats')
-            const req = store.getAll()
-            req.onsuccess = () => {
-              const rows = (req.result as Array<{ id: string; updatedAt: number }>).sort(
-                (a, b) => b.updatedAt - a.updatedAt,
-              )
-              resolve(rows[0]?.id ?? '')
-            }
-            req.onerror = () => reject(req.error)
-          })
-        } finally {
-          db.close()
-        }
-      }, databaseName)
+      chatId = await page.evaluate(async () => {
+        return globalThis.__natterNativeStorageFixture.active(
+          { purpose: 'read-only-assertion' },
+          async (db, request) => {
+            const rows = (await request(
+              db.transaction('chats', 'readonly').objectStore('chats').getAll(),
+            )) as Array<{ id: string; updatedAt: number }>
+            rows.sort((a, b) => b.updatedAt - a.updatedAt)
+            return rows[0]?.id ?? ''
+          },
+        )
+      })
       return chatId
     })
     .not.toBe('')
@@ -729,25 +542,18 @@ export async function firstChatId(page: Page): Promise<string> {
 }
 
 export async function readChatRow(page: Page, chatId: string): Promise<Record<string, unknown>> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ chatId, databaseName }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        return await new Promise<Record<string, unknown>>((resolve, reject) => {
-          const request = db.transaction('chats', 'readonly').objectStore('chats').get(chatId)
-          request.onsuccess = () => resolve(request.result as Record<string, unknown>)
-          request.onerror = () => reject(request.error)
-        })
-      } finally {
-        db.close()
-      }
+    async ({ chatId }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          return (await request(
+            db.transaction('chats', 'readonly').objectStore('chats').get(chatId),
+          )) as Record<string, unknown>
+        },
+      )
     },
-    { chatId, databaseName },
+    { chatId },
   )
 }
 
@@ -771,11 +577,9 @@ export async function clearIndexedDb(page: Page): Promise<void> {
       }
     }
     for (const name of [...names].sort()) {
-      await new Promise<void>((resolve, reject) => {
-        const req = indexedDB.deleteDatabase(name)
-        req.onsuccess = () => resolve()
-        req.onerror = () => reject(req.error)
-        req.onblocked = () => reject(new Error(`IndexedDBDeleteBlocked:${name}`))
+      await globalThis.__natterNativeStorageFixture.deleteOffline({
+        databaseName: name,
+        purpose: 'reset',
       })
     }
   })
@@ -785,35 +589,22 @@ export async function clearIndexedDb(page: Page): Promise<void> {
 
 export async function importIndexedDbDump(page: Page, dump: IndexedDbDump): Promise<void> {
   await page.goto(absolutePageUrl(page, '/'))
-  const databaseName = await activeWorkspaceDatabaseName(page)
+  await waitForWorkspaceRunning(page)
   await page.evaluate(
-    async ({ databaseName, dump }) => {
-      const req = indexedDB.open(databaseName)
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        const storeNames = Array.from(db.objectStoreNames)
-        const writableStores = Object.keys(dump.stores).filter((name) => storeNames.includes(name))
+    (dump) =>
+      globalThis.__natterNativeStorageFixture.active({ purpose: 'legacy-fixture' }, (db) => {
+        const writableStores = Object.keys(dump.stores).filter((name) =>
+          db.objectStoreNames.contains(name),
+        )
         if (writableStores.length === 0) return
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(writableStores, 'readwrite')
-          for (const storeName of writableStores) {
-            const store = tx.objectStore(storeName)
-            store.clear()
-            const rows = dump.stores[storeName] ?? []
-            for (const row of rows) store.put(row)
-          }
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
-    },
-    { databaseName, dump },
+        const transaction = db.transaction(writableStores, 'readwrite')
+        for (const name of writableStores) {
+          const store = transaction.objectStore(name)
+          store.clear()
+          for (const row of dump.stores[name] ?? []) store.put(row)
+        }
+      }),
+    dump,
   )
   await page.reload()
 }

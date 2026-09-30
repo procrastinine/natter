@@ -1,10 +1,12 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CHECKPOINT_REQUIRED_STAGE_IDS,
   collectVerificationMetadata,
+  compileSliceVerificationStages,
+  directBrowserVerificationStages,
   executeVerificationStage,
   runVerification,
   serializeVerificationSummary,
@@ -14,12 +16,17 @@ import {
   type VerificationStage,
   type VerificationSummary,
   verificationStageEnvironment,
+  verifyVerificationStageExecution,
 } from '../../scripts/run-verification.mjs'
 import {
   persistVerificationPerformanceEvidence,
   validateVerificationPerformanceEvidence,
 } from '../../scripts/verification-performance-evidence.mjs'
 import { createVerificationRuntimeInvocation } from '../../scripts/verification-process-execution.mjs'
+import {
+  resolveVerificationStagePrerequisites,
+  verificationStageStatus,
+} from '../../scripts/verification-stage-contract.mjs'
 
 const temporaryRoots: string[] = []
 
@@ -31,6 +38,125 @@ afterEach(async () => {
 })
 
 describe('verification runner', () => {
+  it.each(['ordinary', 'setup'] as const)(
+    'continues independent browser phases after %s failure with exact receipts',
+    async (failure) => {
+      const root = await mkdtemp(resolve(tmpdir(), 'natter-browser-phases-'))
+      temporaryRoots.push(root)
+      const files = [
+        'tests/e2e/large-workspace.setup.ts',
+        'tests/e2e/send-flow.spec.ts',
+        'tests/e2e/large-workspace-startup.spec.ts',
+        'tests/e2e/render-window.spec.ts',
+        'tests/e2e/send-performance.spec.ts',
+      ]
+      const stages = directBrowserVerificationStages('chromium', files)
+      const events: string[] = []
+      let active = 0
+      const result = await runVerification({
+        root,
+        artifactRoot: root,
+        runDirectory: resolve(root, 'proofs'),
+        stages,
+        metadata: verificationMetadata(),
+        executeStage: async (stage, _metadata, context) => {
+          events.push(stage.id)
+          expect(active).toBe(0)
+          active += 1
+          await Promise.resolve()
+          if (stage.kind !== 'playwright') {
+            active -= 1
+            return passedExecution()
+          }
+          expect(context.environment.E2E_SKIP_BUILD).toBe('1')
+          const tasks = stage.browserTasks ?? []
+          const cases = tasks.flatMap((task) =>
+            task.files.map((file) => {
+              const blocked = failure === 'setup' && task.project === 'chromium-large-workspace'
+              const failed =
+                task.project === (failure === 'ordinary' ? 'chromium' : 'large-workspace-setup')
+              return {
+                id: `${task.project}:${file}`,
+                project: task.project,
+                file,
+                outcome: blocked ? 'skipped' : failed ? 'unexpected' : 'expected',
+                annotations: [],
+                results: blocked
+                  ? []
+                  : [{ status: failed ? 'failed' : 'passed', retry: 0, duration: 1 }],
+              }
+            }),
+          )
+          const failed = cases.some((entry) => entry.outcome !== 'expected')
+          const path = context.environment.E2E_BROWSER_PROOF_PATH
+          if (!path) throw new Error('BrowserPhaseProofPathMissing')
+          await mkdir(resolve(path, '..'), { recursive: true })
+          await writeFile(
+            path,
+            JSON.stringify({
+              schemaVersion: 1,
+              status: failed ? 'failed' : 'passed',
+              expected: tasks,
+              cases,
+            }),
+          )
+          active -= 1
+          return { ...passedExecution(), exitCode: failed ? 1 : 0 }
+        },
+        persistSummary: async () => undefined,
+      })
+      expect(events).toEqual([
+        'production-build',
+        'playwright-chromium-ordinary',
+        'playwright-chromium-workspace',
+        'playwright-chromium-measurement',
+      ])
+      expect(result.exitCode).toBe(1)
+      const proof = JSON.parse(
+        await readFile(resolve(root, 'proofs/playwright-chromium.playwright.proof.json'), 'utf8'),
+      ) as {
+        status: string
+        cases: Array<{ project: string; file: string; results: unknown[] }>
+        phases: Array<{ name: string }>
+      }
+      expect(proof.status).toBe('failed')
+      expect(proof.phases.map(({ name }) => name)).toEqual(['ordinary', 'workspace', 'measurement'])
+      expect(
+        proof.cases
+          .filter(({ project }) => project === 'chromium-send-performance')
+          .every(({ results }) => results.length === 1),
+      ).toBe(true)
+      expect(
+        proof.cases.filter(({ results }) => results.length === 0).map(({ project }) => project),
+      ).toEqual(failure === 'setup' ? ['chromium-large-workspace'] : [])
+      expect(new Set(proof.cases.map(({ project, file }) => `${project}:${file}`)).size).toBe(
+        files.length,
+      )
+    },
+  )
+
+  it('requires the exact Vitest receipt even when the process exits successfully', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'natter-verification-unit-proof-'))
+    temporaryRoots.push(root)
+    const stage: VerificationStage = {
+      id: 'vitest',
+      label: 'units',
+      policy: 'blocking',
+      kind: 'vitest',
+      argv: ['pnpm', 'exec', 'vitest', 'run', 'tests/unit/proof.test.ts'],
+      unitFiles: ['tests/unit/proof.test.ts'],
+    }
+    const environment = verificationStageEnvironment(stage, { root, runId: 'proof' })
+    expect(JSON.parse(environment.VERIFICATION_VITEST_SELECTION ?? 'null')).toEqual(stage.unitFiles)
+    const result = await verifyVerificationStageExecution(stage, passedExecution(), {
+      root,
+      artifactRoot: root,
+      environment,
+    })
+    expect(result.exitCode).toBe(1)
+    expect(result.diagnostics.join('\n')).toContain('vitest.proof.json')
+  })
+
   it('keeps peer dependency drift advisory and makes repository hygiene blocking', () => {
     expect(
       VERIFICATION_STAGES.filter((stage) => stage.policy === 'advisory').map((stage) => stage.id),
@@ -65,6 +191,7 @@ describe('verification runner', () => {
       'production-time-semantics',
       'production-work-memory',
       'e2e-browser-storage',
+      'test-runtime-isolation',
       'test-evidence',
       'interaction-capabilities',
       'architecture-inventory-closure',
@@ -170,6 +297,169 @@ describe('verification runner', () => {
     expect(cpuSnapshots.filter((snapshot) => snapshot === undefined)).toHaveLength(2)
   })
 
+  it('rejects a zero-exit execution with infrastructure diagnostics', () => {
+    expect(
+      verificationStageStatus(verificationStage('diagnostic', 'blocking'), {
+        ...passedExecution(),
+        diagnostics: ['IncompleteEvidence'],
+      }),
+    ).toBe('failed')
+  })
+
+  it('preserves the compiled source-selected recipe when the runner receives persisted stages', async () => {
+    const file = 'tests/unit/fixture.test.ts'
+    const stages = compileSliceVerificationStages(
+      { node: [], vitest: [file], playwright: [] },
+      { inputPaths: new Set([file]) },
+    )
+    expect(stages.map((stage) => stage.id)).toEqual(['vitest'])
+    expect(stages[0]?.prerequisiteIds).toEqual([])
+    const result = await runVerification({
+      stages: JSON.parse(JSON.stringify(stages)) as VerificationStage[],
+      metadata: verificationMetadata(),
+      dryRun: true,
+      persistSummary: async () => undefined,
+    })
+    expect(result.summary.stages.map((stage) => stage.id)).toEqual(['vitest'])
+    expect(result.summary.stages[0]?.argv).toEqual(stages[0]?.argv)
+    expect(result.exitCode).toBe(0)
+  })
+
+  it('derives full prerequisites for a raw direct runner selection', async () => {
+    const unit = VERIFICATION_STAGES.find((stage) => stage.id === 'vitest')
+    if (!unit) throw new Error('UnitStageMissing')
+    expect(unit.prerequisiteIds).toBeUndefined()
+    const result = await runVerification({
+      stages: [unit],
+      metadata: verificationMetadata(),
+      dryRun: true,
+      persistSummary: async () => undefined,
+    })
+    expect(result.summary.stages.map((stage) => stage.id)).toEqual(['protocol-contracts', 'vitest'])
+  })
+
+  it('recalculates prerequisites when compilation expands a selected unit population', () => {
+    const helper = 'tests/helpers/generated-facts.ts'
+    const files = ['tests/unit/ordinary.test.ts', 'tests/unit/facts.test.ts']
+    const producer = verificationStage('producer', 'blocking')
+    const unit: VerificationStage = {
+      ...verificationStage('vitest', 'blocking'),
+      kind: 'vitest',
+      argv: ['pnpm', 'exec', 'vitest', 'run'],
+      prerequisites: [{ id: producer.id, consumerModules: [helper] }],
+    }
+    const report: VerificationStage = {
+      ...verificationStage('report', 'blocking'),
+      preparation: 'performance-evidence',
+      prerequisites: [{ id: unit.id }],
+    }
+    const catalog = [producer, unit, report]
+    const ordinary = files[0]
+    if (!ordinary) throw new Error('OrdinaryUnitMissing')
+    const stages = compileSliceVerificationStages(
+      { node: [], vitest: [ordinary], playwright: [] },
+      { catalog, inputPaths: new Set([ordinary]) },
+    )
+    expect(stages.map((stage) => stage.id)).toEqual(['vitest'])
+    expect(stages[0]?.prerequisiteIds).toEqual([])
+    const expanded = compileSliceVerificationStages(
+      { node: [{ id: report.id, argv: ['report.mjs'] }], vitest: [ordinary], playwright: [] },
+      { catalog, inputPaths: new Set([ordinary]), sourceFiles: [...files, helper] },
+    )
+    expect(expanded.map((stage) => stage.id)).toEqual(['producer', 'vitest', 'report'])
+    expect(expanded.find((stage) => stage.id === 'vitest')?.unitFiles).toEqual([...files].sort())
+    expect(expanded.find((stage) => stage.id === 'vitest')?.prerequisiteIds).toEqual(['producer'])
+    expect(resolveVerificationStagePrerequisites(expanded, catalog)).toEqual(expanded)
+  })
+
+  it('orders the complete dependency closure by the catalog independent of selection order', () => {
+    const producer = verificationStage('producer', 'blocking')
+    const independent = verificationStage('independent', 'blocking')
+    const consumer: VerificationStage = {
+      ...verificationStage('consumer', 'blocking'),
+      prerequisites: [{ id: producer.id }],
+    }
+    const catalog = [producer, independent, consumer]
+    const checkpoint = resolveVerificationStagePrerequisites(catalog, catalog)
+    for (const selected of [
+      [independent, consumer],
+      [consumer, independent],
+    ]) {
+      const slice = resolveVerificationStagePrerequisites(selected, catalog)
+      expect(slice).toEqual(checkpoint)
+      expect(slice.map((stage) => stage.id)).toEqual(['producer', 'independent', 'consumer'])
+      expect(resolveVerificationStagePrerequisites(slice, catalog)).toEqual(slice)
+    }
+    expect(
+      resolveVerificationStagePrerequisites(
+        [independent, consumer],
+        [consumer, independent, producer],
+      ).map((stage) => stage.id),
+    ).toEqual(['producer', 'consumer', 'independent'])
+  })
+
+  it('gives compiled browser aliases and profile stages the checkpoint catalog order', () => {
+    const unitFile = 'tests/unit/fixture.test.ts'
+    const files = [
+      unitFile,
+      'tests/e2e/large-workspace.setup.ts',
+      'tests/e2e/large-workspace-startup.spec.ts',
+      'tests/e2e/send-flow.spec.ts',
+      'tests/e2e/send-performance.spec.ts',
+      'tests/e2e/render-window.spec.ts',
+      'tests/e2e/dev-preview-parity.spec.ts',
+      'tests/e2e/reactive-storage-stress.spec.ts',
+    ]
+    const browserTasks = ['headed', 'parity', 'firefox', 'chromium'].flatMap((group) =>
+      directBrowserVerificationStages(group, files).flatMap((stage) => stage.browserTasks ?? []),
+    )
+    const checkpoint = resolveVerificationStagePrerequisites(
+      VERIFICATION_STAGES.filter(
+        (stage) =>
+          stage.kind === 'vitest' || stage.kind === 'playwright' || stage.id === 'performance',
+      ),
+      VERIFICATION_STAGES,
+      new Set(files),
+    )
+    const slice = compileSliceVerificationStages(
+      { node: [], vitest: [unitFile], playwright: browserTasks },
+      { inputPaths: new Set(files), sourceFiles: files, stageIds: ['performance'] },
+    )
+    const identities = (stages: readonly VerificationStage[]) =>
+      stages.map((stage) =>
+        stage.kind === 'playwright' ? [...(stage.browserProjects ?? [])].sort() : stage.id,
+      )
+    expect(identities(slice)).toEqual(identities(checkpoint))
+    expect(resolveVerificationStagePrerequisites(slice, VERIFICATION_STAGES)).toEqual(slice)
+    expect(slice.find((stage) => stage.id === 'vitest')?.prerequisiteIds).toEqual([])
+    expect(slice.filter((stage) => stage.id === 'production-build')).toHaveLength(1)
+  })
+
+  it('deduplicates prerequisites and rejects missing or cyclic stage dependencies', () => {
+    const producer = verificationStage('producer', 'blocking')
+    const consumer = {
+      ...verificationStage('consumer', 'blocking'),
+      prerequisites: [{ id: 'producer' }],
+    }
+    expect(
+      resolveVerificationStagePrerequisites([consumer, producer], [producer, consumer]).map(
+        (stage) => stage.id,
+      ),
+    ).toEqual(['producer', 'consumer'])
+    expect(() => resolveVerificationStagePrerequisites([consumer], [])).toThrow(
+      'VerificationStagePrerequisiteMissing:consumer:producer',
+    )
+    expect(() =>
+      resolveVerificationStagePrerequisites([{ ...consumer, prerequisiteIds: ['producer'] }], []),
+    ).toThrow('VerificationStagePrerequisiteMissing:consumer:producer')
+    expect(() =>
+      resolveVerificationStagePrerequisites(
+        [consumer],
+        [{ ...producer, prerequisites: [{ id: 'consumer' }] }, consumer],
+      ),
+    ).toThrow('VerificationStagePrerequisiteCycle:consumer')
+  })
+
   it('keeps the Node 26 localStorage file scoped to the Vitest child', () => {
     const root = '/workspace'
     const runDirectory = '/evidence/current-run'
@@ -224,7 +514,7 @@ describe('verification runner', () => {
     expect(vitestEnv.E2E_PORT).toBe('29000')
     expect(vitestEnv.E2E_FAKE_PROVIDER_PORT).toBe('29001')
     expect(browserEnv.E2E_REUSE_EXISTING_SERVER).toBe('0')
-    expect(browserEnv.E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE).toBe('1')
+    expect(browserEnv).not.toHaveProperty('E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE')
     expect(browserEnv.E2E_SKIP_BUILD).toBe('1')
     expect(firefoxEnv.E2E_SKIP_BUILD).toBe('1')
     expect(headedEnv.E2E_SKIP_BUILD).toBe('1')
@@ -255,20 +545,8 @@ describe('verification runner', () => {
     expect(vitestEnv.E2E_SKIP_BUILD).toBeUndefined()
     expect(vitestEnv.E2E_DEV_PREVIEW_PARITY).toBeUndefined()
     expect(vitestEnv.E2E_PLAYWRIGHT_OUTPUT_DIR).toBeUndefined()
-    expect(browser.argv).toEqual([
-      'pnpm',
-      'exec',
-      'playwright',
-      'test',
-      '--project=chromium-send-performance',
-    ])
-    expect(firefox.argv).toEqual([
-      'pnpm',
-      'exec',
-      'playwright',
-      'test',
-      '--project=firefox-send-performance',
-    ])
+    expect(browser.argv).toEqual(['node', 'scripts/run-verification.mjs', '--browser', 'chromium'])
+    expect(firefox.argv).toEqual(['node', 'scripts/run-verification.mjs', '--browser', 'firefox'])
     expect(headed.argv).toEqual(['pnpm', 'run', 'e2e:headed-visibility'])
     expect(parity.argv).toEqual([
       'pnpm',
@@ -297,7 +575,10 @@ describe('verification runner', () => {
       verificationStage('firefox-e2e', 'blocking'),
       verificationStage('stream-profile-single', 'blocking'),
       verificationStage('stream-profile-concurrent', 'blocking'),
-      verificationStage('performance', 'blocking'),
+      {
+        ...verificationStage('performance', 'blocking'),
+        preparation: 'performance-evidence' as const,
+      },
     ]
 
     await runVerification({
@@ -427,6 +708,33 @@ describe('verification runner', () => {
         ],
       },
     )
+  })
+
+  it('uses an admitted compiler proof without spawning the duplicate compiler and records its identity', async () => {
+    const stage = VERIFICATION_STAGES.find((stage) => stage.id === 'test-typescript')
+    if (!stage) throw new Error('TestCompilerStageMissing')
+    const evidence = {
+      kind: 'candidate-test-compiler' as const,
+      candidateId: 'candidate',
+      candidateDigest: 'source',
+      snapshotDigest: 'snapshot',
+      compilerCohortDigest: 'cohort',
+      captureDigest: 'capture',
+    }
+    const calls: string[] = []
+    const result = await runVerification({
+      root: '/unavailable-candidate-workspace',
+      stages: [stage],
+      metadata: verificationMetadata(),
+      testCompilerProof: (item) => {
+        calls.push(item.id)
+        return { ...passedExecution(), evidence }
+      },
+      persistSummary: async () => undefined,
+    })
+    expect(calls).toEqual(['test-typescript'])
+    expect(result.exitCode).toBe(0)
+    expect(result.summary.stages[0]?.evidence).toEqual(evidence)
   })
 
   it('retains file-backed stage logs under the external evidence root', async () => {

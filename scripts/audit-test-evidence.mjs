@@ -2,12 +2,19 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { staticAuditState } from './audit-result-state.mjs'
+import { playwrightProjects } from './playwright-projects.mjs'
+import { browserGroupProjects } from './playwright-selection.mjs'
+import { VERIFICATION_STAGES } from './run-verification.mjs'
 import { buildTestEvidenceInventory, TEST_EVIDENCE_DIMENSIONS } from './test-evidence-inventory.mjs'
 import {
   ALLOWED_DEV_BUILT_DIVERGENCES,
   DECLARED_TEST_DOMAINS,
   TEST_GUARANTEE_CLAIMS,
 } from './test-evidence-manifest.mjs'
+import {
+  verificationStageReference,
+  verificationStageReferenceProblems,
+} from './verification-stage-contract.mjs'
 
 const DEFAULT_ROOT = resolve(import.meta.dirname, '..')
 const PNPM_ACTION_SETUP_REVISION = '0977fd99725f1db4007ccb2928dbb4e90d06cc86'
@@ -145,6 +152,12 @@ function validateVerificationParity(root, problems) {
     'utf8',
   )
   const verifyTimeoutMinutes = Number(/timeout-minutes:\s*(\d+)/u.exec(workflow)?.[1])
+  const projects = playwrightProjects()
+  const stageEvidenceSatisfied = (id, expected) =>
+    verificationStageReferenceProblems(
+      verificationStageReference(id, expected),
+      VERIFICATION_STAGES,
+    ).length === 0
   const assertions = [
     parityAssertion(
       'shared-entrypoint',
@@ -167,21 +180,36 @@ function validateVerificationParity(root, problems) {
     parityAssertion(
       'cross-browser-gate',
       workflow.includes('playwright install --with-deps chromium firefox') &&
-        runner.includes("stage('chromium-e2e'") &&
-        runner.includes("'firefox-e2e',") &&
-        runner.indexOf("'firefox-e2e',") > runner.indexOf("stage('chromium-e2e'"),
+        VERIFICATION_STAGES.some((stage) => stage.id === 'chromium-e2e') &&
+        VERIFICATION_STAGES.findIndex((stage) => stage.id === 'firefox-e2e') >
+          VERIFICATION_STAGES.findIndex((stage) => stage.id === 'chromium-e2e'),
       'The sealed local and GitHub checkpoint executes both required browser engines against the same production artifact.',
     ),
     parityAssertion(
       'isolated-send-latency',
-      playwright.includes("name: 'chromium-send-performance'") &&
-        playwright.includes("name: 'firefox-send-performance'") &&
-        playwright.includes('testMatch: [sendPerformanceSpec, renderWindowPerformanceSpec]') &&
-        playwright.includes('renderWindowPerformanceSpec') &&
-        playwright.includes("? ['chromium-large-workspace']") &&
-        playwright.includes("dependencies: ['firefox']") &&
-        runner.includes("'--project=chromium-send-performance'") &&
-        runner.includes("'--project=firefox-send-performance'"),
+      playwright.includes('projects: selectedPlaywrightProjects(process.env)') &&
+        ['chromium-send-performance', 'firefox-send-performance'].every((name) => {
+          const project = projects.find((entry) => entry.name === name)
+          return (
+            project?.workers === 1 &&
+            project.fullyParallel === false &&
+            project.testMatch.some((pattern) => pattern.test('send-performance.spec.ts'))
+          )
+        }) &&
+        projects.find((entry) => entry.name === 'chromium-send-performance')?.executionPhase ===
+          'measurement' &&
+        projects.find((entry) => entry.name === 'firefox-send-performance')?.executionPhase ===
+          'measurement' &&
+        stageEvidenceSatisfied('chromium-e2e', {
+          policy: 'blocking',
+          kind: 'playwright',
+          browserProjects: browserGroupProjects('chromium'),
+        }) &&
+        stageEvidenceSatisfied('firefox-e2e', {
+          policy: 'blocking',
+          kind: 'playwright',
+          browserProjects: browserGroupProjects('firefox'),
+        }),
       'Strict Chromium interaction and send latency run serially after the complete engine suite, so unrelated parallel stress CPU cannot enter their wall clock; Firefox send latency remains isolated after its complete engine suite.',
     ),
     parityAssertion(
@@ -216,7 +244,6 @@ function validateVerificationParity(root, problems) {
       runner.includes("E2E_DEV_PORT: '4175'") &&
         runner.includes("E2E_FAKE_PROVIDER_PORT: '4174'") &&
         runner.includes("E2E_PORT: '4173'") &&
-        runner.includes("E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE: '1'") &&
         runner.includes("TZ: 'UTC'"),
       'All child stages receive fixed ports, timezone, and isolated large-workspace browser ordering.',
     ),
@@ -225,21 +252,28 @@ function validateVerificationParity(root, problems) {
       playwright.includes("process.env.E2E_SKIP_BUILD === '1'") &&
         playwright.includes('command: applicationServerCommand') &&
         playwright.includes("process.env.E2E_REUSE_EXISTING_SERVER === '1'") &&
-        runner.includes("stage('production-build'") &&
-        runner.includes("'firefox-e2e',") &&
-        runner.includes("'headed-hidden-tab-visual-continuity',") &&
-        runner.includes("'dev-preview-parity',") &&
-        runner.includes('].includes(item.id)'),
+        VERIFICATION_STAGES.some((stage) => stage.id === 'production-build') &&
+        VERIFICATION_STAGES.filter((stage) => stage.kind === 'playwright').every((stage) =>
+          stage.prerequisites.some((dependency) => dependency.id === 'production-build'),
+        ),
       'Direct Playwright builds then previews, while checkpoint execution builds once and every later browser workload consumes that exact artifact.',
     ),
     parityAssertion(
       'dev-preview-public-path',
-      runner.includes("'dev-preview-parity',") &&
-        runner.includes("environment.E2E_DEV_PREVIEW_PARITY = '1'") &&
+      stageEvidenceSatisfied('dev-preview-parity', {
+        policy: 'blocking',
+        kind: 'playwright',
+        browserProjects: ['chromium-preview-parity', 'chromium-dev-parity'],
+      }) &&
         playwright.includes('const devPreviewParity = process.env.E2E_DEV_PREVIEW_PARITY') &&
-        playwright.includes("name: 'chromium-preview-parity'") &&
-        playwright.includes("name: 'chromium-dev-parity'") &&
-        playwright.includes('testMatch: devPreviewParitySpec'),
+        playwright.includes('projects: selectedPlaywrightProjects(process.env)') &&
+        ['chromium-preview-parity', 'chromium-dev-parity'].every((name) => {
+          const project = projects.find((entry) => entry.name === name)
+          return (
+            project?.activation === 'E2E_DEV_PREVIEW_PARITY' &&
+            project.testMatch.some((pattern) => pattern.test('dev-preview-parity.spec.ts'))
+          )
+        }),
       'One blocking runtime stage executes the same public-path spec against Vite dev and the already-built preview.',
     ),
     parityAssertion(
@@ -446,6 +480,14 @@ function validateClaims({ claims, root, fileByPath, problems }) {
 }
 
 function validateReference(reference, root, prefix, problems) {
+  if (reference?.stage !== undefined) {
+    problems.push(
+      ...verificationStageReferenceProblems(reference, VERIFICATION_STAGES).map(
+        (problem) => `${prefix}: ${problem}`,
+      ),
+    )
+    return
+  }
   if (!reference?.path || !reference?.locator) {
     problems.push(`${prefix}: evidence needs an exact path and locator`)
     return

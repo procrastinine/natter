@@ -26,6 +26,37 @@ const COMPARISON_MATERIALIZATION_BUDGET_MS = 15_000
 const TEST_SETTLEMENT_BUDGET_MS = 1_000
 
 describe('committed verification comparison', () => {
+  it('captures every runner-scoped root input that snapshot construction consumes', () => {
+    const inputs = [
+      'biome.json',
+      'tsconfig.app.json',
+      'tsconfig.test.json',
+      'jscpd.production.json',
+      'index.html',
+      'vitest.config.ts',
+    ]
+    const capture = comparisonCapture(
+      Object.fromEntries(
+        inputs.map((path) => [
+          path,
+          {
+            bytes: Buffer.from(
+              path.endsWith('.ts')
+                ? 'export default {}\n'
+                : path.endsWith('.html')
+                  ? '<!doctype html>\n'
+                  : '{}\n',
+            ),
+            executable: false,
+          },
+        ]),
+      ),
+    )
+    const comparison = buildCommittedVerificationComparison({ manifest, capture })
+    expect(Object.keys(comparison.snapshot.files).sort()).toEqual([...inputs].sort())
+    expect(comparison.sourceStats.selectedFileCount).toBe(inputs.length)
+  })
+
   it('accepts only the fixed comparison mode or a persisted baseline id', () => {
     expect(parseVerificationSlicePlanArgs(['--begin', '--json'])).toEqual({
       begin: true,
@@ -82,6 +113,47 @@ describe('committed verification comparison', () => {
       restoreCommittedVerificationComparison(JSON.parse(JSON.stringify(first)), manifest),
     ).toEqual(first)
   })
+
+  it.each([2, 3])(
+    'rejects retained snapshot schema %s and rematerializes from Git source',
+    (oldVersion) => {
+      const capture = comparisonCapture({
+        'src/a.ts': { bytes: Buffer.from('export const a = 1\n'), executable: false },
+      })
+      const comparison = buildCommittedVerificationComparison({ manifest, capture })
+      const {
+        digest: _snapshotDigest,
+        unitExecution: _unitExecution,
+        ...snapshotFields
+      } = comparison.snapshot
+      const oldSnapshotFields = { ...snapshotFields, schemaVersion: oldVersion }
+      const oldSnapshot = {
+        ...oldSnapshotFields,
+        digest: createHash('sha256').update(JSON.stringify(oldSnapshotFields)).digest('hex'),
+      }
+      const { digest: _comparisonDigest, ...comparisonFields } = comparison
+      const oldComparisonFields = {
+        ...comparisonFields,
+        snapshotSchemaVersion: oldVersion,
+        snapshot: oldSnapshot,
+      }
+      const retained = {
+        ...oldComparisonFields,
+        digest: `sha256:${createHash('sha256').update(JSON.stringify(oldComparisonFields)).digest('hex')}`,
+      }
+      const retainedBytes = JSON.stringify(retained)
+      expect(() => restoreCommittedVerificationComparison(retained, manifest)).toThrow(
+        'VerificationComparisonEnvelopeInvalid',
+      )
+      const rematerialized = buildCommittedVerificationComparison({ manifest, capture })
+      expect(rematerialized.snapshotSchemaVersion).toBe(4)
+      expect(rematerialized.snapshot.unitExecution.status).toBe('unavailable')
+      expect(rematerialized.commitOid).toBe(retained.commitOid)
+      expect(rematerialized.treeOid).toBe(retained.treeOid)
+      expect(rematerialized.snapshot.digest).not.toBe(retained.snapshot.digest)
+      expect(JSON.stringify(retained)).toBe(retainedBytes)
+    },
+  )
 
   it('rejects batch bytes that do not match the Git object identity', () => {
     const capture = comparisonCapture({

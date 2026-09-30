@@ -228,85 +228,76 @@ async function readWorkspaceControlSnapshot(
 ): Promise<WorkspaceControlSnapshot> {
   return page.evaluate(
     async ({ sourceDatabaseName, generationLifetimeLock }): Promise<WorkspaceControlSnapshot> => {
-      const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open('natter-control')
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      const requestValue = <T>(request: IDBRequest<T>): Promise<T> =>
-        new Promise((resolve, reject) => {
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      try {
-        const transaction = database.transaction(['manifests', 'compactionStates'], 'readonly')
-        const manifests = transaction.objectStore('manifests')
-        const compactionStates = transaction.objectStore('compactionStates')
-        type ManifestRow = {
-          activeDatabaseName: string
-          activationSequence: number
-          pending?: WorkspaceControlSnapshot['pending']
-        }
-        const manifest = await requestValue(
-          manifests.get('workspace') as IDBRequest<ManifestRow | null>,
-        )
-        if (!manifest) throw new Error('StorageCompactionManifestMissing')
-        const [activeCompaction, sourceCompaction] = await Promise.all([
-          requestValue(
-            compactionStates.get(manifest.activeDatabaseName) as IDBRequest<
-              WorkspaceCompactionSnapshot | undefined
-            >,
-          ),
-          sourceDatabaseName
-            ? requestValue(
-                compactionStates.get(sourceDatabaseName) as IDBRequest<
-                  WorkspaceCompactionSnapshot | undefined
-                >,
-              )
-            : Promise.resolve(undefined),
-        ])
-        const databaseNames =
-          typeof indexedDB.databases === 'function'
-            ? (await indexedDB.databases()).flatMap((candidate) =>
-                candidate.name === undefined ? [] : [candidate.name],
-              )
-            : []
-        const locks = await navigator.locks.query()
-        return {
-          activeDatabaseName: manifest.activeDatabaseName,
-          activationSequence: manifest.activationSequence,
-          pending: manifest.pending ?? null,
-          activeCompaction: activeCompaction ?? null,
-          sourceCompaction: sourceCompaction ?? null,
-          databaseNames,
-          runtimeState:
-            document
-              .querySelector<HTMLElement>('[data-ui="app-shell"]')
-              ?.getAttribute('data-workspace-runtime-state') ?? null,
-          generationLifetimeLocks: {
-            held: (locks.held ?? [])
-              .flatMap((lock) =>
-                (lock.name === generationLifetimeLock ||
-                  lock.name?.startsWith('workspace:generation-owner:')) &&
-                lock.mode
-                  ? [lock.mode]
-                  : [],
-              )
-              .sort(),
-            pending: (locks.pending ?? [])
-              .flatMap((lock) =>
-                (lock.name === generationLifetimeLock ||
-                  lock.name?.startsWith('workspace:generation-owner:')) &&
-                lock.mode
-                  ? [lock.mode]
-                  : [],
-              )
-              .sort(),
-          },
-        }
-      } finally {
-        database.close()
-      }
+      return globalThis.__natterNativeStorageFixture.control(
+        { purpose: 'read-only-assertion' },
+        async (database, requestValue) => {
+          const transaction = database.transaction(['manifests', 'compactionStates'], 'readonly')
+          const manifests = transaction.objectStore('manifests')
+          const compactionStates = transaction.objectStore('compactionStates')
+          type ManifestRow = {
+            activeDatabaseName: string
+            activationSequence: number
+            pending?: WorkspaceControlSnapshot['pending']
+          }
+          const manifest = await requestValue(
+            manifests.get('workspace') as IDBRequest<ManifestRow | null>,
+          )
+          if (!manifest) throw new Error('StorageCompactionManifestMissing')
+          const [activeCompaction, sourceCompaction] = await Promise.all([
+            requestValue(
+              compactionStates.get(manifest.activeDatabaseName) as IDBRequest<
+                WorkspaceCompactionSnapshot | undefined
+              >,
+            ),
+            sourceDatabaseName
+              ? requestValue(
+                  compactionStates.get(sourceDatabaseName) as IDBRequest<
+                    WorkspaceCompactionSnapshot | undefined
+                  >,
+                )
+              : Promise.resolve(undefined),
+          ])
+          const databaseNames =
+            typeof indexedDB.databases === 'function'
+              ? (await indexedDB.databases()).flatMap((candidate) =>
+                  candidate.name === undefined ? [] : [candidate.name],
+                )
+              : []
+          const locks = await navigator.locks.query()
+          return {
+            activeDatabaseName: manifest.activeDatabaseName,
+            activationSequence: manifest.activationSequence,
+            pending: manifest.pending ?? null,
+            activeCompaction: activeCompaction ?? null,
+            sourceCompaction: sourceCompaction ?? null,
+            databaseNames,
+            runtimeState:
+              document
+                .querySelector<HTMLElement>('[data-ui="app-shell"]')
+                ?.getAttribute('data-workspace-runtime-state') ?? null,
+            generationLifetimeLocks: {
+              held: (locks.held ?? [])
+                .flatMap((lock) =>
+                  (lock.name === generationLifetimeLock ||
+                    lock.name?.startsWith('workspace:generation-owner:')) &&
+                  lock.mode
+                    ? [lock.mode]
+                    : [],
+                )
+                .sort(),
+              pending: (locks.pending ?? [])
+                .flatMap((lock) =>
+                  (lock.name === generationLifetimeLock ||
+                    lock.name?.startsWith('workspace:generation-owner:')) &&
+                  lock.mode
+                    ? [lock.mode]
+                    : [],
+                )
+                .sort(),
+            },
+          }
+        },
+      )
     },
     { sourceDatabaseName, generationLifetimeLock: GENERATION_LIFETIME_LOCK },
   )
@@ -319,21 +310,15 @@ async function readChatTitleFromDatabase(
 ): Promise<string | null> {
   return page.evaluate(
     async ({ databaseName, chatId }) => {
-      const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        const row = await new Promise<{ title?: unknown } | undefined>((resolve, reject) => {
-          const request = database.transaction('chats', 'readonly').objectStore('chats').get(chatId)
-          request.onsuccess = () => resolve(request.result as { title?: unknown } | undefined)
-          request.onerror = () => reject(request.error)
-        })
-        return typeof row?.title === 'string' ? row.title : null
-      } finally {
-        database.close()
-      }
+      return globalThis.__natterNativeStorageFixture.observeNamed(
+        { purpose: 'read-only-assertion', databaseName: databaseName },
+        async (database, request) => {
+          const row = (await request(
+            database.transaction('chats', 'readonly').objectStore('chats').get(chatId),
+          )) as { title?: unknown } | undefined
+          return typeof row?.title === 'string' ? row.title : null
+        },
+      )
     },
     { databaseName, chatId },
   )
@@ -344,31 +329,414 @@ async function readFirstPresetFromDatabase(
   databaseName: string,
 ): Promise<{ id: string; name: string } | null> {
   return page.evaluate(async (databaseName) => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(databaseName)
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      const row = await new Promise<{ id?: unknown; name?: unknown } | undefined>(
-        (resolve, reject) => {
-          const request = database
-            .transaction('presets', 'readonly')
-            .objectStore('presets')
-            .openCursor()
-          request.onsuccess = () =>
-            resolve(request.result?.value as { id?: unknown; name?: unknown } | undefined)
-          request.onerror = () => reject(request.error)
-        },
-      )
-      return typeof row?.id === 'string' && typeof row.name === 'string'
-        ? { id: row.id, name: row.name }
-        : null
-    } finally {
-      database.close()
-    }
+    return globalThis.__natterNativeStorageFixture.observeNamed(
+      { purpose: 'read-only-assertion', databaseName: databaseName },
+      async (database, request) => {
+        const cursor = await request(
+          database.transaction('presets', 'readonly').objectStore('presets').openCursor(),
+        )
+        const row = cursor?.value as { id?: unknown; name?: unknown } | undefined
+        return typeof row?.id === 'string' && typeof row.name === 'string'
+          ? { id: row.id, name: row.name }
+          : null
+      },
+    )
   }, databaseName)
 }
+
+interface MaintenanceRoundMessage {
+  kind: 'quiesce'
+  senderId: string
+  roundId: string
+  nonce: string
+  sourceDatabaseName: string
+  destinationDatabaseName: string
+}
+
+interface MaintenanceRoundProbe {
+  rounds: MaintenanceRoundMessage[]
+  foregroundRounds: string[]
+  copyClears: Record<string, number>
+  roundChecks: Array<{ name: string; ended: unknown }>
+  runtimeTransitions: Array<{ before: string | null; after: string | null }>
+  channel: BroadcastChannel
+}
+
+async function installMaintenanceRoundProbe(page: Page, origin: string): Promise<void> {
+  const install = (origin: string) => {
+    if (location.origin !== origin) return
+    const scope = window as typeof window & { __e2eMaintenanceRoundProbe?: MaintenanceRoundProbe }
+    if (scope.__e2eMaintenanceRoundProbe) return
+    const channel = new BroadcastChannel('natter-workspace-slot-control:v1')
+    const probe: MaintenanceRoundProbe = {
+      rounds: [],
+      foregroundRounds: [],
+      copyClears: {},
+      roundChecks: [],
+      runtimeTransitions: [],
+      channel,
+    }
+    scope.__e2eMaintenanceRoundProbe = probe
+    channel.addEventListener(
+      'message',
+      (
+        event: MessageEvent<
+          MaintenanceRoundMessage | { kind: 'foreground-demand'; roundId: string }
+        >,
+      ) => {
+        switch (event.data.kind) {
+          case 'quiesce':
+            probe.rounds.push(structuredClone(event.data))
+            break
+          case 'foreground-demand':
+            probe.foregroundRounds.push(event.data.roundId)
+            break
+        }
+      },
+    )
+    const clear = IDBObjectStore.prototype.clear
+    Object.defineProperty(IDBObjectStore.prototype, 'clear', {
+      configurable: true,
+      writable: true,
+      value: function (this: IDBObjectStore) {
+        if (this.name === 'settings') {
+          const name = this.transaction.db.name
+          probe.copyClears[name] = (probe.copyClears[name] ?? 0) + 1
+        }
+        return clear.call(this)
+      },
+    })
+    const request = navigator.locks.request.bind(navigator.locks)
+    Object.defineProperty(navigator.locks, 'request', {
+      configurable: true,
+      writable: true,
+      value: (name: string, ...args: unknown[]) => {
+        const result = Reflect.apply(request, navigator.locks, [name, ...args]) as Promise<unknown>
+        const options = args[0] as LockOptions | undefined
+        if (!name.startsWith('natter:workspace-slot-round:') || options?.ifAvailable !== true) {
+          return result
+        }
+        return result.then((ended) => {
+          probe.roundChecks.push({ name, ended })
+          return ended
+        })
+      },
+    })
+    new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.target instanceof Element && record.target.matches('[data-ui="app-shell"]')) {
+          probe.runtimeTransitions.push({
+            before: record.oldValue,
+            after: record.target.getAttribute('data-workspace-runtime-state'),
+          })
+        }
+      }
+    }).observe(document, {
+      subtree: true,
+      attributes: true,
+      attributeOldValue: true,
+      attributeFilter: ['data-workspace-runtime-state'],
+    })
+  }
+  await page.addInitScript(install, origin)
+}
+
+async function maintenanceRoundProbe(page: Page) {
+  return page.evaluate(() => {
+    const probe = (
+      window as typeof window & {
+        __e2eMaintenanceRoundProbe: MaintenanceRoundProbe
+      }
+    ).__e2eMaintenanceRoundProbe
+    return {
+      rounds: probe.rounds,
+      foregroundRounds: probe.foregroundRounds,
+      copyClears: probe.copyClears,
+      roundChecks: probe.roundChecks,
+      runtimeTransitions: probe.runtimeTransitions,
+    }
+  })
+}
+
+async function injectCompactionCatchupBurst(
+  page: Page,
+  databaseName: string,
+  limit: 'rows' | 'bytes',
+): Promise<void> {
+  await page.evaluate(
+    async ({ databaseName, limit }) => {
+      await globalThis.__natterNativeStorageFixture.offline(
+        { purpose: 'fault-injection', databaseName },
+        async (database, request) => {
+          const transaction = database.transaction(
+            ['settings', 'replacementCatchup__settings'],
+            'readwrite',
+          )
+          const settings = transaction.objectStore('settings')
+          const journal = transaction.objectStore('replacementCatchup__settings')
+          if (!(await request(journal.get('!active'))))
+            throw new Error('CompactionCatchupNotActive')
+          const rows =
+            limit === 'rows'
+              ? Array.from({ length: 300 }, (_, index) => ({
+                  key: `global:e2e-compaction-row-${String(index).padStart(3, '0')}`,
+                  value: `initial-${index}`,
+                }))
+              : [
+                  { key: 'global:e2e-compaction-row-000', value: 'latest-value' },
+                  { key: 'global:e2e-compaction-large', value: 'x'.repeat(2 * 1024 * 1024 + 1) },
+                ]
+          const revision = crypto.randomUUID()
+          await Promise.all(
+            rows.flatMap((row) => [
+              request(settings.put(row)),
+              request(
+                journal.put({
+                  id: `s:${row.key.length}:${row.key}`,
+                  sourceTableName: 'settings',
+                  sourceKey: row.key,
+                  revision,
+                }),
+              ),
+            ]),
+          )
+        },
+      )
+    },
+    { databaseName, limit },
+  )
+}
+
+test('compaction retains one copy through row and byte deferrals and rejects completed peer rounds', async ({
+  page,
+}, testInfo) => {
+  testInfo.setTimeout(180_000)
+  await clearIndexedDb(page)
+  await seedFirstRun(page)
+  const chatId = await seedLinearChat(page, {
+    messageCount: 2,
+    chatId: 'compaction-continuation-chat',
+    title: 'Compaction continuation',
+  })
+  await expect.poll(() => readWorkspaceControlSnapshot(page)).toMatchObject({ pending: null })
+  const before = await readWorkspaceControlSnapshot(page)
+  if (!before.activeCompaction) throw new Error('CompactionBaselineMissing')
+  const requestedRevision = before.activeCompaction.requestRevision + 1
+  const origin = new URL(page.url()).origin
+  const latch = await page.context().newPage()
+  await latch.route('**/__maintenance-latch__', (route) =>
+    route.fulfill({
+      contentType: 'text/html',
+      body: '<!doctype html><title>Maintenance latch</title>',
+    }),
+  )
+  await installMaintenanceRoundProbe(latch, origin)
+  await latch.goto('/__maintenance-latch__')
+  await installMaintenanceRoundProbe(page, origin)
+  const held = new Map<string, BrowserLockHandle>()
+  let peer: Page | undefined
+  const acquire = async (name: string) => {
+    const handle = await queueBrowserLock(latch, name, 'shared')
+    held.set(handle.id, handle)
+    return handle
+  }
+  const release = async (handle: BrowserLockHandle) => {
+    await releaseBrowserLock(latch, handle)
+    held.delete(handle.id)
+  }
+  const acquired = (handle: BrowserLockHandle) =>
+    expect
+      .poll(() => browserLockState(latch, handle))
+      .toMatchObject({ acquired: true, failure: null })
+  const admissionWaiting = () =>
+    expect
+      .poll(() => readWorkspaceControlSnapshot(page))
+      .toMatchObject({
+        generationLifetimeLocks: { pending: expect.arrayContaining(['exclusive']) },
+      })
+  let generation = await acquire(GENERATION_LIFETIME_LOCK)
+  let source = await acquire(workspaceSlotLock(before.activeDatabaseName))
+  try {
+    await acquired(generation)
+    await acquired(source)
+    await latch.evaluate(
+      async ({ databaseName, requestedRevision, debt }) => {
+        await globalThis.__natterNativeStorageFixture.control(
+          { purpose: 'fault-injection' },
+          async (database, request) => {
+            const transaction = database.transaction('compactionStates', 'readwrite')
+            const store = transaction.objectStore('compactionStates')
+            const state = (await request(store.get(databaseName))) as
+              | WorkspaceCompactionSnapshot
+              | undefined
+            if (!state) throw new Error('CompactionBaselineMissing')
+            await request(
+              store.put({
+                ...state,
+                knownReclaimableBytes: debt,
+                requestRevision: requestedRevision,
+              }),
+            )
+          },
+        )
+      },
+      { databaseName: before.activeDatabaseName, requestedRevision, debt: COMPACTION_DEBT_BYTES },
+    )
+    await page.reload()
+    await admissionWaiting()
+    const preparing = await readWorkspaceControlSnapshot(page)
+    const journal = preparing.pending
+    if (!journal) throw new Error('CompactionPreparingJournalMissing')
+    expect(journal.sourceDatabaseName).toBe(before.activeDatabaseName)
+    expect((await maintenanceRoundProbe(page)).copyClears[journal.destinationDatabaseName]).toBe(1)
+    peer = await page.context().newPage()
+    await installMaintenanceRoundProbe(peer, origin)
+    await peer.goto(`/#/chat/${chatId}`)
+    await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText('Compaction continuation')
+    await expect(peer.locator('html')).not.toHaveAttribute('data-natter-route-foreground', /.+/u)
+    const rounds: MaintenanceRoundMessage[] = []
+    for (const [index, limit] of (['rows', 'bytes'] as const).entries()) {
+      await admissionWaiting()
+      await injectCompactionCatchupBurst(latch, before.activeDatabaseName, limit)
+      const nextGeneration = await acquire(GENERATION_LIFETIME_LOCK)
+      await release(generation)
+      await expect
+        .poll(
+          async () =>
+            (await maintenanceRoundProbe(latch)).rounds.filter(
+              (round) => round.nonce === journal.nonce,
+            ).length,
+        )
+        .toBe(index + 1)
+      const round = (await maintenanceRoundProbe(latch)).rounds.filter(
+        (round) => round.nonce === journal.nonce,
+      )[index]
+      if (!round) throw new Error('CompactionRoundMissing')
+      rounds.push(round)
+      await expect
+        .poll(() => navigatorLockSnapshot(latch))
+        .toMatchObject({
+          pending: expect.arrayContaining([workspaceSlotLock(before.activeDatabaseName)]),
+        })
+      const nextSource = await acquire(workspaceSlotLock(before.activeDatabaseName))
+      await release(source)
+      await acquired(nextGeneration)
+      await acquired(nextSource)
+      generation = nextGeneration
+      source = nextSource
+      await Promise.all([waitForWorkspaceRunning(page), waitForWorkspaceRunning(peer)])
+      await expect(peer.locator('html')).not.toHaveAttribute('data-natter-route-foreground', /.+/u)
+      await expect
+        .poll(() => readWorkspaceControlSnapshot(page))
+        .toMatchObject({
+          activeDatabaseName: before.activeDatabaseName,
+          activationSequence: before.activationSequence,
+          pending: journal,
+          activeCompaction: {
+            requestRevision: requestedRevision,
+            attemptedRevision: requestedRevision,
+          },
+        })
+      expect((await maintenanceRoundProbe(page)).copyClears[journal.destinationDatabaseName]).toBe(
+        1,
+      )
+      await peer.locator('[data-role="chat-title-edit"]').click()
+      const title = `Source remains writable after ${limit} deferral`
+      await peer.locator('[data-ui="chat-title-editor"]').fill(title)
+      await peer.locator('[data-ui="chat-title-editor"]').press('Enter')
+      await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText(title)
+      await expect
+        .poll(() => readChatTitleFromDatabase(latch, before.activeDatabaseName, chatId))
+        .toBe(title)
+      await admissionWaiting()
+    }
+    expect(new Set(rounds.map((round) => round.roundId)).size).toBe(2)
+    expect(
+      (await maintenanceRoundProbe(latch)).foregroundRounds.filter((id) =>
+        rounds.some((round) => round.roundId === id),
+      ),
+    ).toEqual([])
+    await peer.evaluate(() => {
+      const probe = (
+        window as typeof window & { __e2eMaintenanceRoundProbe: MaintenanceRoundProbe }
+      ).__e2eMaintenanceRoundProbe
+      probe.roundChecks.length = 0
+      probe.runtimeTransitions.length = 0
+    })
+    await latch.evaluate((rounds) => {
+      const probe = (
+        window as typeof window & { __e2eMaintenanceRoundProbe: MaintenanceRoundProbe }
+      ).__e2eMaintenanceRoundProbe
+      for (const round of rounds) probe.channel.postMessage(round)
+    }, rounds)
+    await expect
+      .poll(async () => (await maintenanceRoundProbe(peer as Page)).roundChecks)
+      .toEqual(
+        rounds.map((round) => ({
+          name: `natter:workspace-slot-round:${round.roundId}`,
+          ended: true,
+        })),
+      )
+    expect((await maintenanceRoundProbe(peer)).runtimeTransitions).toEqual([])
+    await expect(peer.locator('[data-ui="composer-input"]')).toBeEditable()
+    await release(generation)
+    await expect
+      .poll(
+        async () =>
+          (await maintenanceRoundProbe(latch)).rounds.filter(
+            (round) => round.nonce === journal.nonce,
+          ).length,
+      )
+      .toBe(3)
+    await release(source)
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page), { timeout: 30_000 })
+      .toMatchObject({
+        activeDatabaseName: journal.destinationDatabaseName,
+        activationSequence: before.activationSequence + 1,
+        pending: null,
+        activeCompaction: {
+          requestRevision: requestedRevision,
+          completedRevision: requestedRevision,
+        },
+      })
+    await Promise.all([waitForWorkspaceRunning(page), waitForWorkspaceRunning(peer)])
+    expect((await maintenanceRoundProbe(page)).copyClears[journal.destinationDatabaseName]).toBe(1)
+    const stored = await latch.evaluate(async () =>
+      globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (database, request) => {
+          const store = database.transaction('settings', 'readonly').objectStore('settings')
+          const [first, last, large] = (await Promise.all([
+            request(store.get('global:e2e-compaction-row-000')),
+            request(store.get('global:e2e-compaction-row-299')),
+            request(store.get('global:e2e-compaction-large')),
+          ])) as Array<{ value: string }>
+          return { first: first?.value, last: last?.value, largeLength: large?.value.length }
+        },
+      ),
+    )
+    expect(stored).toEqual({
+      first: 'latest-value',
+      last: 'initial-299',
+      largeLength: 2 * 1024 * 1024 + 1,
+    })
+    await testInfo.attach('compaction-continuation.json', {
+      contentType: 'application/json',
+      body: JSON.stringify({
+        before,
+        journal,
+        rounds,
+        stored,
+        owner: await maintenanceRoundProbe(page),
+        peer: await maintenanceRoundProbe(peer),
+      }),
+    })
+  } finally {
+    await Promise.allSettled([...held.values()].map((handle) => releaseBrowserLock(latch, handle)))
+    await Promise.allSettled([peer?.close(), latch.close()])
+  }
+})
 
 test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state', async ({
   page,
@@ -1067,49 +1435,46 @@ test('records schema cleanup without assuming immediate Chromium quota reclamati
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
       return (await navigator.storage.estimate()).usage ?? 0
     }
-    const open = (version: number, upgrade: (db: IDBDatabase) => void): Promise<IDBDatabase> =>
-      new Promise((resolve, reject) => {
-        const request = indexedDB.open(dbName, version)
-        request.onupgradeneeded = () => upgrade(request.result)
-        request.onerror = () => reject(request.error)
-        request.onsuccess = () => resolve(request.result)
-      })
-    const complete = (transaction: IDBTransaction): Promise<void> =>
-      new Promise((resolve, reject) => {
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error)
-      })
-    const remove = (): Promise<void> =>
-      new Promise((resolve, reject) => {
-        const request = indexedDB.deleteDatabase(dbName)
-        request.onerror = () => reject(request.error)
-        request.onsuccess = () => resolve()
-      })
-
     const beforeBytes = await usage()
-    const first = await open(1, (db) => db.createObjectStore('obsolete', { keyPath: 'id' }))
-    const write = first.transaction('obsolete', 'readwrite')
-    const store = write.objectStore('obsolete')
-    for (let id = 0; id < rowCount; id += 1) {
-      const bytes = new Uint8Array(rowBytes)
-      for (let offset = 0; offset < bytes.length; offset += 65_536) {
-        crypto.getRandomValues(bytes.subarray(offset, Math.min(bytes.length, offset + 65_536)))
-      }
-      store.put({ id, blob: new Blob([bytes]) })
-    }
-    await complete(write)
+    await globalThis.__natterNativeStorageFixture.offline(
+      {
+        purpose: 'physical-reclamation',
+        databaseName: dbName,
+        version: 1,
+        upgrade: (db) => {
+          db.createObjectStore('obsolete', { keyPath: 'id' })
+        },
+      },
+      (first) => {
+        const write = first.transaction('obsolete', 'readwrite')
+        const store = write.objectStore('obsolete')
+        for (let id = 0; id < rowCount; id += 1) {
+          const bytes = new Uint8Array(rowBytes)
+          for (let offset = 0; offset < bytes.length; offset += 65_536) {
+            crypto.getRandomValues(bytes.subarray(offset, Math.min(bytes.length, offset + 65_536)))
+          }
+          store.put({ id, blob: new Blob([bytes]) })
+        }
+      },
+    )
     const afterWriteBytes = await usage()
-    first.close()
-
-    const upgraded = await open(2, (db) => {
-      db.deleteObjectStore('obsolete')
-      db.createObjectStore('current', { keyPath: 'id' })
-    })
-    const storesAfterUpgrade = [...upgraded.objectStoreNames]
+    const storesAfterUpgrade = await globalThis.__natterNativeStorageFixture.offline(
+      {
+        purpose: 'physical-reclamation',
+        databaseName: dbName,
+        version: 2,
+        upgrade: (db) => {
+          db.deleteObjectStore('obsolete')
+          db.createObjectStore('current', { keyPath: 'id' })
+        },
+      },
+      (database) => [...database.objectStoreNames],
+    )
     const afterUpgradeBytes = await usage()
-    upgraded.close()
-    await remove()
+    await globalThis.__natterNativeStorageFixture.deleteOffline({
+      purpose: 'physical-reclamation',
+      databaseName: dbName,
+    })
     const afterDeleteBytes = await usage()
 
     return {
@@ -1138,7 +1503,7 @@ test('clear all reloads into a fresh workspace that can fetch and select models 
   context,
   page,
 }) => {
-  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -1158,7 +1523,7 @@ test('clear all reloads into a fresh workspace that can fetch and select models 
       }),
     })
   })
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -1198,21 +1563,19 @@ test('clear all reloads into a fresh workspace that can fetch and select models 
     sessionStorage: 'natter-clear-all-session-probe',
   }
   const seeded = await page.evaluate(async (names) => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(names.database, 1)
-      request.onupgradeneeded = () => request.result.createObjectStore('rows')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction('rows', 'readwrite')
-      transaction.objectStore('rows').put('probe', 'probe')
-      transaction.oncomplete = () => resolve()
-      transaction.onerror = () => reject(transaction.error)
-      transaction.onabort = () => reject(transaction.error)
-    })
-    database.close()
-
+    await globalThis.__natterNativeStorageFixture.offline(
+      {
+        purpose: 'physical-reclamation',
+        databaseName: names.database,
+        version: 1,
+        upgrade: (database) => {
+          database.createObjectStore('rows')
+        },
+      },
+      (database) => {
+        database.transaction('rows', 'readwrite').objectStore('rows').put('probe', 'probe')
+      },
+    )
     const cache = await caches.open(names.cache)
     await cache.put('/__natter-clear-all-cache-probe__', new Response('probe'))
     localStorage.setItem(names.localStorage, 'probe')

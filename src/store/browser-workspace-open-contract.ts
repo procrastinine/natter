@@ -1,4 +1,16 @@
 import type { BrowserWorkspaceDatabaseName } from '../lib/origin-storage-names'
+import type { BrowserWorkspaceReplacementPreparing } from './browser-workspace-database-control'
+import type { BrowserWorkspaceSelectionGrant } from './browser-workspace-slot-coordination'
+import type { WorkspaceFence } from './repository'
+
+export type BrowserWorkspaceOpenTarget =
+  | { readonly kind: 'active' }
+  | {
+      readonly kind: 'retained-source'
+      readonly selection: BrowserWorkspaceSelectionGrant
+      readonly journal: BrowserWorkspaceReplacementPreparing
+      readonly workspace: WorkspaceFence
+    }
 
 export type BrowserWorkspaceMigrationPhase =
   | 'inactive-copy'

@@ -1,12 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { expect, type Page, test } from './fixtures'
-import {
-  activeWorkspaceDatabaseName,
-  firstChatId,
-  type IndexedDbDump,
-  importIndexedDbDump,
-  readChatRow,
-} from './helpers'
+import { firstChatId, type IndexedDbDump, importIndexedDbDump, readChatRow } from './helpers'
 
 const dumpPath = process.env.NATTER_IDB_DUMP
 const ANTHROPIC_MODEL = 'anthropic/claude-opus-4.7'
@@ -75,68 +69,55 @@ async function legacyProviderSettingsSummary(page: Page): Promise<{
   legacyPresets: string[]
   legacyDisplayRefs: string[]
 }> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  return page.evaluate(async (databaseName) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(databaseName)
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<{
-        legacyChats: string[]
-        legacyPresets: string[]
-        legacyDisplayRefs: string[]
-      }>((resolve, reject) => {
+  return page.evaluate(async () => {
+    return globalThis.__natterNativeStorageFixture.active(
+      { purpose: 'read-only-assertion' },
+      async (db, request) => {
         const tx = db.transaction(['chats', 'presets'], 'readonly')
-        const chatReq = tx.objectStore('chats').getAll()
-        const presetReq = tx.objectStore('presets').getAll()
-        tx.oncomplete = () => {
-          const legacyChats: string[] = []
-          const legacyPresets: string[] = []
-          const legacyDisplayRefs: string[] = []
-          for (const chat of chatReq.result as Array<{
-            id: string
-            settings?: {
-              privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }
-              providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] }
-            }
-          }>) {
-            if ((chat.settings?.privacy?.ignoreProviders?.length ?? 0) > 0)
-              legacyChats.push(chat.id)
-            if ((chat.settings?.privacy?.onlyProviders?.length ?? 0) > 0) legacyChats.push(chat.id)
-            collectLegacyDisplayRefs(
-              `chat:${chat.id}`,
-              chat.settings?.providerPrefs,
-              legacyDisplayRefs,
-            )
+        const [chatRows, presetRows] = await Promise.all([
+          request(tx.objectStore('chats').getAll()),
+          request(tx.objectStore('presets').getAll()),
+        ])
+        const legacyChats: string[] = []
+        const legacyPresets: string[] = []
+        const legacyDisplayRefs: string[] = []
+        for (const chat of chatRows as Array<{
+          id: string
+          settings?: {
+            privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }
+            providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] }
           }
-          for (const preset of presetReq.result as Array<{
-            id: string
-            settings?: {
-              privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }
-              providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] }
-            }
-          }>) {
-            if ((preset.settings?.privacy?.ignoreProviders?.length ?? 0) > 0) {
-              legacyPresets.push(preset.id)
-            }
-            if ((preset.settings?.privacy?.onlyProviders?.length ?? 0) > 0) {
-              legacyPresets.push(preset.id)
-            }
-            collectLegacyDisplayRefs(
-              `preset:${preset.id}`,
-              preset.settings?.providerPrefs,
-              legacyDisplayRefs,
-            )
-          }
-          resolve({ legacyChats, legacyPresets, legacyDisplayRefs })
+        }>) {
+          if ((chat.settings?.privacy?.ignoreProviders?.length ?? 0) > 0) legacyChats.push(chat.id)
+          if ((chat.settings?.privacy?.onlyProviders?.length ?? 0) > 0) legacyChats.push(chat.id)
+          collectLegacyDisplayRefs(
+            `chat:${chat.id}`,
+            chat.settings?.providerPrefs,
+            legacyDisplayRefs,
+          )
         }
-        tx.onerror = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
-    }
+        for (const preset of presetRows as Array<{
+          id: string
+          settings?: {
+            privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }
+            providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] }
+          }
+        }>) {
+          if ((preset.settings?.privacy?.ignoreProviders?.length ?? 0) > 0) {
+            legacyPresets.push(preset.id)
+          }
+          if ((preset.settings?.privacy?.onlyProviders?.length ?? 0) > 0) {
+            legacyPresets.push(preset.id)
+          }
+          collectLegacyDisplayRefs(
+            `preset:${preset.id}`,
+            preset.settings?.providerPrefs,
+            legacyDisplayRefs,
+          )
+        }
+        return { legacyChats, legacyPresets, legacyDisplayRefs }
+      },
+    )
 
     function collectLegacyDisplayRefs(
       row: string,
@@ -149,7 +130,7 @@ async function legacyProviderSettingsSummary(page: Page): Promise<{
         }
       }
     }
-  }, databaseName)
+  })
 }
 
 async function openMostRecentChat(page: Page): Promise<void> {
@@ -162,7 +143,7 @@ async function routeOpenRouterFromDump(page: Page, dump: IndexedDbDump): Promise
   const modelsRows = dump.stores.models ?? []
   const endpointRows = dump.stores.endpoints ?? []
   const privacyRows = dump.stores.privacyPolicies ?? []
-  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     const row = modelsRows.find((row) => {
       const rec = row as { payload?: { data?: unknown[] } }
       return Array.isArray(rec.payload?.data) && rec.payload.data.length > 0
@@ -173,7 +154,7 @@ async function routeOpenRouterFromDump(page: Page, dump: IndexedDbDump): Promise
       body: JSON.stringify(row?.payload ?? { data: [] }),
     })
   })
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     const url = new URL(route.request().url())
     const suffix = url.pathname.replace('/api/v1/models/', '').replace('/endpoints', '')
     const modelId = decodeURIComponent(suffix)
@@ -186,7 +167,7 @@ async function routeOpenRouterFromDump(page: Page, dump: IndexedDbDump): Promise
       body: JSON.stringify(row?.payload ?? { data: { id: modelId, endpoints: [] } }),
     })
   })
-  await page.route('**/_or_scrape/**', async (route) => {
+  await page.context().route('**/_or_scrape/**', async (route) => {
     const url = new URL(route.request().url())
     const target = url.searchParams.get('url') ?? url.pathname
     const row = privacyRows.find((row) =>

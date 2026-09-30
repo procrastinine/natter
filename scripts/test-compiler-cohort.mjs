@@ -10,6 +10,7 @@ export const TEST_COMPILER_COHORT_DESCRIPTOR = deepFreeze({
   },
   compiler: {
     packageSpecifier: '@typescript/native',
+    cliRelativePath: 'node_modules/@typescript/native/bin/tsc',
     rootArgs: ['-p', 'tsconfig.test.json', '--showConfig', '--pretty', 'false', '--locale', 'en'],
     diagnosticArgs: ['-p', 'tsconfig.test.json', '--noEmit', '--pretty', 'false', '--locale', 'en'],
     environment: {
@@ -30,6 +31,45 @@ export const TEST_COMPILER_COHORT_DESCRIPTOR = deepFreeze({
 })
 
 export const TEST_COMPILER_COHORT_DESCRIPTOR_DIGEST = digestJson(TEST_COMPILER_COHORT_DESCRIPTOR)
+
+export const TEST_COMPILER_DIAGNOSTIC_ARGV = Object.freeze([
+  'node',
+  TEST_COMPILER_COHORT_DESCRIPTOR.compiler.cliRelativePath,
+  ...TEST_COMPILER_COHORT_DESCRIPTOR.compiler.diagnosticArgs,
+])
+
+export function capturedTestCompilerExecution(stage, candidate) {
+  const cohort = candidate.compilerCohort
+  if (
+    !stage.compilerProof ||
+    JSON.stringify(stage.argv) !== JSON.stringify(TEST_COMPILER_DIAGNOSTIC_ARGV) ||
+    JSON.stringify(stage.environment) !==
+      JSON.stringify(TEST_COMPILER_COHORT_DESCRIPTOR.compiler.environment)
+  )
+    throw new Error('VerificationCompilerProofStageMismatch')
+  if (
+    cohort.status !== 'resolved' ||
+    cohort.candidateId !== candidate.id ||
+    cohort.snapshotDigest !== candidate.snapshot.digest ||
+    cohort.descriptorDigest !== TEST_COMPILER_COHORT_DESCRIPTOR_DIGEST
+  )
+    throw new Error('VerificationCompilerProofCandidateMismatch')
+  return Object.freeze({
+    exitCode: cohort.exitCode,
+    signal: cohort.signal,
+    diagnostics: Object.freeze([...cohort.problems]),
+    stdoutPath: null,
+    stderrPath: null,
+    evidence: Object.freeze({
+      kind: 'candidate-test-compiler',
+      candidateId: candidate.id,
+      candidateDigest: candidate.digest,
+      snapshotDigest: candidate.snapshot.digest,
+      compilerCohortDigest: cohort.digest,
+      captureDigest: cohort.capture.digest,
+    }),
+  })
+}
 
 export function buildTestCompilerCohort(options) {
   return deriveTestCompilerCohort(options.snapshot, options.capture)

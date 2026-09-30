@@ -6,7 +6,6 @@ import {
 } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Locator, type Page, test } from './fixtures'
 import {
-  activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
   holdIndexedDbStoreGate,
@@ -721,31 +720,24 @@ test('retained imported rows repeatedly own Save & Send and delete across branch
   await page.getByRole('button', { name: 'Delete', exact: true }).click()
   await expect(replacement).toHaveCount(0)
 
-  const databaseName = await activeWorkspaceDatabaseName(page)
   await expect
     .poll(() =>
       page.evaluate(
-        async ({ databaseName, replacementId }) => {
-          const database = await new Promise<IDBDatabase>((resolve, reject) => {
-            const request = indexedDB.open(databaseName)
-            request.onsuccess = () => resolve(request.result)
-            request.onerror = () => reject(request.error)
-          })
-          try {
-            return await new Promise<boolean>((resolve, reject) => {
-              const request = database
-                .transaction('messages', 'readonly')
-                .objectStore('messages')
-                .get(replacementId)
-              request.onsuccess = () =>
-                resolve((request.result as { deleted?: unknown } | undefined)?.deleted === true)
-              request.onerror = () => reject(request.error)
-            })
-          } finally {
-            database.close()
-          }
+        async ({ replacementId }) => {
+          return globalThis.__natterNativeStorageFixture.active(
+            { purpose: 'read-only-assertion' },
+            async (database, request) => {
+              const row = (await request(
+                database
+                  .transaction('messages', 'readonly')
+                  .objectStore('messages')
+                  .get(replacementId),
+              )) as { deleted?: unknown } | undefined
+              return row?.deleted === true
+            },
+          )
         },
-        { databaseName, replacementId },
+        { replacementId },
       ),
     )
     .toBe(true)

@@ -148,8 +148,8 @@
   right: var(--space-6);
   bottom: var(--space-6);
   z-index: var(--z-toast, 100);
-  width: 36px;
-  height: 36px;
+  width: var(--floating-control-size);
+  height: var(--floating-control-size);
   border-radius: 50%;
   border: 1px solid var(--color-border-subtle);
   background: var(--color-bg-surface-1);

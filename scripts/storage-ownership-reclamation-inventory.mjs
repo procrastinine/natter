@@ -857,8 +857,8 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
   lifecycle(
     'compaction-attempt-release',
     'src/store/browser-workspace-compaction.ts',
-    'function isRetryableBrowserWorkspaceCompactionError(error: unknown): boolean {',
-    'The exact claimed revision is released only after typed maintenance preemption, bounded catch-up overflow, or an unpromoted staged-copy cleanup; the idempotent capability creates one newer durable request and publishes the existing maintenance wake, while permanent or uncertain outcomes retain the claim.',
+    'completion: started.handoff.completion.then(async (outcome) => {',
+    'Only unpromoted cancelled/cleanup-required starts or a typed cancelled terminal outcome release the exact claim and publish a newer request. Budget deferral retains the claim, destination, journals and accounting; recovery-required and uncertain outcomes cannot be reclassified by nested causes.',
     [],
   ),
   lifecycle(
@@ -900,7 +900,7 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
     'paged-compaction-copy',
     'src/store/browser-workspace-compaction.ts',
     'async function copyBrowserWorkspace(',
-    'Applies the physical manifest online in 64-row or 1-MiB pages, batches each catch-up page in one transaction-owned request wave, and bounds the final quiesced activation to 256 rows or 4 MiB.',
+    'Applies the physical manifest online in 64-row or 1-MiB pages plus one largest row; catch-up advances one native source read at a time, preserves raw physical accounting, and returns online with the same preparation when the final 256-row or 4-MiB budget is exceeded.',
     ['logical-debt-does-not-measure-physical-amplification'],
   ),
   lifecycle(
@@ -914,7 +914,7 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
     'journal-authorized-peer-recovery',
     'src/store/browser-workspace-database-cleanup.ts',
     'export function recoverQuiescedBrowserWorkspaceReplacement(',
-    'A quiesced peer queues on the durable selection Web Lock, reconciles preparing or cleanup state from the authoritative manifest, deletes only the obsolete slot, and reopens the selected database without a resume message or timer.',
+    'A peer waits only for its exact never-reused promotion round, then probes selection without waiting. Live preparation remains intact while the peer reopens the source; an unowned exact journal may become discard, and the retention owner separately deletes only the obsolete slot.',
     [],
   ),
   lifecycle(
@@ -956,7 +956,7 @@ export const STORAGE_COORDINATION_MECHANISMS = Object.freeze([
     'slot-control-transport',
     'src/store/browser-workspace-slot-coordination.ts',
     "const SLOT_CHANNEL_NAME = 'natter-workspace-slot-control:v1'",
-    'BroadcastChannel/localStorage quiesces tabs while exclusive slot locks protect replacement.',
+    'BroadcastChannel/localStorage carries journal-authorized quiesce and foreground demand for an exact promotion round; that round bounds peer waiting while exclusive slot locks protect activation.',
   ),
   coordination(
     'storage-administration-transport',
@@ -1003,7 +1003,7 @@ export const STORAGE_RECLAMATION_ACCEPTANCE = Object.freeze([
   'Every physical table has exactly one current ownership/classification/reclamation record.',
   'Every normal physical mutation contributes bounded obsolete-byte evidence or is explicitly ephemeral.',
   'Compaction remains linear in live rows/bytes with bounded copy pages and never hydrates cold message bodies into the UI.',
-  'A transient compaction or debt-ledger failure remains retryable without requiring new user churn or a reload.',
+  'A safely retryable compaction or debt-ledger failure remains retryable without new user churn or a reload; budget deferral continues the owned preparation, while recovery-required and uncertain outcomes remain terminal.',
   'Known inactive workspace databases are reclaimed during normal operation even when no replacement journal survives.',
   'Multi-tab streams and tab-local branch cursors remain usable across compaction slot switches.',
   'Clear all deletes and verifies every browser namespace available to the origin while reporting unverifiable browser limits honestly.',

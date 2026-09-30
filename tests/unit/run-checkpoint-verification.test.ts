@@ -128,6 +128,9 @@ function fakeExecutionContext(
 ): VerificationCandidateExecutionContext {
   return {
     candidate,
+    testCompilerProof: () => {
+      throw new Error('UnexpectedCompilerProofRequest')
+    },
     runtime: {
       nodeExecutablePath: '/runtime/node',
       pnpmExecutablePath: '/runtime/pnpm.mjs',

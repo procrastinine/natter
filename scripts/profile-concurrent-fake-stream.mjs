@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { chromium } from '@playwright/test'
+import { installNativeWorkspaceStorageFixture } from './native-workspace-storage-fixture.mjs'
 import {
-  activeWorkspaceDatabaseName,
   assertLoopbackUrl,
   createProviderScenario,
   FAKE_REASONING_SEED,
@@ -77,6 +77,7 @@ try {
     args: ['--enable-precise-memory-info'],
   })
   context = await browser.newContext()
+  await context.addInitScript(installNativeWorkspaceStorageFixture)
 
   const firstPage = await createMeasuredPage(0)
   await seedAndRetargetWorkspace(firstPage, {
@@ -422,101 +423,77 @@ async function runPhase({ label, expectedConcurrent, config, start }) {
 }
 
 async function readApplicationAdmission(page, assistantIds) {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, expectedIds }) => {
-      const db = await new Promise((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        const transaction = db.transaction('streamLeases', 'readonly')
-        const leases = await new Promise((resolve, reject) => {
-          const request = transaction.objectStore('streamLeases').getAll()
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-        await new Promise((resolve, reject) => {
-          transaction.oncomplete = () => resolve()
-          transaction.onerror = () => reject(transaction.error)
-          transaction.onabort = () => reject(transaction.error)
-        })
-        const expected = new Set(expectedIds)
-        const owned = leases.filter((lease) => expected.has(lease.targetOwnerKey))
-        const statuses = {}
-        const observed = new Set()
-        const failures = []
-        for (const lease of owned) {
-          statuses[lease.phase] = (statuses[lease.phase] ?? 0) + 1
-          if (lease.targetOwnerKey !== lease.messageId) {
-            failures.push(`${lease.messageId}: target owner mismatch`)
+    async ({ expectedIds }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          const transaction = db.transaction('streamLeases', 'readonly')
+          const leases = await request(transaction.objectStore('streamLeases').getAll())
+          const expected = new Set(expectedIds)
+          const owned = leases.filter((lease) => expected.has(lease.targetOwnerKey))
+          const statuses = {}
+          const observed = new Set()
+          const failures = []
+          for (const lease of owned) {
+            statuses[lease.phase] = (statuses[lease.phase] ?? 0) + 1
+            if (lease.targetOwnerKey !== lease.messageId) {
+              failures.push(`${lease.messageId}: target owner mismatch`)
+            }
+            if (lease.phase !== 'reserved' && lease.phase !== 'active') {
+              failures.push(`${lease.messageId}: admission phase ${lease.phase}`)
+            }
+            if (observed.has(lease.messageId)) {
+              failures.push(`${lease.messageId}: duplicate admission lease`)
+            }
+            observed.add(lease.messageId)
           }
-          if (lease.phase !== 'reserved' && lease.phase !== 'active') {
-            failures.push(`${lease.messageId}: admission phase ${lease.phase}`)
+          for (const id of expected) {
+            if (!observed.has(id)) failures.push(`${id}: missing admission lease`)
           }
-          if (observed.has(lease.messageId)) {
-            failures.push(`${lease.messageId}: duplicate admission lease`)
+          return {
+            expected: expected.size,
+            observed: observed.size,
+            statuses,
+            failures,
           }
-          observed.add(lease.messageId)
-        }
-        for (const id of expected) {
-          if (!observed.has(id)) failures.push(`${id}: missing admission lease`)
-        }
-        return {
-          expected: expected.size,
-          observed: observed.size,
-          statuses,
-          failures,
-        }
-      } finally {
-        db.close()
-      }
+        },
+      )
     },
-    { databaseName, expectedIds: assistantIds },
+    { expectedIds: assistantIds },
   )
 }
 
 async function collectPageState(page) {
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  return page.evaluate(async (databaseName) => {
-    const db = await new Promise((resolve, reject) => {
-      const request = indexedDB.open(databaseName)
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    const requestResult = (request) =>
-      new Promise((resolve, reject) => {
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-    try {
-      const transaction = db.transaction(['messages', 'streamLeases', 'streamChunks'], 'readonly')
-      const [messages, leases, chunkCount] = await Promise.all([
-        requestResult(transaction.objectStore('messages').getAll()),
-        requestResult(transaction.objectStore('streamLeases').getAll()),
-        requestResult(transaction.objectStore('streamChunks').count()),
-      ])
-      const active = messages.filter((message) => message.generation?.status === 'streaming')
-      return {
-        streamStore: {
-          activeCount: active.length,
-          activeTargets: active.map((message) => ({
-            chatId: message.chatId,
-            messageId: message.id,
-          })),
-          liveSnapshotCount: leases.length,
-          liveTextLength: null,
-          liveReasoningLength: null,
-          streamChunkCount: chunkCount,
-          visibleStopButtons: document.querySelectorAll('[data-ui="abort"]').length,
-          evidenceSource: 'dom-indexeddb',
-        },
-      }
-    } finally {
-      db.close()
-    }
-  }, databaseName)
+  return page.evaluate(async () => {
+    return globalThis.__natterNativeStorageFixture.active(
+      { purpose: 'read-only-assertion' },
+      async (db, requestResult) => {
+        const transaction = db.transaction(['messages', 'streamLeases', 'streamChunks'], 'readonly')
+        const [messages, leases, chunkCount] = await Promise.all([
+          requestResult(transaction.objectStore('messages').getAll()),
+          requestResult(transaction.objectStore('streamLeases').getAll()),
+          requestResult(transaction.objectStore('streamChunks').count()),
+        ])
+        const active = messages.filter((message) => message.generation?.status === 'streaming')
+        return {
+          streamStore: {
+            activeCount: active.length,
+            activeTargets: active.map((message) => ({
+              chatId: message.chatId,
+              messageId: message.id,
+            })),
+            liveSnapshotCount: leases.length,
+            liveTextLength: null,
+            liveReasoningLength: null,
+            streamChunkCount: chunkCount,
+            visibleStopButtons: document.querySelectorAll('[data-ui="abort"]').length,
+            evidenceSource: 'dom-indexeddb',
+          },
+        }
+      },
+    )
+  })
 }
 
 function parseArgs(args) {
@@ -673,242 +650,233 @@ async function measureHeap(_pages, sessions) {
 }
 
 async function verifyStored(page, expected) {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, input }) => {
-      const db = await new Promise((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      const transaction = db.transaction(
-        ['chats', 'messages', 'messageBodies', 'streamLeases', 'streamChunks'],
-        'readonly',
-      )
-      const get = (store, key) =>
-        new Promise((resolve, reject) => {
-          const request = transaction.objectStore(store).get(key)
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      const count = (store) =>
-        new Promise((resolve, reject) => {
-          const request = transaction.objectStore(store).count()
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      const countIndex = (store, index, key) =>
-        new Promise((resolve, reject) => {
-          const request = transaction.objectStore(store).index(index).count(key)
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      const sha256 = async (text) => {
-        const bytes = new TextEncoder().encode(text)
-        const digest = await crypto.subtle.digest('SHA-256', bytes)
-        return [...new Uint8Array(digest)]
-          .map((byte) => byte.toString(16).padStart(2, '0'))
-          .join('')
-      }
-      const durableReasoningText = globalThis.__natterProfileDurableReasoningText
-      if (typeof durableReasoningText !== 'function') {
-        throw new Error('profile durable reasoning observer is unavailable')
-      }
-      const rowsPromise = Promise.all(
-        input.assistantIds.map(async (assistantId, index) => {
-          const previousAssistantId = input.previousAssistantIds[index]
-          const userId = input.userIds[index]
-          const [header, body, userHeader, previousHeader, previousBody, chat] = await Promise.all([
-            get('messages', assistantId),
-            get('messageBodies', assistantId),
-            get('messages', userId),
-            get('messages', previousAssistantId),
-            get('messageBodies', previousAssistantId),
-            get('chats', input.chatIds[index]),
-          ])
-          const context =
-            previousBody?.content
-              ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
-              .map((item) => item.text ?? '')
-              .join('') ?? ''
-          const text =
-            body?.content
-              ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
-              .map((item) => item.text ?? '')
-              .join('') ?? ''
-          const reasoning = durableReasoningText(body)
-          return {
-            assistantId,
-            previousHeaderExists: Boolean(previousHeader),
-            previousBodyExists: Boolean(previousBody),
-            userHeaderExists: Boolean(userHeader),
-            headerExists: Boolean(header),
-            bodyExists: Boolean(body),
-            chatExists: Boolean(chat),
-            bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
-            previousBodyVersionsMatch: previousHeader?.bodyVersion === previousBody?.bodyVersion,
-            multiTurnParentsMatch:
-              userHeader?.parentId === previousAssistantId && header?.parentId === userId,
-            previousStatus: previousHeader?.generation?.status,
-            previousIntegrity: previousHeader?.generation?.integrity,
-            status: header?.generation?.status,
-            integrity: header?.generation?.integrity,
-            contextLength: context.length,
-            textLength: text.length,
-            reasoningLength: reasoning.length,
-            contextHash: await sha256(context),
-            textHash: await sha256(text),
-            reasoningHash: await sha256(reasoning),
+    async ({ input }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          const transaction = db.transaction(
+            ['chats', 'messages', 'messageBodies', 'streamLeases', 'streamChunks'],
+            'readonly',
+          )
+          const get = (store, key) => request(transaction.objectStore(store).get(key))
+          const count = (store) => request(transaction.objectStore(store).count())
+          const countIndex = (store, index, key) =>
+            request(transaction.objectStore(store).index(index).count(key))
+          const sha256 = async (text) => {
+            const bytes = new TextEncoder().encode(text)
+            const digest = await crypto.subtle.digest('SHA-256', bytes)
+            return [...new Uint8Array(digest)]
+              .map((byte) => byte.toString(16).padStart(2, '0'))
+              .join('')
           }
-        }),
-      )
-      const regenerationRowsPromise = Promise.all(
-        input.regenerations.map(async (regeneration) => {
-          const [header, body, sourceHeader, parentHeader, messageCount] = await Promise.all([
-            get('messages', regeneration.assistantMessageId),
-            get('messageBodies', regeneration.assistantMessageId),
-            get('messages', regeneration.sourceAssistantId),
-            get('messages', regeneration.parentUserId),
-            countIndex('messages', 'chatId', regeneration.chatId),
-          ])
-          const text =
-            body?.content
-              ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
-              .map((item) => item.text ?? '')
-              .join('') ?? ''
-          const reasoning = durableReasoningText(body)
-          return {
-            assistantId: regeneration.assistantMessageId,
-            headerExists: Boolean(header),
-            bodyExists: Boolean(body),
-            sourceHeaderExists: Boolean(sourceHeader),
-            parentHeaderExists: Boolean(parentHeader),
-            bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
-            branchShapeMatches:
-              header?.parentId === regeneration.parentUserId &&
-              sourceHeader?.parentId === regeneration.parentUserId &&
-              header?.id !== sourceHeader?.id &&
-              header?.siblingIndex !== sourceHeader?.siblingIndex,
-            parentRole: parentHeader?.role,
-            status: header?.generation?.status,
-            integrity: header?.generation?.integrity,
-            messageCount,
-            textLength: text.length,
-            reasoningLength: reasoning.length,
-            textHash: await sha256(text),
-            reasoningHash: await sha256(reasoning),
+          const durableReasoningText = globalThis.__natterProfileDurableReasoningText
+          if (typeof durableReasoningText !== 'function') {
+            throw new Error('profile durable reasoning observer is unavailable')
           }
-        }),
-      )
-      const [rows, regenerationRows] = await Promise.all([rowsPromise, regenerationRowsPromise])
-      const [leaseCount, chunkCount] = await Promise.all([
-        count('streamLeases'),
-        count('streamChunks'),
-      ])
-      await new Promise((resolve, reject) => {
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error)
-      })
-      db.close()
+          const rowsPromise = Promise.all(
+            input.assistantIds.map(async (assistantId, index) => {
+              const previousAssistantId = input.previousAssistantIds[index]
+              const userId = input.userIds[index]
+              const [header, body, userHeader, previousHeader, previousBody, chat] =
+                await Promise.all([
+                  get('messages', assistantId),
+                  get('messageBodies', assistantId),
+                  get('messages', userId),
+                  get('messages', previousAssistantId),
+                  get('messageBodies', previousAssistantId),
+                  get('chats', input.chatIds[index]),
+                ])
+              const context =
+                previousBody?.content
+                  ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
+                  .map((item) => item.text ?? '')
+                  .join('') ?? ''
+              const text =
+                body?.content
+                  ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
+                  .map((item) => item.text ?? '')
+                  .join('') ?? ''
+              const reasoning = durableReasoningText(body)
+              return {
+                assistantId,
+                previousHeaderExists: Boolean(previousHeader),
+                previousBodyExists: Boolean(previousBody),
+                userHeaderExists: Boolean(userHeader),
+                headerExists: Boolean(header),
+                bodyExists: Boolean(body),
+                chatExists: Boolean(chat),
+                bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
+                previousBodyVersionsMatch:
+                  previousHeader?.bodyVersion === previousBody?.bodyVersion,
+                multiTurnParentsMatch:
+                  userHeader?.parentId === previousAssistantId && header?.parentId === userId,
+                previousStatus: previousHeader?.generation?.status,
+                previousIntegrity: previousHeader?.generation?.integrity,
+                status: header?.generation?.status,
+                integrity: header?.generation?.integrity,
+                contextLength: context.length,
+                textLength: text.length,
+                reasoningLength: reasoning.length,
+                contextHash: await sha256(context),
+                textHash: await sha256(text),
+                reasoningHash: await sha256(reasoning),
+              }
+            }),
+          )
+          const regenerationRowsPromise = Promise.all(
+            input.regenerations.map(async (regeneration) => {
+              const [header, body, sourceHeader, parentHeader, messageCount] = await Promise.all([
+                get('messages', regeneration.assistantMessageId),
+                get('messageBodies', regeneration.assistantMessageId),
+                get('messages', regeneration.sourceAssistantId),
+                get('messages', regeneration.parentUserId),
+                countIndex('messages', 'chatId', regeneration.chatId),
+              ])
+              const text =
+                body?.content
+                  ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
+                  .map((item) => item.text ?? '')
+                  .join('') ?? ''
+              const reasoning = durableReasoningText(body)
+              return {
+                assistantId: regeneration.assistantMessageId,
+                headerExists: Boolean(header),
+                bodyExists: Boolean(body),
+                sourceHeaderExists: Boolean(sourceHeader),
+                parentHeaderExists: Boolean(parentHeader),
+                bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
+                branchShapeMatches:
+                  header?.parentId === regeneration.parentUserId &&
+                  sourceHeader?.parentId === regeneration.parentUserId &&
+                  header?.id !== sourceHeader?.id &&
+                  header?.siblingIndex !== sourceHeader?.siblingIndex,
+                parentRole: parentHeader?.role,
+                status: header?.generation?.status,
+                integrity: header?.generation?.integrity,
+                messageCount,
+                textLength: text.length,
+                reasoningLength: reasoning.length,
+                textHash: await sha256(text),
+                reasoningHash: await sha256(reasoning),
+              }
+            }),
+          )
+          const counts = Promise.all([count('streamLeases'), count('streamChunks')])
+          const [rows, regenerationRows, [leaseCount, chunkCount]] = await Promise.all([
+            rowsPromise,
+            regenerationRowsPromise,
+            counts,
+          ])
 
-      const failures = []
-      for (const row of rows) {
-        if (!row.headerExists) failures.push(`${row.assistantId}: missing header`)
-        if (!row.bodyExists) failures.push(`${row.assistantId}: missing body`)
-        if (!row.previousHeaderExists) failures.push(`${row.assistantId}: missing previous header`)
-        if (!row.previousBodyExists)
-          failures.push(`${row.assistantId}: missing previous context body`)
-        if (!row.userHeaderExists) failures.push(`${row.assistantId}: missing current user header`)
-        if (!row.chatExists) failures.push(`${row.assistantId}: missing chat`)
-        if (!row.bodyVersionsMatch)
-          failures.push(`${row.assistantId}: header/body version mismatch`)
-        if (!row.previousBodyVersionsMatch) {
-          failures.push(`${row.assistantId}: previous header/body version mismatch`)
-        }
-        if (!row.multiTurnParentsMatch)
-          failures.push(`${row.assistantId}: broken multi-turn parent chain`)
-        if (row.previousStatus !== 'done') {
-          failures.push(`${row.assistantId}: previous status ${row.previousStatus}`)
-        }
-        if (row.previousIntegrity !== 'clean') {
-          failures.push(`${row.assistantId}: previous integrity ${row.previousIntegrity}`)
-        }
-        if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
-        if (row.integrity !== 'clean')
-          failures.push(`${row.assistantId}: integrity ${row.integrity}`)
-        if (row.contextLength !== input.contextChars) {
-          failures.push(
-            `${row.assistantId}: context length ${row.contextLength}/${input.contextChars}`,
-          )
-        }
-        if (row.textLength !== input.targetChars) {
-          failures.push(`${row.assistantId}: text length ${row.textLength}/${input.targetChars}`)
-        }
-        if (row.reasoningLength !== input.reasoningChars) {
-          failures.push(
-            `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
-          )
-        }
-        if (row.textHash !== input.expectedTextHash) failures.push(`${row.assistantId}: text hash`)
-        if (row.contextHash !== input.expectedContextHash) {
-          failures.push(`${row.assistantId}: context hash`)
-        }
-        if (row.reasoningHash !== input.expectedReasoningHash) {
-          failures.push(`${row.assistantId}: reasoning hash`)
-        }
-      }
-      for (const row of regenerationRows) {
-        if (!row.headerExists) failures.push(`${row.assistantId}: missing regeneration header`)
-        if (!row.bodyExists) failures.push(`${row.assistantId}: missing regeneration body`)
-        if (!row.sourceHeaderExists) failures.push(`${row.assistantId}: missing source sibling`)
-        if (!row.parentHeaderExists) failures.push(`${row.assistantId}: missing shared parent`)
-        if (!row.bodyVersionsMatch) {
-          failures.push(`${row.assistantId}: regeneration header/body version mismatch`)
-        }
-        if (!row.branchShapeMatches) failures.push(`${row.assistantId}: copied or malformed branch`)
-        if (row.parentRole !== 'user')
-          failures.push(`${row.assistantId}: parent role ${row.parentRole}`)
-        if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
-        if (row.integrity !== 'clean')
-          failures.push(`${row.assistantId}: integrity ${row.integrity}`)
-        if (row.messageCount !== 5) {
-          failures.push(`${row.assistantId}: chat message count ${row.messageCount}/5`)
-        }
-        if (row.textLength !== input.targetChars) {
-          failures.push(`${row.assistantId}: text length ${row.textLength}/${input.targetChars}`)
-        }
-        if (row.reasoningLength !== input.reasoningChars) {
-          failures.push(
-            `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
-          )
-        }
-        if (row.textHash !== input.expectedTextHash) failures.push(`${row.assistantId}: text hash`)
-        if (row.reasoningHash !== input.expectedReasoningHash) {
-          failures.push(`${row.assistantId}: reasoning hash`)
-        }
-      }
-      if (leaseCount !== 0) failures.push(`${leaseCount} stream leases remain`)
-      if (chunkCount !== 0) failures.push(`${chunkCount} stream chunks remain`)
-      return {
-        checkedRows: rows.length,
-        leaseCount,
-        chunkCount,
-        contextBytesChecked: rows.reduce((sum, row) => sum + row.contextLength, 0),
-        textBytesChecked: rows.reduce((sum, row) => sum + row.textLength, 0),
-        reasoningBytesChecked: rows.reduce((sum, row) => sum + row.reasoningLength, 0),
-        regenerationRowsChecked: regenerationRows.length,
-        regenerationTextBytesChecked: regenerationRows.reduce(
-          (sum, row) => sum + row.textLength,
-          0,
-        ),
-        regenerationReasoningBytesChecked: regenerationRows.reduce(
-          (sum, row) => sum + row.reasoningLength,
-          0,
-        ),
-        failures,
-      }
+          const failures = []
+          for (const row of rows) {
+            if (!row.headerExists) failures.push(`${row.assistantId}: missing header`)
+            if (!row.bodyExists) failures.push(`${row.assistantId}: missing body`)
+            if (!row.previousHeaderExists)
+              failures.push(`${row.assistantId}: missing previous header`)
+            if (!row.previousBodyExists)
+              failures.push(`${row.assistantId}: missing previous context body`)
+            if (!row.userHeaderExists)
+              failures.push(`${row.assistantId}: missing current user header`)
+            if (!row.chatExists) failures.push(`${row.assistantId}: missing chat`)
+            if (!row.bodyVersionsMatch)
+              failures.push(`${row.assistantId}: header/body version mismatch`)
+            if (!row.previousBodyVersionsMatch) {
+              failures.push(`${row.assistantId}: previous header/body version mismatch`)
+            }
+            if (!row.multiTurnParentsMatch)
+              failures.push(`${row.assistantId}: broken multi-turn parent chain`)
+            if (row.previousStatus !== 'done') {
+              failures.push(`${row.assistantId}: previous status ${row.previousStatus}`)
+            }
+            if (row.previousIntegrity !== 'clean') {
+              failures.push(`${row.assistantId}: previous integrity ${row.previousIntegrity}`)
+            }
+            if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
+            if (row.integrity !== 'clean')
+              failures.push(`${row.assistantId}: integrity ${row.integrity}`)
+            if (row.contextLength !== input.contextChars) {
+              failures.push(
+                `${row.assistantId}: context length ${row.contextLength}/${input.contextChars}`,
+              )
+            }
+            if (row.textLength !== input.targetChars) {
+              failures.push(
+                `${row.assistantId}: text length ${row.textLength}/${input.targetChars}`,
+              )
+            }
+            if (row.reasoningLength !== input.reasoningChars) {
+              failures.push(
+                `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
+              )
+            }
+            if (row.textHash !== input.expectedTextHash)
+              failures.push(`${row.assistantId}: text hash`)
+            if (row.contextHash !== input.expectedContextHash) {
+              failures.push(`${row.assistantId}: context hash`)
+            }
+            if (row.reasoningHash !== input.expectedReasoningHash) {
+              failures.push(`${row.assistantId}: reasoning hash`)
+            }
+          }
+          for (const row of regenerationRows) {
+            if (!row.headerExists) failures.push(`${row.assistantId}: missing regeneration header`)
+            if (!row.bodyExists) failures.push(`${row.assistantId}: missing regeneration body`)
+            if (!row.sourceHeaderExists) failures.push(`${row.assistantId}: missing source sibling`)
+            if (!row.parentHeaderExists) failures.push(`${row.assistantId}: missing shared parent`)
+            if (!row.bodyVersionsMatch) {
+              failures.push(`${row.assistantId}: regeneration header/body version mismatch`)
+            }
+            if (!row.branchShapeMatches)
+              failures.push(`${row.assistantId}: copied or malformed branch`)
+            if (row.parentRole !== 'user')
+              failures.push(`${row.assistantId}: parent role ${row.parentRole}`)
+            if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
+            if (row.integrity !== 'clean')
+              failures.push(`${row.assistantId}: integrity ${row.integrity}`)
+            if (row.messageCount !== 5) {
+              failures.push(`${row.assistantId}: chat message count ${row.messageCount}/5`)
+            }
+            if (row.textLength !== input.targetChars) {
+              failures.push(
+                `${row.assistantId}: text length ${row.textLength}/${input.targetChars}`,
+              )
+            }
+            if (row.reasoningLength !== input.reasoningChars) {
+              failures.push(
+                `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
+              )
+            }
+            if (row.textHash !== input.expectedTextHash)
+              failures.push(`${row.assistantId}: text hash`)
+            if (row.reasoningHash !== input.expectedReasoningHash) {
+              failures.push(`${row.assistantId}: reasoning hash`)
+            }
+          }
+          if (leaseCount !== 0) failures.push(`${leaseCount} stream leases remain`)
+          if (chunkCount !== 0) failures.push(`${chunkCount} stream chunks remain`)
+          return {
+            checkedRows: rows.length,
+            leaseCount,
+            chunkCount,
+            contextBytesChecked: rows.reduce((sum, row) => sum + row.contextLength, 0),
+            textBytesChecked: rows.reduce((sum, row) => sum + row.textLength, 0),
+            reasoningBytesChecked: rows.reduce((sum, row) => sum + row.reasoningLength, 0),
+            regenerationRowsChecked: regenerationRows.length,
+            regenerationTextBytesChecked: regenerationRows.reduce(
+              (sum, row) => sum + row.textLength,
+              0,
+            ),
+            regenerationReasoningBytesChecked: regenerationRows.reduce(
+              (sum, row) => sum + row.reasoningLength,
+              0,
+            ),
+            failures,
+          }
+        },
+      )
     },
-    { databaseName, input: expected },
+    { input: expected },
   )
 }

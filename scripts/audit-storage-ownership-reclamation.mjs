@@ -272,20 +272,122 @@ export function discoverBrowserWorkspaceDatabaseNames(root = ROOT) {
   return Object.freeze(names)
 }
 
+export function inspectCompactionContinuation(source) {
+  const problems = []
+  const normalized = source.replace(/\s+/g, ' ')
+  for (const [token, label] of [
+    [
+      "if (started.kind !== 'handoff') { if ( (started.kind === 'cleanup-required' || started.kind === 'cancelled') && attemptState.claim !== null ) { const release = await attemptState.claim.release() if (release.released) publishStorageCompactionRequest() } return started }",
+      'unpromoted typed claim release',
+    ],
+    [
+      "completion: started.handoff.completion.then(async (outcome) => { if (outcome.kind === 'cancelled' && attemptState.claim !== null) { const release = await attemptState.claim.release() if (release.released) publishStorageCompactionRequest() } return outcome }),",
+      'terminal cancellation-only claim release',
+    ],
+    [
+      "if (catchup === 'resume-online') return { kind: 'resume-online' as const }",
+      'budget deferral retains prepared attempt',
+    ],
+    [
+      'prepared.copied = { copiedRows: adjustCount(prepared.copied.copiedRows, applied.rowDelta), estimatedLiveBytes: adjustCount(prepared.copied.estimatedLiveBytes, applied.byteDelta), }',
+      'applied page updates retained accounting',
+    ],
+  ]) {
+    if (countOccurrences(normalized, token) !== 1)
+      problems.push(`compaction-continuation: missing exact ${label}`)
+  }
+  for (const token of [
+    'isRetryableBrowserWorkspaceCompactionError',
+    'BrowserWorkspaceCompactionCatchupBudgetExceeded',
+  ]) {
+    if (source.includes(token)) problems.push(`compaction-continuation: retained ${token}`)
+  }
+  const catchupRead = source.slice(
+    source.indexOf('async function readBrowserWorkspaceCatchupPage('),
+    source.indexOf('async function deactivateSourceCatchupJournals('),
+  )
+  const normalizedRead = catchupRead.replace(/\s+/g, ' ')
+  for (const [token, label] of [
+    ['const journal = cursor.value as BrowserWorkspaceCatchupJournalRow', 'cursor-owned journal'],
+    [
+      'const request = sourceStore.get(journal.sourceKey as IDBValidKey)',
+      'one physical source read',
+    ],
+    ['request.onsuccess = () => {', 'request-owned continuation'],
+    [
+      'lastId = journal.id if ( entries.length < COMPACTION_COPY_MAX_PAGE_ROWS && estimatedBytes < COMPACTION_COPY_MAX_PAGE_BYTES ) cursor.continue()',
+      'bounded cursor advance after admitted row',
+    ],
+  ]) {
+    if (countOccurrences(normalizedRead, token) !== 1)
+      problems.push(`compaction-continuation: missing exact ${label}`)
+  }
+  if (catchupRead.includes('.forEach('))
+    problems.push('compaction-continuation: catch-up read eagerly fans out journal rows')
+  return problems
+}
+
+export function inspectWorkspacePeerRecovery({ cleanup, coordination, lifecycle }) {
+  const problems = []
+  const recovery = cleanup.slice(
+    cleanup.indexOf('export function recoverQuiescedBrowserWorkspaceReplacement('),
+    cleanup.indexOf('function sameBrowserWorkspaceSlotTransition('),
+  )
+  const round = coordination.slice(
+    coordination.indexOf('export async function withBrowserWorkspaceSlotRound<T>('),
+    coordination.indexOf('export async function withExclusiveBrowserWorkspaceSlots<T>('),
+  )
+  const peer = lifecycle.slice(
+    lifecycle.indexOf('async function reconcileBrowserWorkspaceSlotTransition('),
+    lifecycle.indexOf('function releaseLifecycleInstallationStep('),
+  )
+  for (const [source, token, label] of [
+    [
+      recovery,
+      'return tryWithBrowserWorkspaceSelectionGate(() => recover(true), signal).then((claimed) => claimed.acquired ? claimed.value : recover(false), )',
+      'nonblocking live-owner recovery',
+    ],
+    [
+      recovery,
+      "mayAbandon && journal?.phase === 'preparing' && sameBrowserWorkspaceSlotTransition(journal, transition)",
+      'abandon requires selection ownership and exact journal',
+    ],
+    [
+      round,
+      'const transition = { ...message, roundId: newId() }',
+      'fresh promotion round identity',
+    ],
+    [
+      round,
+      `const name = \`\${SLOT_ROUND_LOCK_PREFIX}\${transition.roundId}\``,
+      'observer waits on exact promotion round',
+    ],
+    [
+      round,
+      "const ended = await manager.request(name, { mode: 'shared', ifAvailable: true }, (lock) => !!lock) if (signal.aborted) throw signal.reason if (ended) return",
+      'ended round cannot quiesce a peer',
+    ],
+    [
+      peer,
+      'await round.finished await recoverQuiescedBrowserWorkspaceReplacement(transition, signal) await raceWithAbortSignal(() => resumeBrowserWorkspace(), signal)',
+      'round ends before recovery and reopen',
+    ],
+  ]) {
+    if (countOccurrences(source.replace(/\s+/g, ' '), token) !== 1)
+      problems.push(`workspace-peer-recovery: missing exact ${label}`)
+  }
+  if (recovery.includes('withBrowserWorkspaceSelectionGate('))
+    problems.push('workspace-peer-recovery: peer waits for the full preparation owner')
+  return problems
+}
+
 function validateCompactionAttemptRelease(root, problems) {
+  problems.push(
+    ...inspectCompactionContinuation(
+      readFileSync(resolve(root, 'src/store/browser-workspace-compaction.ts'), 'utf8'),
+    ),
+  )
   const expectations = [
-    [
-      'src/store/browser-workspace-compaction.ts',
-      'if (!isRetryableBrowserWorkspaceCompactionError(error) || attemptState.claim === null)',
-    ],
-    [
-      'src/store/browser-workspace-compaction.ts',
-      'const release = await attemptState.claim.release()',
-    ],
-    [
-      'src/store/browser-workspace-compaction.ts',
-      'if (release.released) publishStorageCompactionRequest()',
-    ],
     [
       'src/store/browser-workspace-database-control.ts',
       'requestRevision: Math.max(previous.requestRevision, saturatingAdd(revision, 1))',
@@ -404,7 +506,10 @@ function validateCompactionTransactionPromiseOwnership(root, problems) {
     'function runDestinationCompactionTransaction<T>(',
     "const transaction = backend.transaction([journalName, tableName], 'readonly')",
     'const cursorRequest = journalStore.openCursor(',
-    'rows.forEach((journal, index) => {',
+    'const journal = cursor.value as BrowserWorkspaceCatchupJournalRow',
+    'request.onsuccess = () => {',
+    'lastId = journal.id',
+    'cursor.continue()',
     'const request = sourceStore.get(journal.sourceKey as IDBValidKey)',
     "const transaction = backend.transaction(journalName, 'readwrite')",
     'const request = store.get(journal.id)',
@@ -757,6 +862,10 @@ function validateOrphanWorkspaceReclamation(root, problems) {
 }
 
 function validateWorkspaceReplacementLifecycle(root, problems) {
+  const startup = readFileSync(
+    resolve(root, 'src/store/browser-workspace-startup-repair.ts'),
+    'utf8',
+  )
   const control = readFileSync(
     resolve(root, 'src/store/browser-workspace-database-control.ts'),
     'utf8',
@@ -774,9 +883,20 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
     'utf8',
   )
   const retention = readFileSync(resolve(root, 'src/store/storage-maintenance-runtime.ts'), 'utf8')
+  problems.push(
+    ...inspectWorkspacePeerRecovery({
+      cleanup,
+      coordination: readFileSync(
+        resolve(root, 'src/store/browser-workspace-slot-coordination.ts'),
+        'utf8',
+      ),
+      lifecycle: readFileSync(resolve(root, 'src/store/browser-workspace-lifecycle.ts'), 'utf8'),
+    }),
+  )
   const proofs = [
     'tests/unit/browser-workspace-database-control.test.ts',
     'tests/unit/browser-workspace-replacement-transition.test.ts',
+    'tests/unit/browser-workspace-slot-coordination.test.ts',
     'tests/unit/db-open-recovery.test.ts',
     'tests/unit/storage-retention.test.ts',
   ]
@@ -792,7 +912,14 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
       'selection-owned cleanup abandon',
     ],
     [cleanup, 'withExclusiveBrowserWorkspaceSlots(', 1, 'obsolete-slot lock'],
-    [cleanup, 'withBrowserWorkspaceSelectionGate(', 2, 'peer recovery and cleanup selection gates'],
+    [cleanup, 'withBrowserWorkspaceSelectionGate(', 1, 'obsolete-slot cleanup selection gate'],
+    [
+      cleanup,
+      'tryWithBrowserWorkspaceSelectionGate(',
+      2,
+      'nonblocking preparation ownership probes',
+    ],
+    [replacement, 'withBrowserWorkspaceSlotRound(', 1, 'round-owned promotion'],
     [cleanup, 'await Dexie.delete(databaseName)', 1, 'physical obsolete-slot delete'],
     [
       cleanup,
@@ -818,14 +945,22 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
     [cleanup, 'indexedDB.databases(', 'cleanup namespace enumeration'],
     [replacement, 'completeBrowserWorkspaceDatabaseCleanup(', 'replacement physical cleanup'],
     [replacement, 'Dexie.delete(journal.sourceDatabaseName)', 'committed source deletion'],
+    [startup, 'Dexie.delete(journal.sourceDatabaseName)', 'startup committed source deletion'],
   ]) {
     if (source.includes(token)) problems.push(`workspace-replacement: forbidden ${label}`)
   }
   for (const proof of [
-    'keeps a malformed authoritative source selected and cleans under one selection admission',
+    'keeps a malformed source selected with durable discard before separate cleanup admission',
+    'returns the repaired active source while old-source reclamation waits on an independent holder',
+    'reports malformed-source failure before waiting for destination reclamation',
     'keeps active-slot selection ready while old-slot deletion waits on a peer',
     'cleans one journaled slot without enumerating or opening workspace stores',
-    'waits on durable selection ownership then resumes before discarding an abandoned destination',
+    'resumes a deferred source without discarding live staging and cleans it only after owner loss',
+    'ignores an ended round even when its durable preparation remains current',
+    'ends peer quiescence at its round boundary while preparation remains owned',
+    'routes foreground demand only to the exact owned replacement round',
+    'continues repeated $bound budget deferrals with one copy and bounded physical hydration',
+    'transfers prepromotion preparation and cleanup failures as a fatal replacement handoff',
     'recovers an activated quiesced peer before obsolete source cleanup',
     'attempts every committed finalizer and retains every failure',
     'never guesses rollback or publication after an uncertain activation',

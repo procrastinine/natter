@@ -3,6 +3,7 @@ import {
   auditTestEvidence,
   type TestEvidenceFile,
   type TestEvidenceInventory,
+  type TestEvidenceReference,
   type TestGuaranteeClaim,
 } from '../../scripts/audit-test-evidence.mjs'
 import { buildTestEvidenceInventory } from '../../scripts/test-evidence-inventory.mjs'
@@ -15,6 +16,24 @@ import {
 const BASE_INVENTORY = buildTestEvidenceInventory()
 
 describe('test evidence architecture audit', () => {
+  it('checks structured stage proof identities instead of accepting their source filename', () => {
+    const claims = mutableClaims(TEST_GUARANTEE_CLAIMS)
+    const claim = claims.find(({ id }) => id === 'verification-hygiene-failures-affect-exit-code')
+    if (!claim?.evidence) throw new Error('StageProofClaimMissing')
+    claim.evidence = claim.evidence.map((reference) =>
+      'stage' in reference
+        ? {
+            ...reference,
+            stage: { ...reference.stage, id: 'removed-formatting-stage' },
+          }
+        : reference,
+    )
+    const report = auditTestEvidence({ inventory: BASE_INVENTORY, claims })
+    expect(report.problems).toContain(
+      'claims:verification-hygiene-failures-affect-exit-code: VerificationStageReferenceCardinality:removed-formatting-stage:0',
+    )
+  })
+
   it('inventories every current suite without laundering reachability into behavioral proof', () => {
     const report = auditTestEvidence({ inventory: BASE_INVENTORY })
 
@@ -180,8 +199,8 @@ type MutableTestEvidenceFile = Omit<TestEvidenceFile, 'definitions' | 'domains'>
 }
 
 type MutableTestGuaranteeClaim = Omit<TestGuaranteeClaim, 'evidence' | 'touchedBy'> & {
-  evidence?: Array<{ path: string; locator: string }>
-  touchedBy?: Array<{ path: string; locator: string }>
+  evidence?: TestEvidenceReference[]
+  touchedBy?: TestEvidenceReference[]
 }
 
 function mutableClaims(claims: readonly TestGuaranteeClaim[]): MutableTestGuaranteeClaim[] {

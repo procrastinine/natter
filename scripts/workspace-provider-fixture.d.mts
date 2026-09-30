@@ -41,13 +41,31 @@ export function importPortableChatThroughUi(
   messageIdMap: Record<string, string> | null
 }>
 
+export interface WorkspaceConfigurationFixtureOptions {
+  model?: string
+  paretoFilter?: boolean
+  workspaceSettings?: Record<string, unknown>
+}
+
+export function exportWorkspaceThroughUi(
+  page: Page,
+  nativeDownloadDirectory?: string | null,
+): Promise<Record<string, unknown>>
+
+export function restoreWorkspaceThroughUi(
+  page: Page,
+  backup: Record<string, unknown>,
+  options?: { filename?: string; returnUrl?: string; applicationUrl?: string },
+): Promise<void>
+
+export function configureWorkspaceBackup(
+  backup: Record<string, unknown>,
+  options?: WorkspaceConfigurationFixtureOptions,
+): Record<string, unknown>
+
 export function configureWorkspaceThroughUi(
   page: Page,
-  options?: {
-    model?: string
-    paretoFilter?: boolean
-    workspaceSettings?: Record<string, unknown>
-  },
+  options?: WorkspaceConfigurationFixtureOptions,
 ): Promise<void>
 
 export interface WorkspaceChatCatalogFixture {

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { extname, posix, relative, resolve } from 'node:path'
+import { parse as parseCss, walk as walkCss } from 'css-tree'
 import ts from 'typescript'
 
 const DEFAULT_ROOT = resolve(import.meta.dirname, '..')
@@ -181,9 +182,9 @@ function scanLocalModuleGraphCore(options, projectFile) {
 }
 
 function inspectLocalModuleDependencies({ path, pathSet, source, file, diagnostics }) {
-  if (file.kind === 'non-code') return Object.freeze([])
+  if (file.kind === 'non-code' && extname(path) !== '.css') return Object.freeze([])
   const sourceFile = file.sourceFile
-  for (const diagnostic of sourceFile.parseDiagnostics ?? []) {
+  for (const diagnostic of sourceFile?.parseDiagnostics ?? []) {
     diagnostics.push(
       graphDiagnostic({
         code: 'parse-error',
@@ -194,7 +195,10 @@ function inspectLocalModuleDependencies({ path, pathSet, source, file, diagnosti
     )
   }
   const resolvedDependencies = []
-  for (const reference of discoverModuleReferences(sourceFile)) {
+  const references = sourceFile
+    ? discoverModuleReferences(sourceFile)
+    : discoverCssReferences(file, diagnostics)
+  for (const reference of references) {
     if (reference.specifier === null) {
       diagnostics.push(
         graphDiagnostic({
@@ -240,6 +244,49 @@ function inspectLocalModuleDependencies({ path, pathSet, source, file, diagnosti
     }
   }
   return Object.freeze(uniqueSorted(resolvedDependencies))
+}
+
+function discoverCssReferences(file, diagnostics) {
+  const references = []
+  const reportParseError = (error) => {
+    diagnostics.push(
+      graphDiagnostic({
+        code: 'parse-error',
+        path: file.path,
+        line: error.line,
+        detail: error.message,
+      }),
+    )
+  }
+  let ast
+  try {
+    ast = parseCss(file.bytes.toString('utf8'), {
+      positions: true,
+      parseCustomProperty: true,
+      onParseError: reportParseError,
+    })
+  } catch (error) {
+    reportParseError(error)
+    return references
+  }
+  walkCss(ast, (node) => {
+    const imported = node.type === 'Atrule' && node.name.toLowerCase() === 'import'
+    const skip = imported ? walkCss.skip : undefined
+    const target = imported ? node.prelude?.children?.first : node
+    if (!target || (target.type !== 'Url' && !(imported && target.type === 'String'))) return skip
+    const value = target.value
+    if (/^(?:[a-z][a-z\d+.-]*:|\/\/|#)/iu.test(value)) return skip
+    const path = value.split(/[?#]/u, 1)[0]
+    if (!path) return skip
+    if (imported && !isLocalSpecifier(path) && !path.endsWith('.css')) return skip
+    references.push({
+      specifier: isLocalSpecifier(path) ? path : `./${path}`,
+      kind: 'literal',
+      line: target.loc.start.line,
+    })
+    return skip
+  })
+  return references
 }
 
 function createLocalModuleGraph(paths, dependencies, diagnostics) {
@@ -326,10 +373,13 @@ function discoverModuleReferences(sourceFile) {
   if (!/\b(?:import|require)\s*\(|\bvi\s*\.\s*(?:doMock|mock)\s*\(/u.test(sourceFile.text)) {
     return references
   }
+  const fileUrlSpecifier = staticFileUrlResolver(sourceFile)
   const visit = (node) => {
     if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const argument = node.arguments[0]
-      if (!argument || !ts.isStringLiteralLike(argument)) add(node, null, 'import()')
+      if (!argument || !ts.isStringLiteralLike(argument)) {
+        add(node, argument ? fileUrlSpecifier(argument) : null, 'import()')
+      }
     } else if (
       ts.isCallExpression(node) &&
       ts.isIdentifier(node.expression) &&
@@ -355,6 +405,96 @@ function discoverModuleReferences(sourceFile) {
   }
   visit(sourceFile)
   return references
+}
+
+function staticFileUrlResolver(sourceFile) {
+  const constants = new Map()
+  const imports = new Map()
+  const declarations = new Map()
+  const countDeclarations = (node) => {
+    if (
+      (ts.isVariableDeclaration(node) ||
+        ts.isParameter(node) ||
+        ts.isBindingElement(node) ||
+        ts.isFunctionDeclaration(node) ||
+        ts.isFunctionExpression(node) ||
+        ts.isClassDeclaration(node) ||
+        ts.isClassExpression(node) ||
+        ts.isEnumDeclaration(node) ||
+        ts.isModuleDeclaration(node) ||
+        ts.isImportEqualsDeclaration(node) ||
+        ts.isImportSpecifier(node) ||
+        ts.isImportClause(node) ||
+        ts.isNamespaceImport(node)) &&
+      node.name &&
+      ts.isIdentifier(node.name)
+    ) {
+      declarations.set(node.name.text, (declarations.get(node.name.text) ?? 0) + 1)
+    }
+    ts.forEachChild(node, countDeclarations)
+  }
+  countDeclarations(sourceFile)
+  for (const statement of sourceFile.statements) {
+    if (ts.isVariableStatement(statement) && statement.declarationList.flags & ts.NodeFlags.Const) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name) && declaration.initializer) {
+          constants.set(declaration.name.text, declaration.initializer)
+        }
+      }
+    }
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteralLike(statement.moduleSpecifier)) {
+      const bindings = statement.importClause?.namedBindings
+      if (bindings && ts.isNamedImports(bindings)) {
+        for (const binding of bindings.elements) {
+          imports.set(binding.name.text, {
+            module: statement.moduleSpecifier.text.replace(/^node:/u, ''),
+            name: (binding.propertyName ?? binding.name).text,
+          })
+        }
+      }
+    }
+  }
+  const imported = (node, module, name) =>
+    ts.isIdentifier(node) &&
+    declarations.get(node.text) === 1 &&
+    imports.get(node.text)?.module === module &&
+    imports.get(node.text)?.name === name
+  const follow = (node, seen, evaluate) => {
+    if (!ts.isIdentifier(node) || declarations.get(node.text) !== 1 || seen.has(node.text)) {
+      return null
+    }
+    const value = constants.get(node.text)
+    return value ? evaluate(value, new Set([...seen, node.text])) : null
+  }
+  const anchor = '/__verification_source_root__'
+  const pathValue = (node, seen) => {
+    if (ts.isStringLiteralLike(node)) return node.text
+    if (ts.isIdentifier(node) && node.text === '__dirname' && !declarations.has('__dirname')) {
+      return posix.dirname(`${anchor}/${sourceFile.fileName}`)
+    }
+    if (ts.isCallExpression(node) && imported(node.expression, 'path', 'resolve')) {
+      const args = node.arguments.map((argument) => pathValue(argument, seen))
+      if (!args.length || args.some((value) => value === null) || !args[0].startsWith('/')) {
+        return null
+      }
+      return posix.resolve(...args)
+    }
+    return follow(node, seen, pathValue)
+  }
+  const fileUrl = (node, seen) => {
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      node.name.text === 'href' &&
+      ts.isCallExpression(node.expression) &&
+      imported(node.expression.expression, 'url', 'pathToFileURL') &&
+      node.expression.arguments.length === 1
+    ) {
+      const path = pathValue(node.expression.arguments[0], seen)
+      return path?.startsWith(`${anchor}/`) ? path.slice(anchor.length) : null
+    }
+    return follow(node, seen, fileUrl)
+  }
+  return (node) => fileUrl(node, new Set())
 }
 
 function resolveLocalModule(importerPath, specifier, sourcePaths) {

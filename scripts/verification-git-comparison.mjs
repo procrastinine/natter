@@ -2,12 +2,16 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { posix, resolve } from 'node:path'
 import { currentWaveManifest } from './current-wave-manifest.mjs'
-import { discoverLocalModulePaths } from './local-module-graph.mjs'
-import { buildVerificationSnapshot } from './verification-impact-plan.mjs'
+import {
+  buildVerificationSnapshot,
+  verificationSnapshotInputPaths,
+} from './verification-impact-plan.mjs'
 import {
   VERIFICATION_EXPLICIT_MODULE_EDGES,
   verificationGlobalInputPaths,
 } from './verification-obligation-manifest.mjs'
+
+import { VERIFICATION_SNAPSHOT_SCHEMA_VERSION } from './verification-snapshot-schema.mjs'
 
 const COMMITTED_COMPARISONS = new WeakSet()
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -170,10 +174,7 @@ function selectTreeEntries(entries) {
       throw new Error('VerificationComparisonDiscoveryMetadataForbidden')
     },
   })
-  const selectedPaths = uniqueSorted([
-    ...discoverLocalModulePaths({ source: discoverySource }),
-    ...verificationGlobalInputPaths({ allPaths }).filter((path) => allPaths.has(path)),
-  ])
+  const selectedPaths = verificationSnapshotInputPaths({ source: discoverySource })
   const entryByPath = new Map(entries.map((entry) => [entry.path, entry]))
   const selectedEntries = selectedPaths.map((path) => {
     const entry = entryByPath.get(path)
@@ -314,6 +315,7 @@ function validateComparisonEnvelope(value, manifest) {
     value?.waveId !== manifest.id ||
     (!canonical && !descendant) ||
     !/^[0-9a-f]{40}$/u.test(value?.treeOid ?? '') ||
+    value?.snapshotSchemaVersion !== VERIFICATION_SNAPSHOT_SCHEMA_VERSION ||
     value?.snapshotSchemaVersion !== value?.snapshot?.schemaVersion
   ) {
     throw new Error('VerificationComparisonEnvelopeInvalid')

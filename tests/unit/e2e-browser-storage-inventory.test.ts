@@ -1,60 +1,150 @@
-import { resolve } from 'node:path'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   auditE2eBrowserStorage,
+  discoverBrowserFixtureSources,
   type E2eBrowserStorageSite,
   validateE2eBrowserStorageInventory,
+  validateNativeFixtureOwnership,
 } from '../../scripts/audit-e2e-browser-storage.mjs'
+
+import { VERIFICATION_STAGES } from '../../scripts/run-verification.mjs'
 
 const ROOT = resolve(__dirname, '../..')
 
 describe('E2E raw browser storage inventory', () => {
-  it('allows every semantic AST site exactly once with operation detail', () => {
-    const result = auditE2eBrowserStorage(ROOT)
-    const discovered = result.sites
-
-    expect(result.violations, JSON.stringify(result.violations, null, 2)).toEqual([])
-    expect(result.ok).toBe(true)
-    expect(result.discoveredSiteCount).toBe(discovered.length)
-    expect(result.allowedSiteCount).toBe(discovered.length)
-    expect(result.uniqueAllowedSiteCount).toBe(discovered.length)
-    expect(result.cleanupEvidenceSiteCount).toBeGreaterThan(0)
-    expect(result.unpairedOpenSiteIds).toEqual([])
-    expect(result.readwriteTransactionCount).toBeGreaterThan(0)
-    expect(discovered).toContainEqual(
-      expect.objectContaining({
-        path: 'tests/e2e/large-workspace-startup.spec.ts',
-        owner: 'function:installStartupProbe',
-        access: 'instrumentation',
-        operation: 'indexeddb.transaction.addEventListener',
-      }),
-    )
-    expect(
-      (
+  it('discovers exact native, facade, purpose, and cleanup semantics on a bounded source fixture', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'natter-native-inventory-'))
+    const write = (path: string, text: string) => {
+      const target = resolve(root, path)
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, text)
+    }
+    try {
+      for (const stage of VERIFICATION_STAGES) {
+        const entry = stage.argv[1]
+        if (stage.argv[0] === 'node' && entry && !entry.startsWith('node_modules/')) {
+          write(entry, 'export {}\n')
+        }
+      }
+      write(
+        'tsconfig.app.json',
+        JSON.stringify({ compilerOptions: { types: [], lib: ['ES2022', 'DOM'] } }),
+      )
+      write('inventory.json', JSON.stringify({ schemaVersion: 2, allowances: [] }))
+      write(
+        'tests/e2e/example.spec.ts',
+        `
+interface NativeFixtureDatabase {
+  completion(transaction: IDBTransaction): Promise<void>
+  transaction(stores: string[], mode: IDBTransactionMode): IDBTransaction
+}
+export function inspectNative(db: IDBDatabase, facade: NativeFixtureDatabase) {
+  const read = db.transaction(['messages', 'settings'], 'readonly')
+  read.objectStore('messages').index('chatId').getAll('chat')
+  read.addEventListener('complete', () => {})
+  const write = facade.transaction(['messages'], 'readwrite')
+  const messages = write.objectStore('messages')
+  void facade.completion(write)
+  messages.put({ id: 'first' })
+  messages.put({ id: 'second' })
+  indexedDB.open('fixture')
+  db.close()
+  indexedDB.deleteDatabase('fixture')
+  globalThis.__natterNativeStorageFixture.active({ purpose: 'read-only-assertion' }, () => {})
+  globalThis.__natterNativeStorageFixture.active({ purpose: 'unclassified-purpose' }, () => {})
+}
+`,
+      )
+      const result = auditE2eBrowserStorage(root, resolve(root, 'inventory.json'))
+      const operationDetails = result.sites
+        .map(({ operation, mode, store, occurrence }) =>
+          [operation, mode, store, occurrence].join('|'),
+        )
+        .sort()
+      expect(operationDetails).toEqual(
         [
-          'close',
-          'delete',
-          'enumeration',
-          'instrumentation',
-          'open',
-          'read',
-          'selection',
-          'transaction',
-          'write',
-        ] as const
-      ).every((access) => typeof result.accessCounts[access] === 'number'),
-    ).toBe(true)
+          ['indexeddb.database.transaction', 'readonly', 'messages+settings', 1],
+          ['indexeddb.transaction.object-store', 'readonly', 'messages', 1],
+          ['indexeddb.object-store.index', 'readonly', 'messages@index:chatId', 1],
+          ['indexeddb.getAll', 'readonly', 'messages@index:chatId', 1],
+          ['indexeddb.transaction.addEventListener', 'readonly', '<transaction-scope>', 1],
+          ['indexeddb.database.transaction', 'readwrite', 'messages', 1],
+          ['indexeddb.transaction.object-store', 'readwrite', 'messages', 1],
+          ['native-fixture.transaction-completion', null, '<transaction-scope>', 1],
+          ['indexeddb.put', 'readwrite', 'messages', 1],
+          ['indexeddb.put', 'readwrite', 'messages', 2],
+          ['indexeddb.factory.open', null, null, 1],
+          ['indexeddb.database.close', null, null, 1],
+          ['indexeddb.factory.delete-database', null, null, 1],
+          ['native-fixture.active', 'read-only-assertion', '<operation-scope>', 1],
+          ['native-fixture.active', 'unclassified-purpose', '<operation-scope>', 1],
+        ]
+          .map((detail) => detail.join('|'))
+          .sort(),
+      )
+      expect(result.discoveredSiteCount).toBe(result.sites.length)
+      expect(result.cleanupEvidenceSiteCount).toBe(2)
+      expect(result.readwriteTransactionCount).toBe(1)
+      expect(new Set(result.sites.map(({ id }) => id)).size).toBe(result.sites.length)
+      for (const site of result.sites) {
+        expect(site.path).toBe('tests/e2e/example.spec.ts')
+        expect(site.owner).toBe('function:inspectNative')
+        expect(site.id).toBe(
+          [
+            site.path,
+            'owner=function%3AinspectNative',
+            `operation=${site.operation}`,
+            `mode=${site.mode ?? '-'}`,
+            `store=${encodeURIComponent(site.store ?? '-')}`,
+            `occurrence=${site.occurrence}`,
+          ].join('::'),
+        )
+      }
+      expect(result.sites.find((site) => site.mode === 'unclassified-purpose')?.access).toBe(
+        'unknown',
+      )
+      expect(result.ok).toBe(false)
+      expect(result.missingSiteIds).toEqual(result.sites.map(({ id }) => id).sort())
+      expect(new Set(result.violations.map(({ code }) => code))).toEqual(
+        new Set([
+          'allowance-missing',
+          'native-fixture-open-bypass',
+          'native-fixture-delete-bypass',
+        ]),
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('derives mandatory browser profile roots and rejects raw opens and deletes outside their shared owner', () => {
+    const sources = discoverBrowserFixtureSources(ROOT)
+    expect(sources).toEqual(
+      expect.arrayContaining([
+        resolve(ROOT, 'scripts/profile-fake-stream.mjs'),
+        resolve(ROOT, 'scripts/profile-concurrent-fake-stream.mjs'),
+        resolve(ROOT, 'scripts/profile-stream-harness.mjs'),
+        resolve(ROOT, 'scripts/native-workspace-storage-fixture.mjs'),
+      ]),
+    )
+    expect(sources).not.toContain(resolve(ROOT, 'scripts/audit-e2e-browser-storage.mjs'))
+    const open = site('unowned-open', 'open', 'indexeddb.factory.open')
+    expect(validateNativeFixtureOwnership([open])).toEqual([
+      expect.objectContaining({ code: 'native-fixture-open-bypass', siteId: open.id }),
+    ])
+    const remove = site('unowned-delete', 'delete', 'indexeddb.factory.delete-database')
+    expect(validateNativeFixtureOwnership([remove])).toEqual([
+      expect.objectContaining({ code: 'native-fixture-delete-bypass', siteId: remove.id }),
+    ])
     expect(
-      discovered.every(
-        (site) =>
-          site.id.includes(site.path) &&
-          site.id.includes('owner=') &&
-          site.id.includes(`operation=${site.operation}`) &&
-          site.id.includes('mode=') &&
-          site.id.includes('store=') &&
-          site.id.includes(`occurrence=${site.occurrence}`),
-      ),
-    ).toBe(true)
+      validateNativeFixtureOwnership([
+        { ...open, path: 'scripts/native-workspace-storage-fixture.mjs' },
+        { ...remove, path: 'scripts/native-workspace-storage-fixture.mjs' },
+      ]),
+    ).toEqual([])
   })
 
   it('fails closed on inventory drift, duplicates, and missing metadata', () => {

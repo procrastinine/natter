@@ -26,7 +26,10 @@ import {
   subscribeRouteChange,
 } from '../../src/app/router'
 import type { ConversationRouteHandoff } from '../../src/store/conversation-controller'
-import { awaitWorkspaceForegroundDemandIdle } from '../../src/store/workspace-runtime'
+import {
+  awaitWorkspaceForegroundDemandIdle,
+  workspaceForegroundDemandInterruptionSignal,
+} from '../../src/store/workspace-runtime'
 
 function handoffFor(
   intent: ReturnType<typeof beginRouteIntent>,
@@ -152,6 +155,52 @@ describe('route parsing and rendering', () => {
 })
 
 describe('opaque tab route intents', () => {
+  it.each(['', '#new'])('settles the rendered route for the equivalent address %j', (address) => {
+    navigate(address)
+    const pending = workspaceForegroundDemandInterruptionSignal()
+    expect(pending.aborted).toBe(true)
+    settleRouteForegroundDemandForPresentation(routeToHref(parseRoute(address)), {
+      hasActiveChat: false,
+      targetKind: null,
+      revealPending: false,
+      destinationDeferred: false,
+    })
+    expect(workspaceForegroundDemandInterruptionSignal().aborted).toBe(false)
+  })
+
+  it('keeps a settled navigation settled when consumers resubscribe or a route command is cancelled', () => {
+    const initialSubscription = subscribeRouteChange(() => undefined)
+    initialSubscription()
+    navigate('#/storage/attachments/example')
+    settleRouteForegroundDemandForPresentation('#/storage/attachments/example', {
+      hasActiveChat: false,
+      targetKind: null,
+      revealPending: false,
+      destinationDeferred: false,
+    })
+    const idle = workspaceForegroundDemandInterruptionSignal()
+    expect(idle.aborted).toBe(false)
+    const route = browserConversationNavigationPort.getArrival()
+    const observed = vi.fn()
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      const unsubscribeSnapshot = subscribeRouteChange(observed)
+      const unsubscribeArrival = subscribeRouteArrival(observed)
+      try {
+        expect(workspaceForegroundDemandInterruptionSignal()).toBe(idle)
+        expect(idle.aborted).toBe(false)
+        expect(browserConversationNavigationPort.getArrival()).toBe(route)
+        expect(observed).not.toHaveBeenCalled()
+      } finally {
+        unsubscribeSnapshot()
+        unsubscribeArrival()
+      }
+    }
+    const intent = beginRouteIntent()
+    expect(idle.aborted).toBe(true)
+    cancelRouteIntent(intent)
+    expect(workspaceForegroundDemandInterruptionSignal().aborted).toBe(false)
+  })
+
   it('owns foreground demand from command claim through route handoff', async () => {
     settleRouteForegroundDemandForPresentation('#/', {
       hasActiveChat: false,

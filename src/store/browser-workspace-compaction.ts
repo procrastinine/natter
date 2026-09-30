@@ -45,7 +45,6 @@ import { estimateStoredValueBytes } from './storage-size-estimate'
 import { readBrowserWorkspaceMeta, readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
 import {
   isWorkspaceForegroundDemandInterruptedError,
-  isWorkspaceMaintenancePreemptedError,
   type WorkspaceRuntimeActionOptions,
 } from './workspace-runtime'
 
@@ -59,14 +58,7 @@ interface BrowserWorkspaceCompactionPrepared {
     readonly workspaceId: string
     readonly replacementEpoch: number
   }
-  readonly copied: BrowserWorkspaceCompactionResult
-}
-
-class BrowserWorkspaceCompactionCatchupBudgetExceededError extends Error {
-  constructor(rows: number, bytes: number) {
-    super(`BrowserWorkspaceCompactionCatchupBudgetExceeded:${rows}:${bytes}`)
-    this.name = 'BrowserWorkspaceCompactionCatchupBudgetExceededError'
-  }
+  copied: BrowserWorkspaceCompactionResult
 }
 
 type DestinationTransactionRunner = <T>(
@@ -113,7 +105,7 @@ export async function tryStartBrowserWorkspaceCompaction(
           await checkpoint()
           const sourceWorkspace = await readBrowserWorkspaceMeta(source)
           await checkpoint()
-          let copied = await copyBrowserWorkspace(
+          const copied = await copyBrowserWorkspace(
             source,
             destination,
             context.runDestinationTransaction,
@@ -121,21 +113,24 @@ export async function tryStartBrowserWorkspaceCompaction(
             checkpoint,
             context.foregroundInterruptionSignal,
           )
-          copied = await drainBrowserWorkspaceCatchup(
-            source,
-            context.runDestinationTransaction,
-            copied,
-            {
-              mode: 'online',
-              signal: context.signal,
-              preactivationCheckpoint: checkpoint,
-            },
-          )
           return { sourceWorkspace, copied }
         })
       },
+      refresh: async (_destination, context, prepared) => {
+        const checkpoint = async () => {
+          await context.awaitForegroundIdle()
+          context.preactivationCheckpoint()
+        }
+        await context.withSourceDatabase((source) =>
+          drainBrowserWorkspaceCatchup(source, context.runDestinationTransaction, prepared, {
+            mode: 'online',
+            signal: context.signal,
+            preactivationCheckpoint: checkpoint,
+          }),
+        )
+      },
       abandon: (sourceDatabaseName) => deactivateSourceCatchupJournals(sourceDatabaseName),
-      commit: async (destination, context, prepared) => {
+      tryCommit: async (destination, context, prepared) => {
         context.preactivationCheckpoint()
         if (
           context.atomicity !== 'slotted-staging' ||
@@ -152,16 +147,17 @@ export async function tryStartBrowserWorkspaceCompaction(
             ) {
               throw new Error('BrowserWorkspaceCompactionSourceChanged')
             }
-            let copied = await drainBrowserWorkspaceCatchup(
+            const catchup = await drainBrowserWorkspaceCatchup(
               source,
               (tableNames, operation) => grant.runTransaction(destination, tableNames, operation),
-              prepared.copied,
+              prepared,
               {
                 mode: 'final',
                 signal: context.signal,
                 preactivationCheckpoint: context.preactivationCheckpoint,
               },
             )
+            if (catchup === 'resume-online') return { kind: 'resume-online' as const }
             context.preactivationCheckpoint()
             const copiedWorkspace = await runDestinationCompactionTransaction(
               (tableNames, operation) => grant.runTransaction(destination, tableNames, operation),
@@ -184,11 +180,17 @@ export async function tryStartBrowserWorkspaceCompaction(
                   .table<SettingsRow, string>('settings')
                   .put(chatSidebarProjectionBackfillMarker()),
             )
-            copied = Object.freeze({ ...copied })
+            const copied = Object.freeze({ ...prepared.copied })
             return {
-              workspace: copiedWorkspace,
-              storageBaseline: { kind: 'carry-source', liveBytes: copied.estimatedLiveBytes },
-              value: copied,
+              kind: 'prepared' as const,
+              replacement: {
+                workspace: copiedWorkspace,
+                storageBaseline: {
+                  kind: 'carry-source' as const,
+                  liveBytes: copied.estimatedLiveBytes,
+                },
+                value: copied,
+              },
             }
           }),
         )
@@ -197,7 +199,10 @@ export async function tryStartBrowserWorkspaceCompaction(
     options,
   )
   if (started.kind !== 'handoff') {
-    if (started.kind === 'cleanup-required' && attemptState.claim !== null) {
+    if (
+      (started.kind === 'cleanup-required' || started.kind === 'cancelled') &&
+      attemptState.claim !== null
+    ) {
       const release = await attemptState.claim.release()
       if (release.released) publishStorageCompactionRequest()
     }
@@ -206,13 +211,12 @@ export async function tryStartBrowserWorkspaceCompaction(
   return {
     kind: 'handoff',
     handoff: {
-      completion: started.handoff.completion.catch(async (error: unknown) => {
-        if (!isRetryableBrowserWorkspaceCompactionError(error) || attemptState.claim === null) {
-          throw error
+      completion: started.handoff.completion.then(async (outcome) => {
+        if (outcome.kind === 'cancelled' && attemptState.claim !== null) {
+          const release = await attemptState.claim.release()
+          if (release.released) publishStorageCompactionRequest()
         }
-        const release = await attemptState.claim.release()
-        if (release.released) publishStorageCompactionRequest()
-        throw error
+        return outcome
       }),
     },
   }
@@ -324,15 +328,13 @@ async function copyTable(
 async function drainBrowserWorkspaceCatchup(
   source: NatterDb,
   runDestinationTransaction: DestinationTransactionRunner,
-  initial: BrowserWorkspaceCompactionResult,
+  prepared: BrowserWorkspaceCompactionPrepared,
   options: {
     readonly mode: 'online' | 'final'
     readonly signal: AbortSignal
     readonly preactivationCheckpoint: () => void | Promise<void>
   },
-): Promise<BrowserWorkspaceCompactionResult> {
-  let copiedRows = initial.copiedRows
-  let estimatedLiveBytes = initial.estimatedLiveBytes
+): Promise<'caught-up' | 'resume-online'> {
   let finalRows = 0
   let finalBytes = 0
   for (const tableName of BROWSER_WORKSPACE_CATCHUP_SOURCE_TABLE_NAMES) {
@@ -348,7 +350,7 @@ async function drainBrowserWorkspaceCatchup(
           finalRows > COMPACTION_FINAL_CATCHUP_MAX_ROWS ||
           finalBytes > COMPACTION_FINAL_CATCHUP_MAX_BYTES
         ) {
-          throw new BrowserWorkspaceCompactionCatchupBudgetExceededError(finalRows, finalBytes)
+          return 'resume-online'
         }
       }
       const applied = await applyBrowserWorkspaceCatchupPage(
@@ -358,36 +360,19 @@ async function drainBrowserWorkspaceCatchup(
         runDestinationTransaction,
         options.preactivationCheckpoint,
       )
-      copiedRows = adjustCount(copiedRows, applied.rowDelta)
-      estimatedLiveBytes = adjustCount(estimatedLiveBytes, applied.byteDelta)
-      if (options.mode === 'online') {
-        await options.preactivationCheckpoint()
-        await acknowledgeBrowserWorkspaceCatchupPage(source, tableName, page.entries)
+      prepared.copied = {
+        copiedRows: adjustCount(prepared.copied.copiedRows, applied.rowDelta),
+        estimatedLiveBytes: adjustCount(prepared.copied.estimatedLiveBytes, applied.byteDelta),
       }
+      await options.preactivationCheckpoint()
+      await acknowledgeBrowserWorkspaceCatchupPage(source, tableName, page.entries)
       after = page.lastId
       if (after === undefined) {
         throw new Error(`BrowserWorkspaceCatchupPrimaryKeyMissing:${tableName}`)
       }
     }
   }
-  return { copiedRows, estimatedLiveBytes }
-}
-
-function isRetryableBrowserWorkspaceCompactionError(error: unknown): boolean {
-  if (
-    isWorkspaceMaintenancePreemptedError(error) ||
-    error instanceof BrowserWorkspaceCompactionCatchupBudgetExceededError
-  ) {
-    return true
-  }
-  if (error instanceof AggregateError) {
-    return error.errors.some(isRetryableBrowserWorkspaceCompactionError)
-  }
-  return (
-    error instanceof Error &&
-    error.cause !== undefined &&
-    isRetryableBrowserWorkspaceCompactionError(error.cause)
-  )
+  return 'caught-up'
 }
 
 async function readBrowserWorkspaceCatchupPage(
@@ -404,7 +389,7 @@ async function readBrowserWorkspaceCatchupPage(
   readonly scannedRows: number
   readonly estimatedBytes: number
 }> {
-  if (signal.aborted) throw compactionReadError(signal.reason)
+  if (signal.aborted) throw signal.reason
   const journalName = browserWorkspaceCatchupJournalTableName(tableName)
   const backend = source.backendDB() as IDBDatabase | null
   if (!backend) throw new Error('BrowserWorkspaceCompactionSourceClosed')
@@ -425,23 +410,19 @@ async function readBrowserWorkspaceCatchupPage(
         ? IDBKeyRange.lowerBound(BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID, true)
         : IDBKeyRange.lowerBound(after, true),
     )
-    const rows: BrowserWorkspaceCatchupJournalRow[] = []
-    const sourceValues: unknown[] = []
-    let sourceReadsScheduled = false
+    const entries: { journal: BrowserWorkspaceCatchupJournalRow; sourceValue: unknown }[] = []
+    let estimatedBytes = 0
+    let lastId: string | undefined
     let settled = false
     const cleanup = () => signal.removeEventListener('abort', abortForLifetime)
-    const fail = (error?: unknown) => {
+    const fail = (reason: unknown) => {
       if (settled) return
       settled = true
       cleanup()
       reject(
-        compactionTransactionError(
-          `read-catchup:${tableName}`,
-          error ??
-            cursorRequest.error ??
-            transaction.error ??
-            new Error('BrowserWorkspaceCompactionCatchupReadFailed'),
-        ),
+        signal.aborted && reason === signal.reason
+          ? reason
+          : compactionTransactionError(`read-catchup:${tableName}`, reason),
       )
     }
     const abortForLifetime = () => {
@@ -453,71 +434,62 @@ async function readBrowserWorkspaceCatchupPage(
       }
       fail(signal.reason)
     }
-    const scheduleSourceReads = () => {
-      if (sourceReadsScheduled) return
-      sourceReadsScheduled = true
-      rows.forEach((journal, index) => {
-        const request = sourceStore.get(journal.sourceKey as IDBValidKey)
-        request.onerror = () => fail(request.error)
-        request.onsuccess = () => {
-          sourceValues[index] = request.result
-        }
-      })
-    }
     signal.addEventListener('abort', abortForLifetime, { once: true })
-    transaction.onerror = () => fail()
-    transaction.onabort = () => fail()
+    const failTransaction = () =>
+      fail(
+        cursorRequest.error ??
+          transaction.error ??
+          new Error('BrowserWorkspaceCompactionCatchupReadFailed'),
+      )
+    transaction.onerror = failTransaction
+    transaction.onabort = failTransaction
     transaction.oncomplete = () => {
       if (settled) return
+      settled = true
+      cleanup()
+      resolve({
+        entries,
+        ...(lastId === undefined ? {} : { lastId }),
+        scannedRows: entries.length,
+        estimatedBytes,
+      })
+    }
+    const failCallback = (error: unknown) => {
+      fail(error)
       try {
-        const entries: {
-          journal: BrowserWorkspaceCatchupJournalRow
-          sourceValue: unknown
-        }[] = []
-        let estimatedBytes = 0
-        let lastId: string | undefined
-        for (let index = 0; index < rows.length; index += 1) {
-          const journal = rows[index] as BrowserWorkspaceCatchupJournalRow
-          const sourceValue = sourceValues[index]
-          const rowBytes = sourceValue === undefined ? 0 : estimateStoredValueBytes(sourceValue)
-          if (entries.length > 0 && estimatedBytes + rowBytes > COMPACTION_COPY_MAX_PAGE_BYTES) {
-            break
-          }
-          entries.push({ journal, sourceValue })
-          estimatedBytes = saturatingAdd(estimatedBytes, rowBytes)
-          lastId = journal.id
-          if (estimatedBytes >= COMPACTION_COPY_MAX_PAGE_BYTES) break
-        }
-        settled = true
-        cleanup()
-        resolve({
-          entries,
-          ...(lastId === undefined ? {} : { lastId }),
-          scannedRows: rows.length,
-          estimatedBytes,
-        })
-      } catch (error) {
-        fail(error)
+        transaction.abort()
+      } catch {
+        return
       }
     }
     cursorRequest.onerror = () => fail(cursorRequest.error)
     cursorRequest.onsuccess = () => {
       try {
         const cursor = cursorRequest.result
-        if (!cursor || rows.length >= COMPACTION_COPY_MAX_PAGE_ROWS) {
-          scheduleSourceReads()
-          return
+        if (!cursor) return
+        const journal = cursor.value as BrowserWorkspaceCatchupJournalRow
+        const request = sourceStore.get(journal.sourceKey as IDBValidKey)
+        request.onerror = () => fail(request.error)
+        request.onsuccess = () => {
+          try {
+            const sourceValue: unknown = request.result
+            entries.push({ journal, sourceValue })
+            estimatedBytes = saturatingAdd(
+              estimatedBytes,
+              sourceValue === undefined ? 0 : estimateStoredValueBytes(sourceValue),
+            )
+            lastId = journal.id
+            if (
+              entries.length < COMPACTION_COPY_MAX_PAGE_ROWS &&
+              estimatedBytes < COMPACTION_COPY_MAX_PAGE_BYTES
+            )
+              cursor.continue()
+          } catch (error) {
+            failCallback(error)
+          }
         }
-        rows.push(cursor.value as BrowserWorkspaceCatchupJournalRow)
-        if (rows.length >= COMPACTION_COPY_MAX_PAGE_ROWS) scheduleSourceReads()
-        else cursor.continue()
       } catch (error) {
-        fail(error)
-        try {
-          transaction.abort()
-        } catch {
-          // The transaction may have already aborted because the callback threw.
-        }
+        failCallback(error)
       }
     }
   })
@@ -555,7 +527,10 @@ async function applyBrowserWorkspaceCatchupPage(
     runDestinationTransaction,
     `observe-catchup:${tableName}`,
     [tableName],
-    (tx) => tx.table<unknown, IndexableType>(tableName).bulkGet(keys),
+    (tx) => {
+      const table = tx.table<unknown, IndexableType>(tableName)
+      return Dexie.Promise.all(keys.map((key) => table.where(':id').equals(key).raw().first()))
+    },
   )
   const puts: unknown[] = []
   const deletes: IndexableType[] = []
@@ -719,9 +694,9 @@ function readCopyPage(
   readonly lastPrimaryKey?: IndexableType
   readonly estimatedBytes: number
 }> {
-  if (signal.aborted) return Promise.reject(compactionReadError(signal.reason))
+  if (signal.aborted) return Promise.reject(signal.reason)
   if (foregroundInterruptionSignal.aborted) {
-    return Promise.reject(compactionReadError(foregroundInterruptionSignal.reason))
+    return Promise.reject(foregroundInterruptionSignal.reason)
   }
   const backend = source.db.backendDB() as IDBDatabase | null
   if (!backend) throw new Error('BrowserWorkspaceCompactionSourceClosed')
@@ -752,18 +727,11 @@ function readCopyPage(
         estimatedBytes,
       })
     }
-    const fail = (error?: unknown) => {
+    const fail = (reason: unknown) => {
       if (settled) return
       settled = true
       cleanup()
-      reject(
-        compactionReadError(
-          error ??
-            request.error ??
-            transaction.error ??
-            new Error('BrowserWorkspaceCompactionReadFailed'),
-        ),
-      )
+      reject(reason)
     }
     const abort = (reason: unknown) => {
       try {
@@ -780,10 +748,12 @@ function readCopyPage(
     foregroundInterruptionSignal.addEventListener('abort', abortForForegroundDemand, {
       once: true,
     })
-    transaction.onerror = () => fail()
-    transaction.onabort = () => fail()
+    const failTransaction = () =>
+      fail(request.error ?? transaction.error ?? new Error('BrowserWorkspaceCompactionReadFailed'))
+    transaction.onerror = failTransaction
+    transaction.onabort = failTransaction
     transaction.oncomplete = finish
-    request.onerror = () => fail()
+    request.onerror = failTransaction
     request.onsuccess = () => {
       try {
         const cursor = request.result

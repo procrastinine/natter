@@ -1,13 +1,22 @@
 import { createHash } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { extname, resolve } from 'node:path'
 import ts from 'typescript'
 import { ARCHITECTURE_COVERAGE } from './architecture-coverage-manifest.mjs'
 import {
   createFilesystemLocalModuleSource,
+  discoverLocalModulePaths,
+  LOCAL_MODULE_ASSET_EXTENSIONS,
   reverseReachableLocalModules,
   scanLocalModuleGraph,
+  scanReachableLocalModuleGraph,
 } from './local-module-graph.mjs'
+import { browserProjectsForFile, selectBrowserTasks } from './playwright-selection.mjs'
+import {
+  compileSliceVerificationStages,
+  VERIFICATION_STAGES,
+  verificationStageInputPaths,
+} from './run-verification.mjs'
 import { TEST_GUARANTEE_CLAIMS } from './test-evidence-manifest.mjs'
 import {
   VERIFICATION_EXPLICIT_MODULE_EDGES,
@@ -19,8 +28,24 @@ import {
   verificationGlobalInputPaths,
 } from './verification-obligation-manifest.mjs'
 import { VERIFICATION_SNAPSHOT_SCHEMA_VERSION } from './verification-snapshot-schema.mjs'
+import { isVitestSuitePath, parseVitestProjectSource, vitestProjects } from './vitest-projects.mjs'
 
 const DEFAULT_ROOT = resolve(import.meta.dirname, '..')
+const VITEST_PROJECT_PROVIDER_INPUTS = ['scripts/vitest-projects.mjs', 'vitest.config.ts']
+let loadedProjectProviderInputs
+
+export function verificationSnapshotInputPaths(options) {
+  const source = options.source
+  const globalInputs =
+    options.globalInputs ?? verificationGlobalInputPaths({ allPaths: source.allPaths })
+  return uniqueSorted([
+    ...discoverLocalModulePaths({ source }),
+    ...globalInputs,
+    ...(options.stages ?? VERIFICATION_STAGES).flatMap((stage) =>
+      verificationStageInputPaths(stage, source.allPaths),
+    ),
+  ]).filter((path) => source.allPaths.has(path))
+}
 
 export function buildVerificationSnapshot(options = {}) {
   const root = options.root ?? DEFAULT_ROOT
@@ -29,17 +54,27 @@ export function buildVerificationSnapshot(options = {}) {
     verificationGlobalInputPaths(options.source ? { allPaths: options.source.allPaths } : { root })
   const source =
     options.source ??
-    createFilesystemLocalModuleSource({ root, additionalPaths: initialGlobalInputs })
+    createFilesystemLocalModuleSource({
+      root,
+      additionalPaths: [
+        ...initialGlobalInputs,
+        ...VERIFICATION_STAGES.flatMap((stage) => verificationStageInputPaths(stage)),
+      ],
+    })
   const globalInputs =
     options.globalInputs ?? verificationGlobalInputPaths({ allPaths: source.allPaths })
-  const extraPaths = globalInputs.filter((path) => source.allPaths.has(path))
+  const extraPaths = verificationSnapshotInputPaths({ source, globalInputs })
+  const scannedFiles = new Map()
   const scan = scanLocalModuleGraph({
     source,
     supplementalPaths: extraPaths,
-    ...(options.parseSourceFile ? { parseSourceFile: options.parseSourceFile } : {}),
-    projectFile: verificationFileRecord,
+    parseSourceFile: options.parseSourceFile ?? parseVitestProjectSource,
+    projectFile(file) {
+      scannedFiles.set(file.path, file)
+      return verificationFileRecord(file)
+    },
   })
-  const graph = withExplicitModuleEdges(
+  let graph = withVerificationModuleEdges(
     scan.graph,
     options.explicitEdges ?? VERIFICATION_EXPLICIT_MODULE_EDGES,
   )
@@ -49,6 +84,20 @@ export function buildVerificationSnapshot(options = {}) {
     const projection = scan.projections.get(path)
     if (!projection) throw new Error(`VerificationSnapshotProjectionMissing:${path}`)
     files[path] = projection
+  }
+  const unitExecution = snapshotUnitExecution(source, files, {
+    graph: scan.graph,
+    files: scannedFiles,
+  })
+  if (unitExecution.status === 'owned') {
+    graph = withVerificationModuleEdges(
+      graph,
+      unitExecution.projects.flatMap((project) =>
+        project.files.flatMap((importer) =>
+          project.setupFiles.map((dependency) => ({ importer, dependency })),
+        ),
+      ),
+    )
   }
   const dependencies = Object.fromEntries(
     [...graph.dependencies]
@@ -60,12 +109,85 @@ export function buildVerificationSnapshot(options = {}) {
     obligationSchemaVersion: VERIFICATION_OBLIGATION_SCHEMA_VERSION,
     files,
     dependencies,
+    unitExecution,
     graphDiagnostics: graph.diagnostics,
   }
   return Object.freeze({
     ...snapshotWithoutDigest,
     digest: digestJson(snapshotWithoutDigest),
   })
+}
+
+function snapshotUnitExecution(source, files, moduleScan) {
+  if (!loadedProjectProviderInputs) {
+    const providerSource = createFilesystemLocalModuleSource({
+      root: DEFAULT_ROOT,
+      directories: ['scripts'],
+      files: ['vitest.config.ts', 'vite.config.ts'],
+    })
+    const scan = scanReachableLocalModuleGraph({
+      source: providerSource,
+      entryPaths: VITEST_PROJECT_PROVIDER_INPUTS,
+      availablePaths: providerSource.allPaths,
+      projectFile: ({ path }) => sha256(providerSource.readFileBytes(path)),
+    })
+    if (scan.graph.diagnostics.length > 0) {
+      throw new Error('VerificationUnitProjectProviderGraphUnresolved')
+    }
+    loadedProjectProviderInputs = Object.freeze(
+      Object.fromEntries([...scan.projections].sort(([left], [right]) => compareText(left, right))),
+    )
+  }
+  const providerInputs = loadedProjectProviderInputs
+  const mismatchedPaths = Object.keys(providerInputs).filter(
+    (path) => files[path]?.sha256 !== providerInputs[path],
+  )
+  if (mismatchedPaths.length > 0) {
+    return Object.freeze({
+      status: 'unavailable',
+      providerInputs,
+      mismatchedPaths: Object.freeze(mismatchedPaths),
+    })
+  }
+  const projects = vitestProjects({ source, moduleScan }).map((project) =>
+    Object.freeze({
+      project: project.project,
+      files: Object.freeze([...project.files]),
+      setupFiles: Object.freeze([...project.setupFiles]),
+    }),
+  )
+  for (const project of projects) {
+    for (const path of project.setupFiles) {
+      if (!files[path]) throw new Error(`VerificationUnitSetupMissing:${project.project}:${path}`)
+    }
+  }
+  return Object.freeze({ status: 'owned', providerInputs, projects: Object.freeze(projects) })
+}
+
+function compareUnitExecution(base, current) {
+  if (
+    base.unitExecution.status !== 'owned' ||
+    current.unitExecution.status !== 'owned' ||
+    JSON.stringify(base.unitExecution.providerInputs) !==
+      JSON.stringify(current.unitExecution.providerInputs)
+  ) {
+    return { fullRunner: true, movedFiles: [] }
+  }
+  const ownership = (snapshot) =>
+    new Map(
+      snapshot.unitExecution.projects.flatMap((project) =>
+        project.files.map((path) => [
+          path,
+          JSON.stringify({ project: project.project, setupFiles: project.setupFiles }),
+        ]),
+      ),
+    )
+  const before = ownership(base)
+  const after = ownership(current)
+  return {
+    fullRunner: false,
+    movedFiles: [...after.keys()].filter((path) => before.get(path) !== after.get(path)),
+  }
 }
 
 export function diffVerificationSnapshots(base, current) {
@@ -114,6 +236,7 @@ export function planSliceVerification(options) {
   const impact = diffVerificationSnapshots(base, current)
   const obligations = options.obligations ?? VERIFICATION_OBLIGATIONS
   const proofs = options.proofs ?? VERIFICATION_PROOFS
+  const stages = options.stages ?? VERIFICATION_STAGES
   const globalInputs = new Set(
     options.globalInputs ??
       verificationGlobalInputPaths({
@@ -130,19 +253,73 @@ export function planSliceVerification(options) {
   const currentGraph = graphFromSnapshot(current)
   const baseGraph = graphFromSnapshot(base)
   const currentRoots = impact.changedPaths.filter((path) => currentGraph.paths.includes(path))
-  const deletedRoots = impact.deletedPaths.filter((path) => baseGraph.paths.includes(path))
+  const previousRoots = impact.changedPaths.filter((path) => baseGraph.paths.includes(path))
   const affectedPaths = uniqueSorted([
     ...reverseReachableLocalModules(currentGraph, currentRoots),
-    ...reverseReachableLocalModules(baseGraph, deletedRoots),
+    ...reverseReachableLocalModules(baseGraph, previousRoots),
     ...impact.changedPaths,
   ])
   const affectedSet = new Set(affectedPaths)
-  const affectedTestFiles = affectedPaths.filter(isTestSuitePath)
   const changedSet = new Set(impact.changedPaths)
-  const changedGlobalInputs = impact.changedPaths.filter((path) => globalInputs.has(path))
+  const affectedGlobalInputs = [...globalInputs].filter((path) => affectedSet.has(path))
+  const stageInputs = new Map(
+    stages.map((stage) => [
+      stage.id,
+      verificationStageInputPaths(
+        stage,
+        new Set([...Object.keys(base.files), ...Object.keys(current.files)]),
+      ),
+    ]),
+  )
+  const impactedStageIds = new Set(
+    stages
+      .filter(
+        (stage) =>
+          affectedGlobalInputs.length > 0 ||
+          stageInputs.get(stage.id).some((path) => affectedSet.has(path)),
+      )
+      .map((stage) => stage.id),
+  )
+  const unitOwnership = compareUnitExecution(base, current)
+  if (unitOwnership.fullRunner && impact.changedPaths.some(isExecutableRepositoryPath)) {
+    for (const stage of stages) if (stage.kind === 'vitest') impactedStageIds.add(stage.id)
+  }
+  const prerequisiteConsumers = new Set()
+  let expanded = true
+  while (expanded) {
+    expanded = false
+    for (const stage of stages) {
+      for (const prerequisite of stage.prerequisites ?? []) {
+        if (prerequisite.propagateImpact === false || !impactedStageIds.has(prerequisite.id))
+          continue
+        if (prerequisite.consumerModules) {
+          for (const path of prerequisite.consumerModules) prerequisiteConsumers.add(path)
+        } else if (!impactedStageIds.has(stage.id)) {
+          impactedStageIds.add(stage.id)
+          expanded = true
+        }
+      }
+    }
+  }
+  const impactedRunners = new Set(
+    stages.filter((stage) => impactedStageIds.has(stage.id)).map((stage) => stage.kind),
+  )
+  const prerequisiteConsumerTests = reverseReachableLocalModules(currentGraph, [
+    ...prerequisiteConsumers,
+  ])
+  const affectedTestFiles = uniqueSorted([
+    ...(affectedGlobalInputs.length > 0 ? Object.keys(current.files) : affectedPaths),
+    ...prerequisiteConsumerTests,
+    ...unitOwnership.movedFiles,
+    ...Object.keys(current.files).filter((path) =>
+      path.startsWith('tests/e2e/')
+        ? impactedRunners.has('playwright')
+        : impactedRunners.has('vitest'),
+    ),
+  ]).filter((path) => current.files[path] && isTestSuitePath(path))
   const impactedObligations = obligations.filter(
     (obligation) =>
-      changedGlobalInputs.length > 0 ||
+      affectedGlobalInputs.length > 0 ||
       obligation.impactModules.some((path) => affectedSet.has(path)) ||
       (obligation.impactPrefixes ?? []).some((prefix) =>
         impact.changedPaths.some((path) => path.startsWith(prefix)),
@@ -179,18 +356,15 @@ export function planSliceVerification(options) {
       .flatMap((proof) => proof.execution.files),
     ...affectedVitestFiles,
   ])
-  const selectedBrowserByProject = new Map()
-  for (const proof of selectedProofs.filter((proof) => proof.execution.runner === 'playwright')) {
-    const files = selectedBrowserByProject.get(proof.execution.project) ?? []
-    files.push(...proof.execution.files)
-    selectedBrowserByProject.set(proof.execution.project, files)
-  }
-  if (affectedBrowserFiles.length > 0) {
-    const files = selectedBrowserByProject.get('chromium') ?? []
-    files.push(...affectedBrowserFiles)
-    selectedBrowserByProject.set('chromium', files)
-  }
-  addPlaywrightProjectPrerequisites(selectedBrowserByProject)
+  const browserSelection = selectBrowserTasks(
+    uniqueSorted([
+      ...selectedProofs
+        .filter((proof) => proof.execution.runner === 'playwright')
+        .flatMap((proof) => proof.execution.files),
+      ...affectedBrowserFiles,
+    ]),
+    Object.keys(current.files),
+  )
   const selectedNodeProofs = selectedProofs
     .filter((proof) => proof.execution.runner === 'node')
     .map((proof) => Object.freeze({ id: proof.id, argv: proof.execution.argv }))
@@ -203,16 +377,32 @@ export function planSliceVerification(options) {
     })
   const classifiedProduction = moduleClassificationByPath(moduleInventory)
   const changedProductionPaths = impact.changedPaths.filter((path) => path.startsWith('src/'))
-  const impactedDomains = uniqueSorted(
-    changedProductionPaths.flatMap((path) =>
-      classifiedProduction.get(path) ? [classifiedProduction.get(path).domain] : [],
-    ),
+  const productionDomains = new Map(
+    changedProductionPaths.map((path) => {
+      const owners = LOCAL_MODULE_ASSET_EXTENSIONS.includes(extname(path))
+        ? uniqueSorted([
+            ...reverseReachableLocalModules(currentGraph, [path]),
+            ...reverseReachableLocalModules(baseGraph, [path]),
+          ])
+        : [path]
+      return [
+        path,
+        uniqueSorted(owners.flatMap((owner) => classifiedProduction.get(owner)?.domain ?? [])),
+      ]
+    }),
   )
-  const structuralBlockers = [...manifestProblems]
+  const impactedDomains = uniqueSorted([...productionDomains.values()].flat())
+  const structuralBlockers = [
+    ...manifestProblems,
+    ...browserSelection.problems,
+    ...(current.unitExecution.status === 'owned'
+      ? []
+      : ['VerificationUnitExecutionUnowned:current']),
+  ]
 
   for (const path of changedProductionPaths) {
     if (globalInputs.has(path)) continue
-    if (!classifiedProduction.has(path) && current.files[path]) {
+    if (!productionDomains.get(path).length && current.files[path]) {
       structuralBlockers.push(`VerificationChangedPathUnclassified:${path}`)
     }
     if (!registeredImpactClosure.has(path) && !registeredProofImpactClosure.has(path)) {
@@ -223,6 +413,13 @@ export function planSliceVerification(options) {
     ...changedProductionPaths,
     ...impact.changedPaths.filter(isTestSuitePath),
     ...globalInputs,
+    ...[...stageInputs.values()].flat(),
+    ...dependencyClosure(currentGraph, [...stageInputs.values()].flat()),
+    ...dependencyClosure(baseGraph, [...stageInputs.values()].flat()),
+    ...dependencyClosure(currentGraph, [...globalInputs]),
+    ...dependencyClosure(baseGraph, [...globalInputs]),
+    ...dependencyClosure(currentGraph, affectedTestFiles),
+    ...dependencyClosure(baseGraph, affectedTestFiles),
     ...obligations.flatMap((obligation) => obligation.impactModules),
     ...proofs.flatMap(proofFiles),
     ...registeredImpactClosure,
@@ -246,6 +443,14 @@ export function planSliceVerification(options) {
     ),
   )
   for (const diagnostic of [...base.graphDiagnostics, ...current.graphDiagnostics]) {
+    if (extname(diagnostic.path) === '.css') {
+      if (affectedSet.has(diagnostic.path)) {
+        structuralBlockers.push(
+          `VerificationImpactEdgeUnresolved:${diagnostic.path}:${diagnostic.line}:${diagnostic.code}`,
+        )
+      }
+      continue
+    }
     if (disposedOpaqueKeys.has(`${diagnostic.path}|${diagnostic.code}`)) continue
     if (affectedTestFiles.includes(diagnostic.path)) continue
     if (globalInputs.has(diagnostic.path)) continue
@@ -271,19 +476,37 @@ export function planSliceVerification(options) {
     ...impactedGuarantees.filter((claim) => claim.status !== 'covered'),
     ...architectureGapsForDomains(impactedDomains),
   ]
-  const tasks = Object.freeze({
+  let tasks = Object.freeze({
     node: Object.freeze(selectedNodeProofs),
     vitest: Object.freeze(selectedVitestFiles),
-    playwright: Object.freeze(
-      [...selectedBrowserByProject]
-        .sort(([left], [right]) => comparePlaywrightProjects(left, right))
-        .map(([project, files]) =>
-          Object.freeze({ project, files: Object.freeze(uniqueSorted(files)) }),
-        ),
-    ),
+    playwright: Object.freeze(browserSelection.tasks),
   })
+  let executionStages = []
+  try {
+    executionStages = compileSliceVerificationStages(tasks, {
+      catalog: stages,
+      sourceFiles: Object.keys(current.files),
+      stageIds: [...impactedStageIds],
+      inputPaths: new Set(
+        dependencyClosure(currentGraph, [
+          ...selectedVitestFiles,
+          ...browserSelection.tasks.flatMap((task) => task.files),
+        ]),
+      ),
+    })
+  } catch (error) {
+    structuralBlockers.push(String(error instanceof Error ? error.message : error))
+  }
+  if (executionStages.length)
+    tasks = Object.freeze({
+      ...tasks,
+      vitest: Object.freeze(
+        uniqueSorted(executionStages.flatMap((stage) => stage.unitFiles ?? [])),
+      ),
+      playwright: Object.freeze(executionStages.flatMap((stage) => stage.browserTasks ?? [])),
+    })
   const reportWithoutDigest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     baseDigest: base.digest,
     currentDigest: current.digest,
     impact,
@@ -294,6 +517,8 @@ export function planSliceVerification(options) {
     openGuarantees: Object.freeze(uniqueGuarantees(openGuarantees)),
     unregisteredAffectedTests: Object.freeze(unregisteredAffectedTests),
     tasks,
+    stages: Object.freeze(executionStages),
+    impactedStageIds: Object.freeze([...impactedStageIds].sort(compareText)),
     structuralBlockers: Object.freeze(uniqueSorted(structuralBlockers)),
   }
   return Object.freeze({
@@ -305,32 +530,6 @@ export function planSliceVerification(options) {
       reportWithoutDigest.unregisteredAffectedTests.length === 0,
     planDigest: digestJson(reportWithoutDigest),
   })
-}
-
-function addPlaywrightProjectPrerequisites(selectedBrowserByProject) {
-  if (!selectedBrowserByProject.has('chromium-large-workspace')) return
-  selectedBrowserByProject.set('large-workspace-setup', ['tests/e2e/large-workspace.setup.ts'])
-}
-
-function comparePlaywrightProjects(left, right) {
-  return playwrightProjectOrder(left) - playwrightProjectOrder(right) || compareText(left, right)
-}
-
-function playwrightProjectOrder(project) {
-  switch (project) {
-    case 'chromium':
-      return 0
-    case 'firefox':
-      return 1
-    case 'large-workspace-setup':
-      return 2
-    case 'chromium-large-workspace':
-      return 3
-    case 'chromium-send-performance':
-      return 4
-    default:
-      return Number.MAX_SAFE_INTEGER
-  }
 }
 
 export function validateVerificationManifest(options = {}) {
@@ -400,16 +599,12 @@ function validateProofExecution({ proof, root, problems, checkFiles = true }) {
     return
   }
   if (execution.runner === 'playwright') {
-    if (
-      !['chromium', 'firefox', 'chromium-large-workspace', 'chromium-send-performance'].includes(
-        execution.project,
-      )
-    ) {
-      problems.push(`VerificationBrowserSelectorUnsafe:${proof.id}:project=${execution.project}`)
-    }
     for (const path of execution.files) {
       if (!/^tests\/e2e\/[^:]+\.spec\.ts$/u.test(path)) {
         problems.push(`VerificationBrowserSelectorUnsafe:${proof.id}:${path}`)
+      }
+      if (browserProjectsForFile(path).length === 0) {
+        problems.push(`VerificationBrowserFileUncollected:${proof.id}:${path}`)
       }
       if (checkFiles && !statSync(resolve(root, path), { throwIfNoEntry: false })?.isFile()) {
         problems.push(`VerificationProofFileMissing:${path}`)
@@ -488,9 +683,13 @@ function graphFromSnapshot(snapshot) {
   })
 }
 
-function withExplicitModuleEdges(graph, explicitEdges) {
+function withVerificationModuleEdges(graph, explicitEdges) {
   const dependencies = new Map([...graph.dependencies].map(([path, values]) => [path, [...values]]))
   const diagnostics = [...graph.diagnostics]
+  for (const [path, values] of dependencies) {
+    const declaration = path.replace(/\.([mc]?)js$/u, '.d.$1ts')
+    if (declaration !== path && dependencies.has(declaration)) values.push(declaration)
+  }
   for (const edge of explicitEdges) {
     if (!dependencies.has(edge.importer) && !dependencies.has(edge.dependency)) continue
     if (!dependencies.has(edge.importer) || !dependencies.has(edge.dependency)) {
@@ -524,7 +723,7 @@ function withExplicitModuleEdges(graph, explicitEdges) {
   })
 }
 
-function validateOpaqueModuleDispositions(diagnostics, dispositions, files) {
+export function validateOpaqueModuleDispositions(diagnostics, dispositions, files) {
   const counts = new Map()
   for (const diagnostic of diagnostics) {
     const key = `${diagnostic.path}|${diagnostic.code}`
@@ -607,7 +806,7 @@ function uniqueGuarantees(guarantees) {
 }
 
 function isTestSuitePath(path) {
-  return /^tests\/(?:unit|integration|live|e2e)\/.*\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(path)
+  return /^tests\/(?:unit|integration|live|e2e)\/.*\.(?:test|spec|setup)\.[cm]?[jt]sx?$/u.test(path)
 }
 
 function isExecutableRepositoryPath(path) {
@@ -623,6 +822,39 @@ function isNonExecutableDocumentation(path) {
 function validateSnapshot(snapshot, label) {
   if (!snapshot || snapshot.schemaVersion !== VERIFICATION_SNAPSHOT_SCHEMA_VERSION) {
     throw new Error(`VerificationSnapshotInvalid:${label}`)
+  }
+  const execution = snapshot.unitExecution
+  if (execution?.status === 'unavailable') {
+    if (!Array.isArray(execution.mismatchedPaths) || execution.mismatchedPaths.length === 0) {
+      throw new Error(`VerificationUnitExecutionInvalid:${label}`)
+    }
+    return
+  }
+  if (execution?.status !== 'owned' || !Array.isArray(execution.projects)) {
+    throw new Error(`VerificationUnitExecutionInvalid:${label}`)
+  }
+  const owners = new Set()
+  const selected = []
+  for (const project of execution.projects) {
+    if (owners.has(project.project)) throw new Error(`VerificationUnitProjectDuplicate:${label}`)
+    owners.add(project.project)
+    for (const file of project.files) {
+      if (!snapshot.files[file] || !isVitestSuitePath(file)) {
+        throw new Error(`VerificationUnitProjectFileInvalid:${label}:${file}`)
+      }
+      selected.push(file)
+      for (const setup of project.setupFiles) {
+        if (!snapshot.files[setup] || !snapshot.dependencies[file]?.includes(setup)) {
+          throw new Error(`VerificationUnitSetupEdgeMissing:${label}:${file}:${setup}`)
+        }
+      }
+    }
+  }
+  if (
+    JSON.stringify(selected.sort()) !==
+    JSON.stringify(Object.keys(snapshot.files).filter(isVitestSuitePath).sort())
+  ) {
+    throw new Error(`VerificationUnitProjectPopulationMismatch:${label}`)
   }
 }
 

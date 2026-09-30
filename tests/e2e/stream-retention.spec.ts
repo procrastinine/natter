@@ -5,7 +5,6 @@ import {
 } from './fake-stream-provider'
 import { type CDPSession, expect, type Page, test } from './fixtures'
 import {
-  activeWorkspaceDatabaseName,
   clearIndexedDb,
   createChatAndOpen,
   firstChatId,
@@ -102,108 +101,103 @@ async function readRetentionStorageState(
   page: Page,
   chatId: string,
 ): Promise<RetentionStorageState> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      const read = <T>(request: IDBRequest<T>) =>
-        new Promise<T>((resolve, reject) => {
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      try {
-        const transaction = db.transaction(
-          ['messages', 'messageBodies', 'streamLeases', 'streamChunks'],
-          'readonly',
-        )
-        const [headers, bodies, leases, chunks] = await Promise.all([
-          read(transaction.objectStore('messages').index('chatId').getAll(id)),
-          read(transaction.objectStore('messageBodies').getAll()),
-          read(transaction.objectStore('streamLeases').getAll()),
-          read(transaction.objectStore('streamChunks').getAll()),
-        ])
-        const messageHeaders = (headers as Array<Record<string, unknown>>).sort(
-          (left, right) =>
-            Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0) ||
-            String(left.id).localeCompare(String(right.id)),
-        )
-        const users = messageHeaders.filter((row) => row.role === 'user')
-        const assistants = messageHeaders.filter((row) => row.role === 'assistant')
-        const latestUser = users.at(-1)
-        const latestAssistant = assistants.at(-1)
-        const body = (bodies as Array<Record<string, unknown>>).find(
-          (row) => row.id === latestAssistant?.id,
-        )
-        const content: unknown[] = Array.isArray(body?.content) ? body.content : []
-        const reasoningEnvelope =
-          typeof body?.reasoningEnvelope === 'object' && body.reasoningEnvelope !== null
-            ? (body.reasoningEnvelope as Record<string, unknown>)
-            : null
-        const reasoning: unknown[] = Array.isArray(reasoningEnvelope?.visible)
-          ? reasoningEnvelope.visible
-          : []
-        const generationFinished = (row: Record<string, unknown>) => {
-          const generation = row.generation
-          return (
-            typeof generation === 'object' &&
-            generation !== null &&
-            typeof (generation as { finishedAt?: unknown }).finishedAt === 'number'
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, read) => {
+          const transaction = db.transaction(
+            ['messages', 'messageBodies', 'streamLeases', 'streamChunks'],
+            'readonly',
           )
-        }
-        return {
-          assistantCount: assistants.length,
-          latestAssistantId: typeof latestAssistant?.id === 'string' ? latestAssistant.id : null,
-          latestContentChars: content.reduce<number>(
-            (total, item) =>
-              total +
-              (typeof item === 'object' &&
-              item !== null &&
-              typeof (item as { text?: unknown }).text === 'string'
-                ? (item as { text: string }).text.length
-                : 0),
-            0,
-          ),
-          latestReasoningChars: reasoning.reduce<number>(
-            (total, item) =>
-              total +
-              (typeof item === 'object' &&
-              item !== null &&
-              typeof (item as { text?: unknown }).text === 'string'
-                ? (item as { text: string }).text.length
-                : 0),
-            0,
-          ),
-          latestReasoningCarrierCount: Array.isArray(reasoningEnvelope?.carriers)
-            ? reasoningEnvelope.carriers.length
-            : 0,
-          latestReasoningSchemaVersion:
-            typeof reasoningEnvelope?.schemaVersion === 'number'
-              ? reasoningEnvelope.schemaVersion
-              : null,
-          legacyReasoningDetailsPresent: Object.hasOwn(body ?? {}, 'reasoningDetails'),
-          latestUserAssistantChildren:
-            typeof latestUser?.id === 'string'
-              ? assistants.filter((row) => row.parentId === latestUser.id).length
+          const [headers, bodies, leases, chunks] = await Promise.all([
+            read(transaction.objectStore('messages').index('chatId').getAll(id)),
+            read(transaction.objectStore('messageBodies').index('chatId').getAll(id)),
+            read(
+              transaction
+                .objectStore('streamLeases')
+                .index('[chatId+streamId]')
+                .getAll(IDBKeyRange.bound([id, ''], [id, '\uffff'])),
+            ),
+            read(transaction.objectStore('streamChunks').index('chatId').getAll(id)),
+          ])
+          const messageHeaders = (headers as Array<Record<string, unknown>>).sort(
+            (left, right) =>
+              Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0) ||
+              String(left.id).localeCompare(String(right.id)),
+          )
+          const users = messageHeaders.filter((row) => row.role === 'user')
+          const assistants = messageHeaders.filter((row) => row.role === 'assistant')
+          const latestUser = users.at(-1)
+          const latestAssistant = assistants.at(-1)
+          const body = (bodies as Array<Record<string, unknown>>).find(
+            (row) => row.id === latestAssistant?.id,
+          )
+          const content: unknown[] = Array.isArray(body?.content) ? body.content : []
+          const reasoningEnvelope =
+            typeof body?.reasoningEnvelope === 'object' && body.reasoningEnvelope !== null
+              ? (body.reasoningEnvelope as Record<string, unknown>)
+              : null
+          const reasoning: unknown[] = Array.isArray(reasoningEnvelope?.visible)
+            ? reasoningEnvelope.visible
+            : []
+          const generationFinished = (row: Record<string, unknown>) => {
+            const generation = row.generation
+            return (
+              typeof generation === 'object' &&
+              generation !== null &&
+              typeof (generation as { finishedAt?: unknown }).finishedAt === 'number'
+            )
+          }
+          return {
+            assistantCount: assistants.length,
+            latestAssistantId: typeof latestAssistant?.id === 'string' ? latestAssistant.id : null,
+            latestContentChars: content.reduce<number>(
+              (total, item) =>
+                total +
+                (typeof item === 'object' &&
+                item !== null &&
+                typeof (item as { text?: unknown }).text === 'string'
+                  ? (item as { text: string }).text.length
+                  : 0),
+              0,
+            ),
+            latestReasoningChars: reasoning.reduce<number>(
+              (total, item) =>
+                total +
+                (typeof item === 'object' &&
+                item !== null &&
+                typeof (item as { text?: unknown }).text === 'string'
+                  ? (item as { text: string }).text.length
+                  : 0),
+              0,
+            ),
+            latestReasoningCarrierCount: Array.isArray(reasoningEnvelope?.carriers)
+              ? reasoningEnvelope.carriers.length
               : 0,
-          latestUserId: typeof latestUser?.id === 'string' ? latestUser.id : null,
-          streamChunkCount: (chunks as Array<{ chatId?: unknown }>).filter(
-            (row) => row.chatId === id,
-          ).length,
-          streamLeaseCount: (leases as Array<{ chatId?: unknown }>).filter(
-            (row) => row.chatId === id,
-          ).length,
-          unfinishedAssistantCount: assistants.filter((row) => !generationFinished(row)).length,
-          userCount: users.length,
-        }
-      } finally {
-        db.close()
-      }
+            latestReasoningSchemaVersion:
+              typeof reasoningEnvelope?.schemaVersion === 'number'
+                ? reasoningEnvelope.schemaVersion
+                : null,
+            legacyReasoningDetailsPresent: Object.hasOwn(body ?? {}, 'reasoningDetails'),
+            latestUserAssistantChildren:
+              typeof latestUser?.id === 'string'
+                ? assistants.filter((row) => row.parentId === latestUser.id).length
+                : 0,
+            latestUserId: typeof latestUser?.id === 'string' ? latestUser.id : null,
+            streamChunkCount: (chunks as Array<{ chatId?: unknown }>).filter(
+              (row) => row.chatId === id,
+            ).length,
+            streamLeaseCount: (leases as Array<{ chatId?: unknown }>).filter(
+              (row) => row.chatId === id,
+            ).length,
+            unfinishedAssistantCount: assistants.filter((row) => !generationFinished(row)).length,
+            userCount: users.length,
+          }
+        },
+      )
     },
-    { databaseName, id: chatId },
+    { id: chatId },
   )
 }
 
@@ -280,32 +274,20 @@ function generationRequestCount(
 }
 
 async function streamChunkCountForChat(page: Page, chatId: string): Promise<number> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        return await new Promise<number>((resolve, reject) => {
-          const request = db
-            .transaction('streamChunks', 'readonly')
-            .objectStore('streamChunks')
-            .getAll()
-          request.onsuccess = () =>
-            resolve(
-              (request.result as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
-                .length,
-            )
-          request.onerror = () => reject(request.error)
-        })
-      } finally {
-        db.close()
-      }
-    },
-    { databaseName, id: chatId },
+    (chatId) =>
+      globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        (database, request) =>
+          request(
+            database
+              .transaction('streamChunks')
+              .objectStore('streamChunks')
+              .index('chatId')
+              .count(chatId),
+          ),
+      ),
+    chatId,
   )
 }
 

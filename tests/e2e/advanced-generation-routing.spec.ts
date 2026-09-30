@@ -10,7 +10,7 @@ import {
   readChatRow,
   readMessages,
   seedFirstRun,
-  seedLinearChat,
+  sendMessage,
   waitForAssistantGenerationFinished,
 } from './helpers'
 
@@ -50,17 +50,57 @@ test('consecutive regenerations finish with nineteen idle tabs on other chats', 
     corsProxyUrl: '/_or_scrape',
   })
   await sendAndExpectAssistant(page, 'Regenerate this prompt repeatedly.', replies[0])
+  const activeChatId = await firstChatId(page)
+  await transformWorkspaceThroughUi(page, (backup) => {
+    const payload = backup.payload as {
+      chats: Array<Record<string, unknown> & { id: string; lastUpdatedLeafId: string | null }>
+      messages: Array<
+        Record<string, unknown> & {
+          id: string
+          chatId: string
+          parentId: string | null
+          turnId: string
+        }
+      >
+    }
+    const sourceChat = payload.chats.find((chat) => chat.id === activeChatId)
+    if (!sourceChat) throw new Error('IdlePeerSourceChatMissing')
+    const sourceMessages = payload.messages.filter((message) => message.chatId === activeChatId)
+    expect(sourceMessages).toHaveLength(2)
+    for (let index = 0; index < 19; index += 1) {
+      const chatId = `idle-peer-${index}`
+      const messageId = (id: string | null) => (id === null ? null : `${chatId}:${id}`)
+      payload.chats.push({
+        ...structuredClone(sourceChat),
+        id: chatId,
+        title: `Idle peer ${index}`,
+        titleStatus: 'manual',
+        lastUpdatedLeafId: messageId(sourceChat.lastUpdatedLeafId),
+      })
+      payload.messages.push(
+        ...sourceMessages.map((message) => {
+          const idleMessage = structuredClone(message)
+          delete idleMessage.generation
+          return {
+            ...idleMessage,
+            id: `${chatId}:${message.id}`,
+            chatId,
+            parentId: messageId(message.parentId),
+            turnId: `${chatId}:${message.turnId}`,
+          }
+        }),
+      )
+    }
+  })
   const peers: Page[] = []
   for (let index = 0; index < 19; index += 1) {
     const peer = await page.context().newPage()
     peers.push(peer)
-    await mockOpenRouterDiscovery(peer, OR_CHAT_MODEL)
-    await peer.goto('/')
-    await seedLinearChat(peer, {
-      messageCount: 2,
-      chatId: `idle-peer-${index}`,
-      title: `Idle peer ${index}`,
-    })
+    await peer.goto(`/#/chat/idle-peer-${index}`)
+    await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText(`Idle peer ${index}`)
+    await expect(peer.locator('[data-ui="message"][data-role="assistant"]')).toContainText(
+      replies[0],
+    )
   }
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
   for (const reply of replies.slice(1)) {
@@ -91,32 +131,7 @@ test('one tab can send while compaction waits for an unrelated local command', a
   const chatId = await firstChatId(page)
   const databaseName = await activeWorkspaceDatabaseName(page)
   const marker = `natter:storage-compaction-intent:v1:single-tab-test-${crypto.randomUUID()}`
-  await page.addInitScript(() => {
-    if (window.location.protocol === 'about:') return
-    const scope = window as typeof window & {
-      __replacementAdmissionProbe?: { reached: boolean; release(): void }
-    }
-    let release!: () => void
-    const hold = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const probe = { reached: false, release }
-    scope.__replacementAdmissionProbe = probe
-    const request = navigator.locks.request.bind(navigator.locks)
-    navigator.locks.request = ((...args: Parameters<LockManager['request']>) => {
-      const options = args[1]
-      if (
-        args[0] === 'workspace:generation-lifetime' &&
-        typeof options === 'object' &&
-        options.mode === 'exclusive' &&
-        !probe.reached
-      ) {
-        probe.reached = true
-        return hold.then(() => request(...args))
-      }
-      return request(...args)
-    }) as LockManager['request']
-  })
+  await holdCompactionAdmissionOnReload(page)
   await page.evaluate(
     ({ marker, databaseName }) => {
       localStorage.setItem(
@@ -222,6 +237,127 @@ test('one tab can send while compaction waits for an unrelated local command', a
   )
 })
 
+test('manual provider Send survives compaction and Reload refreshes the missing cache', async ({
+  page,
+}) => {
+  const requests: CapturedRequest[] = []
+  const endpoints = [endpoint('Alpha ZDR', 131_072, ['provider'], { data_policy: policy({}) })]
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL, {
+    endpointsPayload: {
+      data: {
+        id: OR_CHAT_MODEL,
+        endpoints,
+      },
+    },
+  })
+  await mockChatCompletionsCapture(page, requests, ['Selected provider survived compaction.'])
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await openSettingsPanel(page)
+  await expect(page.getByLabel('Use Alpha ZDR', { exact: true })).toBeChecked()
+  await page.getByRole('button', { name: 'Select all', exact: true }).click()
+  const chatId = await firstChatId(page)
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toHaveProperty('providerPrefs.only', ['Alpha ZDR'])
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const marker = `natter:storage-compaction-intent:v1:selected-provider-${crypto.randomUUID()}`
+  await holdCompactionAdmissionOnReload(page)
+  await page.evaluate(
+    ({ marker, databaseName }) =>
+      localStorage.setItem(
+        marker,
+        JSON.stringify({
+          formatVersion: 2,
+          nonce: marker,
+          exactDebt: [[databaseName, 66 * 1024 * 1024]],
+        }),
+      ),
+    { marker, databaseName },
+  )
+  let releaseNetwork!: () => void
+  let heldEndpointRequests = 0
+  const network = new Promise<void>((resolve) => {
+    releaseNetwork = resolve
+  })
+  try {
+    await page.reload()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as typeof window & { __replacementAdmissionProbe?: { reached: boolean } })
+              .__replacementAdmissionProbe?.reached,
+        ),
+      )
+      .toBe(true)
+    await openSettingsPanel(page)
+    await expect(page.getByLabel('Use Alpha ZDR', { exact: true })).toBeChecked()
+    await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+      heldEndpointRequests += 1
+      await network
+      await route.fallback()
+    })
+    await page.evaluate(() =>
+      (
+        window as typeof window & { __replacementAdmissionProbe?: { release(): void } }
+      ).__replacementAdmissionProbe?.release(),
+    )
+    await expect.poll(() => activeWorkspaceDatabaseName(page)).not.toBe(databaseName)
+    await sendAndExpectAssistant(
+      page,
+      'Use the providers I selected.',
+      'Selected provider survived compaction.',
+    )
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.body.provider).toMatchObject({ only: ['Alpha ZDR'] })
+    await expect(page.getByLabel('Use Alpha ZDR', { exact: true })).toBeChecked()
+    endpoints.push(endpoint('New provider', 131_072, ['provider'], { data_policy: policy({}) }))
+    const requestsBeforeReload = heldEndpointRequests
+    await page.getByRole('button', { name: 'Reload providers', exact: true }).click()
+    await expect.poll(() => heldEndpointRequests).toBe(requestsBeforeReload + 1)
+    releaseNetwork()
+    await expect(page.getByLabel('Use New provider', { exact: true })).toBeVisible()
+    await expect(page.getByLabel('Use New provider', { exact: true })).not.toBeChecked()
+    await expect(page.getByLabel('Use Alpha ZDR', { exact: true })).toBeChecked()
+  } finally {
+    releaseNetwork()
+    await page.evaluate((marker) => localStorage.removeItem(marker), marker)
+  }
+})
+
+async function holdCompactionAdmissionOnReload(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    if (window.location.protocol === 'about:') return
+    const scope = window as typeof window & {
+      __replacementAdmissionProbe?: { reached: boolean; release(): void }
+    }
+    let release!: () => void
+    const hold = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const probe = { reached: false, release }
+    scope.__replacementAdmissionProbe = probe
+    const request = navigator.locks.request.bind(navigator.locks)
+    navigator.locks.request = ((...args: Parameters<LockManager['request']>) => {
+      const options = args[1]
+      if (
+        args[0] === 'workspace:generation-lifetime' &&
+        typeof options === 'object' &&
+        options.mode === 'exclusive' &&
+        !probe.reached
+      ) {
+        probe.reached = true
+        return hold.then(() => request(...args))
+      }
+      return request(...args)
+    }) as LockManager['request']
+  })
+}
+
 for (const action of ['regenerate', 'send', 'new-chat send'] as const) {
   test(`${action} does not await compaction recovery in an unrelated new-chat tab`, async ({
     page,
@@ -234,20 +370,17 @@ for (const action of ['regenerate', 'send', 'new-chat send'] as const) {
       disablePrivacyFilter: false,
       corsProxyUrl: '/_or_scrape',
     })
-    await sendAndExpectAssistant(page, 'Keep regeneration local to this chat.', 'Original reply.')
+    if (action !== 'new-chat send') {
+      await sendAndExpectAssistant(page, 'Keep generation local to this chat.', 'Original reply.')
+    }
     const chatUrl = page.url()
     const databaseName = await activeWorkspaceDatabaseName(page)
     const recoveryIntentKey = `natter:storage-compaction-intent:v1:crashed-test-${crypto.randomUUID()}`
     const peer = await page.context().newPage()
-    await mockOpenRouterDiscovery(peer, OR_CHAT_MODEL)
     const target = await page.context().newPage()
     const requests: CapturedRequest[] = []
-    await mockOpenRouterDiscovery(target, OR_CHAT_MODEL)
-    await mockChatCompletionsCapture(target, requests, [
-      'Independent first reply.',
-      'Independent send.',
-      'Independent new chat.',
-    ])
+    const replies = ['Independent first reply.', 'Independent repeated reply.']
+    await mockChatCompletionsCapture(target, requests, replies)
     try {
       await peer.goto('/#/new')
       await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText('New chat')
@@ -274,33 +407,24 @@ for (const action of ['regenerate', 'send', 'new-chat send'] as const) {
       await target.goto(action === 'new-chat send' ? '/#/new' : chatUrl)
       const assistant = target.locator('[data-ui="message"][data-role="assistant"]').last()
       if (action !== 'new-chat send') await expect(assistant).toContainText('Original reply.')
-      if (action === 'regenerate') {
-        await assistant.getByRole('button', { name: 'Regenerate response', exact: true }).click()
-        await expect(assistant.locator('[data-ui="message-body"]')).toContainText(
-          'Independent first reply.',
-        )
-      } else {
-        await sendAndExpectAssistant(
-          target,
-          'First write with recovery held.',
-          'Independent first reply.',
-        )
+      for (const [index, reply] of replies.entries()) {
+        if (action === 'regenerate') {
+          await assistant.getByRole('button', { name: 'Regenerate response', exact: true }).click()
+          await expect(assistant.locator('[data-ui="message-body"]')).toContainText(reply)
+        } else {
+          if (action === 'new-chat send' && index > 0) await createChatAndOpen(target)
+          await sendAndExpectAssistant(target, `Independent attempt ${index + 1}.`, reply)
+        }
+        await expect(
+          target.getByRole('button', { name: 'Cancel preparing', exact: true }),
+        ).toHaveCount(0)
+        await expect(target.locator('[data-ui="abort"]')).toHaveCount(0)
       }
-      await expect(
-        target.getByRole('button', { name: 'Cancel preparing', exact: true }),
-      ).toHaveCount(0)
-      await sendAndExpectAssistant(target, 'Send with the unrelated tab open.', 'Independent send.')
-      await createChatAndOpen(target)
-      await sendAndExpectAssistant(
-        target,
-        'New chat with the unrelated tab open.',
-        'Independent new chat.',
-      )
-      expect(requests).toHaveLength(3)
+      expect(requests).toHaveLength(replies.length)
       expect(await peer.evaluate(() => location.hash)).toBe('#/new')
     } finally {
-      await peer.close()
       await page.evaluate((key) => localStorage.removeItem(key), recoveryIntentKey)
+      await peer.close()
       await target.close()
     }
   })
@@ -968,7 +1092,7 @@ test('GUI manual selections pin new providers across reload, preset restore, bul
   const requests: CapturedRequest[] = []
   const discovered = [endpoint('Original', 131_072, ['provider'], { data_policy: policy({}) })]
   await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     await route.fulfill({ json: { data: { id: OR_CHAT_MODEL, endpoints: discovered } } })
   })
   await mockChatCompletionsCapture(page, requests, ['pinned provider ok'])
@@ -1035,7 +1159,7 @@ test('GUI switching saved GLM and GPT presets replaces providers, sort, privacy 
   const gpt = OR_BOTH_CHAT_ROUTES_MODEL
   const requests: CapturedRequest[] = []
   await mockOpenRouterDiscovery(page, glm)
-  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     await route.fulfill({
       json: {
         data: [
@@ -1045,7 +1169,7 @@ test('GUI switching saved GLM and GPT presets replaces providers, sort, privacy 
       },
     })
   })
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     const isGlm = route.request().url().includes(glm)
     await route.fulfill({
       json: {
@@ -1573,9 +1697,7 @@ async function openConnectionDetail(page: Page): Promise<void> {
 
 async function sendAndExpectAssistant(page: Page, prompt: string, expected: string): Promise<void> {
   const before = await page.locator('[data-ui="message"][data-role="assistant"]').count()
-  const composer = page.locator('[data-ui="composer"]:not([inert]) [data-ui="composer-input"]')
-  await composer.fill(prompt)
-  await composer.press('Enter')
+  await sendMessage(page, prompt, 'enter')
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').nth(before)
   await expect(assistant.locator('[data-ui="message-body"]')).toContainText(expected)
   await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
@@ -1608,35 +1730,21 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
 }
 
 async function waitForProviderOrder(page: Page, expected: string[]): Promise<void> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   await page.waitForFunction(
-    async ({ databaseName, order }) => {
+    async ({ order }) => {
       const chatId = window.location.hash.match(/^#\/chat\/([^/?#]+)/)?.[1]
       if (!chatId) return false
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open(databaseName)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        return await new Promise<boolean>((resolve, reject) => {
-          const tx = db.transaction('chats', 'readonly')
-          const req = tx.objectStore('chats').get(chatId)
-          req.onsuccess = () => {
-            const row = req.result as
-              | { settings?: { providerPrefs?: { order?: string[] } } }
-              | undefined
-            resolve(
-              JSON.stringify(row?.settings?.providerPrefs?.order ?? []) === JSON.stringify(order),
-            )
-          }
-          req.onerror = () => reject(req.error)
-        })
-      } finally {
-        db.close()
-      }
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          const row = (await request(
+            db.transaction('chats', 'readonly').objectStore('chats').get(chatId),
+          )) as { settings?: { providerPrefs?: { order?: string[] } } } | undefined
+          return JSON.stringify(row?.settings?.providerPrefs?.order ?? []) === JSON.stringify(order)
+        },
+      )
     },
-    { databaseName, order: expected },
+    { order: expected },
   )
 }
 
@@ -1673,14 +1781,14 @@ async function mockOpenRouterDiscovery(
     policyRows?: Array<Record<string, unknown>>
   } = {},
 ): Promise<void> {
-  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify(openRouterModelsPayload(modelId, opts.supportedParameters)),
     })
   })
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -1689,7 +1797,7 @@ async function mockOpenRouterDiscovery(
       ),
     })
   })
-  await page.route('**/_or_scrape/**', async (route) => {
+  await page.context().route('**/_or_scrape/**', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'text/html',
@@ -1792,7 +1900,7 @@ async function mockOpenRouterResponses(page: Page, requests: CapturedRequest[]):
 }
 
 async function mockOpenAiDirect(page: Page, requests: CapturedRequest[]): Promise<void> {
-  await page.route('https://api.openai.com/v1/models**', async (route) => {
+  await page.context().route('https://api.openai.com/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -1822,7 +1930,7 @@ async function mockOpenAiAlternatingToolContext(
   page: Page,
   requests: CapturedRequest[],
 ): Promise<void> {
-  await page.route('https://api.openai.com/v1/models**', async (route) => {
+  await page.context().route('https://api.openai.com/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -1882,9 +1990,9 @@ async function mockOpenAiAlternatingToolContext(
 }
 
 async function mockGoogleModels(page: Page): Promise<void> {
-  await page.route(
-    'https://generativelanguage.googleapis.com/v1beta/openai/models**',
-    async (route) => {
+  await page
+    .context()
+    .route('https://generativelanguage.googleapis.com/v1beta/openai/models*', async (route) => {
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -1892,8 +2000,7 @@ async function mockGoogleModels(page: Page): Promise<void> {
           data: [{ id: GOOGLE_MODEL, object: 'model', created: 0, owned_by: 'google' }],
         }),
       })
-    },
-  )
+    })
 }
 
 async function mockGeminiAlternatingToolContext(
@@ -1999,7 +2106,7 @@ async function mockGeminiNative(page: Page, requests: CapturedRequest[]): Promis
 }
 
 async function mockLlamaModels(page: Page): Promise<void> {
-  await page.route('http://127.0.0.1:8080/props', async (route) => {
+  await page.context().route('http://127.0.0.1:8080/props', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -2009,7 +2116,7 @@ async function mockLlamaModels(page: Page): Promise<void> {
       }),
     })
   })
-  await page.route('http://127.0.0.1:8080/v1/models**', async (route) => {
+  await page.context().route('http://127.0.0.1:8080/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',

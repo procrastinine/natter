@@ -1,12 +1,7 @@
 import type { Route } from '@playwright/test'
 import { createFakeStreamScenario, retargetOnlyProfileToFakeProvider } from './fake-stream-provider'
 import { expect, type Page, test } from './fixtures'
-import {
-  activeWorkspaceDatabaseName,
-  clearIndexedDb,
-  seedFirstRun,
-  seedLinearChat,
-} from './helpers'
+import { clearIndexedDb, seedFirstRun, seedLinearChat } from './helpers'
 
 const CHAT_ID = 'ownership-admission-chat'
 const LIFECYCLE_COUNT = 64
@@ -405,39 +400,32 @@ async function readLeaseState(
   page: Page,
   messageId: string,
 ): Promise<{ phase: string; stopRequested: boolean } | null> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, messageId }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        const rows = await new Promise<unknown[]>((resolve, reject) => {
-          const request = db
-            .transaction('streamLeases', 'readonly')
-            .objectStore('streamLeases')
-            .getAll()
-          request.onsuccess = () => resolve(request.result as unknown[])
-          request.onerror = () => reject(request.error)
-        })
-        const row = rows.find(
-          (candidate) =>
-            typeof candidate === 'object' &&
-            candidate !== null &&
-            (candidate as { messageId?: unknown }).messageId === messageId,
-        ) as { phase?: unknown; stopControl?: unknown } | undefined
-        if (!row) return null
-        return {
-          phase: String(row.phase),
-          stopRequested: row.stopControl !== undefined && row.stopControl !== null,
-        }
-      } finally {
-        db.close()
-      }
-    },
-    { databaseName, messageId },
+    (messageId) =>
+      globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (database, request) => {
+          const transaction = database.transaction(['messages', 'streamLeases'], 'readonly')
+          const message = (await request(transaction.objectStore('messages').get(messageId))) as
+            | { chatId: string }
+            | undefined
+          if (!message) return null
+          const rows = (await request(
+            transaction
+              .objectStore('streamLeases')
+              .index('[chatId+streamId]')
+              .getAll(IDBKeyRange.bound([message.chatId, ''], [message.chatId, '\uffff'])),
+          )) as Array<{ messageId: string; phase: string; stopControl?: unknown }>
+          const row = rows.find((candidate) => candidate.messageId === messageId)
+          return row
+            ? {
+                phase: row.phase,
+                stopRequested: row.stopControl !== undefined && row.stopControl !== null,
+              }
+            : null
+        },
+      ),
+    messageId,
   )
 }
 
@@ -484,52 +472,36 @@ async function readActiveRouteMessage(
   status?: string
   finishedAt?: number
 } | null> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, id }) => {
+    async ({ id }) => {
       const prefix = `#/chat/${id}/message/`
       if (!window.location.hash.startsWith(prefix)) return null
       const messageId = window.location.hash.slice(prefix.length)
       if (!messageId) return null
-      const db = await openNatterDatabase()
-      try {
-        const row = await requestResult(
-          db.transaction('messages', 'readonly').objectStore('messages').get(messageId),
-        )
-        if (!isRecord(row)) return null
-        const generation = isRecord(row.generation) ? row.generation : undefined
-        return {
-          id: String(row.id),
-          role: String(row.role),
-          ...(typeof generation?.status === 'string' ? { status: generation.status } : {}),
-          ...(typeof generation?.finishedAt === 'number'
-            ? { finishedAt: generation.finishedAt }
-            : {}),
-        }
-      } finally {
-        db.close()
-      }
-
-      function openNatterDatabase(): Promise<IDBDatabase> {
-        return new Promise((resolve, reject) => {
-          const request = indexedDB.open(databaseName)
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      }
-
-      function requestResult(request: IDBRequest): Promise<unknown> {
-        return new Promise((resolve, reject) => {
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      }
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, requestResult) => {
+          const row = await requestResult<unknown>(
+            db.transaction('messages', 'readonly').objectStore('messages').get(messageId),
+          )
+          if (!isRecord(row)) return null
+          const generation = isRecord(row.generation) ? row.generation : undefined
+          return {
+            id: String(row.id),
+            role: String(row.role),
+            ...(typeof generation?.status === 'string' ? { status: generation.status } : {}),
+            ...(typeof generation?.finishedAt === 'number'
+              ? { finishedAt: generation.finishedAt }
+              : {}),
+          }
+        },
+      )
 
       function isRecord(value: unknown): value is Record<string, unknown> {
         return typeof value === 'object' && value !== null && !Array.isArray(value)
       }
     },
-    { databaseName, id: chatId },
+    { id: chatId },
   )
 }
 
@@ -556,77 +528,73 @@ async function readDurableOwnershipState(
   page: Page,
   chatId: string,
 ): Promise<DurableOwnershipState> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        const transaction = db.transaction(
-          ['chats', 'messages', 'streamLeases', 'streamChunks'],
-          'readonly',
-        )
-        const result = (request: IDBRequest) =>
-          new Promise<unknown>((resolve, reject) => {
-            request.onsuccess = () => resolve(request.result)
-            request.onerror = () => reject(request.error)
-          })
-        const [chatValue, messagesValue, streamLeasesValue, streamChunksValue] = await Promise.all([
-          result(transaction.objectStore('chats').get(id)),
-          result(transaction.objectStore('messages').index('chatId').getAll(id)),
-          result(transaction.objectStore('streamLeases').getAll()),
-          result(transaction.objectStore('streamChunks').getAll()),
-        ])
-        const isRecord = (value: unknown): value is Record<string, unknown> =>
-          typeof value === 'object' && value !== null && !Array.isArray(value)
-        const chat = isRecord(chatValue) ? chatValue : undefined
-        const messages = Array.isArray(messagesValue) ? messagesValue.filter(isRecord) : []
-        const streamLeases = Array.isArray(streamLeasesValue) ? streamLeasesValue : []
-        const streamChunks = Array.isArray(streamChunksValue) ? streamChunksValue : []
-        return {
-          ...(chat
-            ? {
-                chat: {
-                  ...(typeof chat.lastUpdatedLeafId === 'string'
-                    ? { lastUpdatedLeafId: chat.lastUpdatedLeafId }
-                    : {}),
-                },
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, result) => {
+          const transaction = db.transaction(
+            ['chats', 'messages', 'streamLeases', 'streamChunks'],
+            'readonly',
+          )
+          const [chatValue, messagesValue, streamLeasesValue, streamChunksValue] =
+            await Promise.all([
+              result<unknown>(transaction.objectStore('chats').get(id)),
+              result(transaction.objectStore('messages').index('chatId').getAll(id)),
+              result(
+                transaction
+                  .objectStore('streamLeases')
+                  .index('[chatId+streamId]')
+                  .getAll(IDBKeyRange.bound([id, ''], [id, '\uffff'])),
+              ),
+              result(transaction.objectStore('streamChunks').index('chatId').getAll(id)),
+            ])
+          const isRecord = (value: unknown): value is Record<string, unknown> =>
+            typeof value === 'object' && value !== null && !Array.isArray(value)
+          const chat = isRecord(chatValue) ? chatValue : undefined
+          const messages = Array.isArray(messagesValue) ? messagesValue.filter(isRecord) : []
+          const streamLeases = Array.isArray(streamLeasesValue) ? streamLeasesValue : []
+          const streamChunks = Array.isArray(streamChunksValue) ? streamChunksValue : []
+          return {
+            ...(chat
+              ? {
+                  chat: {
+                    ...(typeof chat.lastUpdatedLeafId === 'string'
+                      ? { lastUpdatedLeafId: chat.lastUpdatedLeafId }
+                      : {}),
+                  },
+                }
+              : {}),
+            messages: messages.map((message) => {
+              const generation = isRecord(message.generation) ? message.generation : undefined
+              return {
+                id: String(message.id),
+                parentId: typeof message.parentId === 'string' ? message.parentId : null,
+                siblingIndex: Number(message.siblingIndex),
+                role: String(message.role),
+                ...(generation
+                  ? {
+                      generation: {
+                        ...(typeof generation.status === 'string'
+                          ? { status: generation.status }
+                          : {}),
+                        ...(typeof generation.finishedAt === 'number'
+                          ? { finishedAt: generation.finishedAt }
+                          : {}),
+                        ...(typeof generation.abortReason === 'string'
+                          ? { abortReason: generation.abortReason }
+                          : {}),
+                      },
+                    }
+                  : {}),
               }
-            : {}),
-          messages: messages.map((message) => {
-            const generation = isRecord(message.generation) ? message.generation : undefined
-            return {
-              id: String(message.id),
-              parentId: typeof message.parentId === 'string' ? message.parentId : null,
-              siblingIndex: Number(message.siblingIndex),
-              role: String(message.role),
-              ...(generation
-                ? {
-                    generation: {
-                      ...(typeof generation.status === 'string'
-                        ? { status: generation.status }
-                        : {}),
-                      ...(typeof generation.finishedAt === 'number'
-                        ? { finishedAt: generation.finishedAt }
-                        : {}),
-                      ...(typeof generation.abortReason === 'string'
-                        ? { abortReason: generation.abortReason }
-                        : {}),
-                    },
-                  }
-                : {}),
-            }
-          }),
-          streamLeases,
-          streamChunks,
-        }
-      } finally {
-        db.close()
-      }
+            }),
+            streamLeases,
+            streamChunks,
+          }
+        },
+      )
     },
-    { databaseName, id: chatId },
+    { id: chatId },
   )
 }

@@ -68,7 +68,7 @@ try {
     ],
     {
       env: {
-        ...process.env,
+        ...nativeChildEnvironment,
         E2E_HEADED_VISIBILITY: '1',
         E2E_NATIVE_CDP_ARTIFACTS_DIR: chromiumArtifactsPath,
         E2E_NATIVE_CDP_ENDPOINT: endpointURL,

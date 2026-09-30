@@ -1,6 +1,5 @@
 import { expect, test } from './fixtures'
 import {
-  activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
@@ -53,16 +52,12 @@ test('a single crashed Message renders a replacement; peers remain interactive',
   // Corrupt one header exactly as an out-of-band storage/debugger edit could. The
   // raw IDB write bypasses the repository changefeed, so reload to exercise the
   // real row boundary without adding a test-only branch to production rendering.
-  const databaseName = await activeWorkspaceDatabaseName(page)
+
   await page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open(databaseName)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'fault-injection' },
+        async (db) => {
           const tx = db.transaction('messages', 'readwrite')
           const index = tx.objectStore('messages').index('chatId')
           const cursorReq = index.openCursor(id)
@@ -89,14 +84,10 @@ test('a single crashed Message renders a replacement; peers remain interactive',
             }
             cursor.continue()
           }
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
+        },
+      )
     },
-    { databaseName, id: chatId },
+    { id: chatId },
   )
   await page.reload()
   // The URL preserves the active chat — no need to manually re-click the row.

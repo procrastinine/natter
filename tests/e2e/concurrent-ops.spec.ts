@@ -1,7 +1,6 @@
 import type { Route } from '@playwright/test'
 import { createChatUiJourneyProfile, expect, type Page, test } from './fixtures'
 import {
-  activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
@@ -88,24 +87,15 @@ test('an indefinitely pending network request does not block a different chat in
     ).toHaveText('tab-a-reply', { timeout: 5000 })
 
     // The shared IndexedDB contains at least two distinct chats.
-    const databaseName = await activeWorkspaceDatabaseName(page)
-    const chatCount = await page.evaluate(async (databaseName) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open(databaseName)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        return await new Promise<number>((resolve, reject) => {
-          const tx = db.transaction('chats', 'readonly')
-          const req = tx.objectStore('chats').count()
-          req.onsuccess = () => resolve(req.result)
-          req.onerror = () => reject(req.error)
-        })
-      } finally {
-        db.close()
-      }
-    }, databaseName)
+
+    const chatCount = await page.evaluate(async () => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          return request(db.transaction('chats', 'readonly').objectStore('chats').count())
+        },
+      )
+    })
     expect(chatCount).toBeGreaterThanOrEqual(2)
     await uiJourney.checkpoint(page, 'parallel-streams-finished')
     await second.close()

@@ -8,6 +8,43 @@ import { discoverProductionDiscriminatedUnions } from './discover-production-dis
 import * as defaultInventory from './durable-command-pipeline-inventory.mjs'
 import { createProductionTypeScriptProgram } from './production-typescript-source.mjs'
 
+const EXECUTABLE_CALLS_BY_NODE = new WeakMap()
+const ALL_CALLS_BY_NODE = new WeakMap()
+const CALL_TARGETS_BY_CHECKER = new WeakMap()
+const HANDLER_ROOTS_BY_CHECKER = new WeakMap()
+const SYNTAX_FACTS_BY_SOURCE = new WeakMap()
+const WHOLE_COLLECTION_READ_METHODS = new Set([
+  'each',
+  'eachKey',
+  'eachPrimaryKey',
+  'getAll',
+  'getAllKeys',
+  'keys',
+  'openCursor',
+  'openKeyCursor',
+  'primaryKeys',
+  'sortBy',
+  'toArray',
+  'toCollection',
+  'uniqueKeys',
+])
+const COLLECTION_NARROWING_METHODS = new Set([
+  'above',
+  'aboveOrEqual',
+  'anyOf',
+  'below',
+  'belowOrEqual',
+  'between',
+  'equals',
+  'filter',
+  'limit',
+  'offset',
+  'startsWith',
+  'startsWithIgnoreCase',
+  'until',
+  'where',
+])
+
 const ROOT = resolve(import.meta.dirname, '..')
 const SRC_ROOT = resolve(ROOT, 'src')
 const WORKSPACE_COMMAND_UNION_ID = 'src/store/workspace-protocol.ts#WorkspaceCommand|kind'
@@ -92,7 +129,18 @@ const EXPECTED_PIPELINE_STAGES = Object.freeze([
 export function buildDurableCommandPipelineSourceFacts(options = {}) {
   const program = options.program ?? createProductionTypeScriptProgram(ROOT)
   const discoveredUnions =
-    options.discovered ?? discoverProductionDiscriminatedUnions(ROOT, { program })
+    options.discovered ??
+    discoverProductionDiscriminatedUnions(ROOT, {
+      program,
+      unionIds: [
+        WORKSPACE_COMMAND_UNION_ID,
+        SCOPE_DERIVED_MUTATION_COMMAND_UNION_ID,
+        ATTEMPT_MUTATION_COMMAND_UNION_ID,
+        CONFIGURATION_COMMAND_UNION_ID,
+        BROWSER_COMMAND_FANOUT_ADMISSION_UNION_ID,
+        BROWSER_WORKSPACE_REPLACEMENT_WORK_UNION_ID,
+      ],
+    })
   const workspaceUnion = exactUnion(discoveredUnions.unions, WORKSPACE_COMMAND_UNION_ID)
   const scopeDerivedMutationUnion = exactUnion(
     discoveredUnions.unions,
@@ -751,68 +799,71 @@ function foregroundStorageLocalityFacts(program, browserRepoSource, outputProble
 }
 
 function productionWholeCollectionReadSites(program) {
-  const readMethods = new Set([
-    'each',
-    'eachKey',
-    'eachPrimaryKey',
-    'getAll',
-    'getAllKeys',
-    'keys',
-    'openCursor',
-    'openKeyCursor',
-    'primaryKeys',
-    'sortBy',
-    'toArray',
-    'toCollection',
-    'uniqueKeys',
-  ])
-  const narrowingMethods = new Set([
-    'above',
-    'aboveOrEqual',
-    'anyOf',
-    'below',
-    'belowOrEqual',
-    'between',
-    'equals',
-    'filter',
-    'limit',
-    'offset',
-    'startsWith',
-    'startsWithIgnoreCase',
-    'until',
-    'where',
-  ])
   const sites = []
   for (const source of program.getSourceFiles()) {
     const path = relative(ROOT, source.fileName).split(sep).join('/')
     if (!path.startsWith('src/store/') && !path.startsWith('src/backcompat/')) continue
-    const visit = (node, owner = '<module>') => {
-      const nextOwner = sourceOwnerName(node, source, owner)
-      if (
-        ts.isCallExpression(node) &&
-        ts.isPropertyAccessExpression(node.expression) &&
-        readMethods.has(node.expression.name.text)
-      ) {
-        const chain = calledMethodChain(node.expression.expression)
-        if (
-          node.expression.name.text === 'keys' &&
-          !chain.some((method) => method === 'orderBy' || method === 'toCollection')
-        ) {
-          ts.forEachChild(node, (child) => visit(child, nextOwner))
-          return
-        }
-        if (
-          node.expression.name.text === 'toCollection' ||
-          !chain.some((method) => narrowingMethods.has(method))
-        ) {
-          sites.push(`${path}#${nextOwner}:${node.expression.name.text}`)
-        }
-      }
-      ts.forEachChild(node, (child) => visit(child, nextOwner))
-    }
-    visit(source)
+    sites.push(...durableCommandSourceSyntaxFacts(source).wholeCollectionReadSites)
   }
   return Object.freeze(sites.sort())
+}
+
+export function durableCommandSourceSyntaxFacts(source) {
+  const cached = SYNTAX_FACTS_BY_SOURCE.get(source)
+  if (cached) return cached
+  const path = relative(ROOT, source.fileName).split(sep).join('/')
+  const semanticOperationDescriptors = []
+  const sealTerminalCalls = []
+  const manualWriteMarkers = new Map()
+  const directGrantTransactions = new Map()
+  const wholeCollectionReadSites = []
+  for (const call of callsInNode(source)) {
+    const expression = call.expression.getText(source)
+    if (expression === 'semanticOperationDescriptor') semanticOperationDescriptors.push(call)
+    const counts =
+      expression === 'commandMeta.markWrite' ||
+      expression === 'commit.markWrite' ||
+      expression === 'markWorkspaceWrite'
+        ? manualWriteMarkers
+        : expression === 'grant.runTransaction'
+          ? directGrantTransactions
+          : undefined
+    if (counts) {
+      const owners = []
+      for (let node = call.parent; node; node = node.parent) {
+        const name = declaredOwnerName(node, source)
+        if (name) owners.push(name)
+      }
+      const id = `${path}#${owners.reverse().join('.') || '<module>'}#${expression}`
+      counts.set(id, (counts.get(id) ?? 0) + 1)
+    }
+    if (!ts.isPropertyAccessExpression(call.expression)) continue
+    const method = call.expression.name.text
+    if (method === 'sealTerminal') sealTerminalCalls.push(path)
+    if (!WHOLE_COLLECTION_READ_METHODS.has(method)) continue
+    const chain = calledMethodChain(call.expression.expression)
+    if (method === 'keys' && !chain.some((name) => name === 'orderBy' || name === 'toCollection')) {
+      continue
+    }
+    if (method !== 'toCollection' && chain.some((name) => COLLECTION_NARROWING_METHODS.has(name)))
+      continue
+    let owner
+    for (let node = call.parent; node && owner === undefined; node = node.parent) {
+      owner = sourceOwnerName(node, source, undefined)
+    }
+    wholeCollectionReadSites.push(`${path}#${owner ?? '<module>'}:${method}`)
+  }
+  const facts = Object.freeze({
+    semanticOperationDescriptors: Object.freeze(semanticOperationDescriptors),
+    sealTerminalCalls: Object.freeze(sealTerminalCalls),
+    manualWriteMarkers: Object.freeze([...manualWriteMarkers].map((entry) => Object.freeze(entry))),
+    directGrantTransactions: Object.freeze(
+      [...directGrantTransactions].map((entry) => Object.freeze(entry)),
+    ),
+    wholeCollectionReadSites: Object.freeze(wholeCollectionReadSites),
+  })
+  SYNTAX_FACTS_BY_SOURCE.set(source, facts)
+  return facts
 }
 
 function sourceOwnerName(node, source, current) {
@@ -1836,22 +1887,16 @@ function observedStage(proof) {
   return Object.freeze({ status: 'observed', proof })
 }
 
-function semanticOperationCapabilityFacts(program, outputProblems) {
+export function semanticOperationCapabilityFacts(program, outputProblems) {
   const facts = new Map()
   for (const source of program.getSourceFiles()) {
     if (!isProductionSource(source)) continue
     const path = relative(ROOT, source.fileName).split(sep).join('/')
-    visit(source, (node) => {
-      if (
-        !ts.isCallExpression(node) ||
-        node.expression.getText(source) !== 'semanticOperationDescriptor'
-      ) {
-        return
-      }
+    for (const node of durableCommandSourceSyntaxFacts(source).semanticOperationDescriptors) {
       const definition = node.arguments[0] ? unwrap(node.arguments[0]) : undefined
       if (!definition || !ts.isObjectLiteralExpression(definition)) {
         outputProblems.push(`${path}: semantic operation descriptor must use an object literal`)
-        return
+        continue
       }
       const owner = containingVariableName(node) ?? '<anonymous>'
       const containingFunction = containingFunctionDeclaration(node)?.name?.text
@@ -1870,14 +1915,14 @@ function semanticOperationCapabilityFacts(program, outputProblems) {
           owner === 'CHAT_DELETE_ARCHIVED_OPERATION' ||
           owner === 'CHAT_EMPTY_ARCHIVE_OPERATION')
       ) {
-        return
+        continue
       }
-      if (path === BROWSER_REPO_PATH && owner === 'CHAT_FORK_OPERATION') return
+      if (path === BROWSER_REPO_PATH && owner === 'CHAT_FORK_OPERATION') continue
       if (
         path === BROWSER_GENERATION_COMMAND_RUNTIME_PATH &&
         owner === 'GENERATION_METADATA_OPERATION'
       ) {
-        return
+        continue
       }
       if (
         path === BROWSER_REPO_PATH &&
@@ -1891,7 +1936,7 @@ function semanticOperationCapabilityFacts(program, outputProblems) {
           'ATTACHMENT_INTEGRITY_OPERATION',
         ].includes(owner)
       ) {
-        return
+        continue
       }
       if (
         path === BROWSER_IMPORT_EXPORT_PATH &&
@@ -1901,7 +1946,7 @@ function semanticOperationCapabilityFacts(program, outputProblems) {
           'IMPORT_CONNECTION_PROFILE_OPERATION',
         ].includes(owner)
       ) {
-        return
+        continue
       }
       if (
         path === CONFIGURATION_HANDLER_PATH &&
@@ -1909,7 +1954,7 @@ function semanticOperationCapabilityFacts(program, outputProblems) {
           containingFunction === 'textTemplateEntityOperationDescriptor' ||
           containingFunction === 'keyMaterialOperationDescriptor')
       ) {
-        return
+        continue
       }
       const operationKind = stringProperty(definition, 'operationKind')
       if (!operationKind) {
@@ -1969,14 +2014,14 @@ function semanticOperationCapabilityFacts(program, outputProblems) {
         ) {
           outputProblems.push(`${path}: semantic operation descriptor needs literal operationKind`)
         }
-        return
+        continue
       }
       const commandKind = operationKind.startsWith('configuration:')
         ? operationKind.slice('configuration:'.length)
         : operationKind
       if (facts.has(commandKind)) {
         outputProblems.push(`semantic operation descriptor duplicated ${commandKind}`)
-        return
+        continue
       }
       const transaction = objectPropertyInitializer(definition, 'transaction')
       const resources = objectPropertyInitializer(definition, 'resources')
@@ -2033,7 +2078,7 @@ function semanticOperationCapabilityFacts(program, outputProblems) {
             : { exactEffectsProved: false }),
         }),
       )
-    })
+    }
   }
   return facts
 }
@@ -2536,19 +2581,7 @@ function streamLeaseOperationCapabilityFacts(
   const directSealTerminalCalls = program
     .getSourceFiles()
     .filter(isProductionSource)
-    .flatMap((source) => {
-      const matches = []
-      visit(source, (node) => {
-        if (
-          ts.isCallExpression(node) &&
-          ts.isPropertyAccessExpression(node.expression) &&
-          node.expression.name.text === 'sealTerminal'
-        ) {
-          matches.push(relative(ROOT, source.fileName).split(sep).join('/'))
-        }
-      })
-      return matches
-    })
+    .flatMap((source) => durableCommandSourceSyntaxFacts(source).sealTerminalCalls)
   const boundsText = findVariableInitializer(
     browserRepoSource,
     'STREAM_LEASE_OPERATION_BOUNDS',
@@ -11235,7 +11268,9 @@ function reachableCallsResolvingTo(checker, roots, target) {
   return matches
 }
 
-function executableCalls(root) {
+export function executableCalls(root) {
+  const cached = EXECUTABLE_CALLS_BY_NODE.get(root)
+  if (cached) return cached
   const calls = []
   const scan = (node) => {
     if (node !== root && ts.isFunctionLike(node)) return
@@ -11243,6 +11278,7 @@ function executableCalls(root) {
     node.forEachChild(scan)
   }
   scan(root)
+  EXECUTABLE_CALLS_BY_NODE.set(root, Object.freeze(calls))
   return calls
 }
 
@@ -11295,7 +11331,24 @@ function declarationIdentity(node) {
   return `${path}#${name ?? '<anonymous>'}`
 }
 
-function callResolvesTo(checker, call, declaration) {
+export function callResolvesTo(checker, call, declaration) {
+  let calls = CALL_TARGETS_BY_CHECKER.get(checker)
+  if (!calls) {
+    calls = new WeakMap()
+    CALL_TARGETS_BY_CHECKER.set(checker, calls)
+  }
+  let targets = calls.get(call)
+  if (!targets) {
+    targets = new WeakMap()
+    calls.set(call, targets)
+  }
+  if (targets.has(declaration)) return targets.get(declaration)
+  const result = uncachedCallResolvesTo(checker, call, declaration)
+  targets.set(declaration, result)
+  return result
+}
+
+function uncachedCallResolvesTo(checker, call, declaration) {
   const resolved = checker.getResolvedSignature(call)?.declaration
   if (sameDeclaration(resolved, declaration)) return true
   const resolvedName = resolved && 'name' in resolved ? resolved.name : undefined
@@ -11359,11 +11412,14 @@ function containingFunctionDeclaration(node) {
   return undefined
 }
 
-function callsInNode(node) {
+export function callsInNode(node) {
+  const cached = ALL_CALLS_BY_NODE.get(node)
+  if (cached) return cached
   const calls = []
   visit(node, (current) => {
     if (ts.isCallExpression(current)) calls.push(current)
   })
+  ALL_CALLS_BY_NODE.set(node, Object.freeze(calls))
   return calls
 }
 
@@ -11492,6 +11548,8 @@ function exactUnion(unions, id) {
 }
 
 function exactSource(currentProgram, path) {
+  const direct = currentProgram.getSourceFile(resolve(ROOT, path))
+  if (direct) return direct
   const source = currentProgram
     .getSourceFiles()
     .find((candidate) => relative(ROOT, candidate.fileName).split(sep).join('/') === path)
@@ -11654,7 +11712,14 @@ function configurationHandlerTargets(source) {
   return handlers
 }
 
-function configurationHandlerRoots(checker, source) {
+export function configurationHandlerRoots(checker, source) {
+  let sources = HANDLER_ROOTS_BY_CHECKER.get(checker)
+  if (!sources) {
+    sources = new WeakMap()
+    HANDLER_ROOTS_BY_CHECKER.set(checker, sources)
+  }
+  const cached = sources.get(source)
+  if (cached) return cached
   const object = variableObjectLiteral(source, 'configurationDomainHandlers')
   const handlers = new Map()
   for (const property of object.properties) {
@@ -11672,6 +11737,7 @@ function configurationHandlerRoots(checker, source) {
     const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0]
     if (declaration && ts.isFunctionLike(declaration)) handlers.set(variant, declaration)
   }
+  sources.set(source, handlers)
   return handlers
 }
 
@@ -11679,24 +11745,9 @@ function manualWriteMarkerOwnerCounts(currentProgram) {
   const counts = new Map()
   for (const source of currentProgram.getSourceFiles()) {
     if (!isProductionSource(source)) continue
-    const path = relative(ROOT, source.fileName).split(sep).join('/')
-    const scan = (node, ownerNames) => {
-      const name = declaredOwnerName(node, source)
-      const nextOwners = name ? [...ownerNames, name] : ownerNames
-      if (ts.isCallExpression(node)) {
-        const marker = node.expression.getText(source)
-        if (
-          marker === 'commandMeta.markWrite' ||
-          marker === 'commit.markWrite' ||
-          marker === 'markWorkspaceWrite'
-        ) {
-          const id = `${path}#${nextOwners.join('.') || '<module>'}#${marker}`
-          counts.set(id, (counts.get(id) ?? 0) + 1)
-        }
-      }
-      node.forEachChild((child) => scan(child, nextOwners))
+    for (const [id, count] of durableCommandSourceSyntaxFacts(source).manualWriteMarkers) {
+      counts.set(id, (counts.get(id) ?? 0) + count)
     }
-    scan(source, [])
   }
   return counts
 }
@@ -11705,16 +11756,9 @@ function directGrantTransactionOwnerCounts(currentProgram) {
   const counts = new Map()
   for (const path of COMMAND_TRANSACTION_BOUNDARY_PATHS) {
     const source = exactSource(currentProgram, path)
-    const scan = (node, ownerNames) => {
-      const name = declaredOwnerName(node, source)
-      const nextOwners = name ? [...ownerNames, name] : ownerNames
-      if (ts.isCallExpression(node) && node.expression.getText(source) === 'grant.runTransaction') {
-        const id = `${path}#${nextOwners.join('.') || '<module>'}#grant.runTransaction`
-        counts.set(id, (counts.get(id) ?? 0) + 1)
-      }
-      node.forEachChild((child) => scan(child, nextOwners))
+    for (const [id, count] of durableCommandSourceSyntaxFacts(source).directGrantTransactions) {
+      counts.set(id, (counts.get(id) ?? 0) + count)
     }
-    scan(source, [])
   }
   return counts
 }

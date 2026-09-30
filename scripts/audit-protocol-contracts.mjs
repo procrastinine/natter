@@ -112,25 +112,44 @@ export function evaluateProtocolContractBundle(bundle, options = {}) {
 }
 
 export function buildProtocolContractMutationProof(baselineBundle) {
+  const replaceSite = (source, before, after) => {
+    const occurrences = source.split(before).length - 1
+    if (occurrences !== 1) {
+      throw new Error(`ProtocolAuditMutationSiteCardinality:${occurrences}:${before}`)
+    }
+    return source.replace(before, after)
+  }
   const changedProgram = programWithSourceMutations({
     'src/store/workspace-protocol.ts': (source) =>
-      source.replace(
+      replaceSite(
+        source,
         '  | OrganizationCommand\n\nexport type WorkspaceCommandResult',
         "  | OrganizationCommand\n  | { kind: 'audit.injected-workspace-command' }\n\nexport type WorkspaceCommandResult",
       ),
     'src/store/configuration-domain-contract.ts': (source) =>
-      source.replace(
+      replaceSite(
+        source,
         '  | ConfigurationPromptDeleteCommand\n\nexport type ConfigurationDomainCommandKind',
         "  | ConfigurationPromptDeleteCommand\n  | { readonly kind: 'audit.injected-configuration-command' }\n\nexport type ConfigurationDomainCommandKind",
       ),
-    'src/store/workspace-runtime-control.ts': (source) =>
-      source.replace("    'maintenance',\n    true,", "    'maintenance',\n    false,").concat(`
+    'src/store/workspace-runtime-control.ts': (source) => {
+      const wrongIdleOverload = replaceSite(
+        source,
+        "  kind: 'maintenance',\n  requireIdle: true,",
+        "  kind: 'maintenance',\n  requireIdle: false,",
+      )
+      return replaceSite(
+        wrongIdleOverload,
+        "    'maintenance',\n    true,",
+        "    'maintenance',\n    false,",
+      ).concat(`
 export const forgedRootAdmission = (() => undefined) as WorkspaceRootAdmissionCapability<
   () => void,
   { readonly fixedKind: 'chat-fork' }
 >
 forgedRootAdmission()
-`),
+`)
+    },
   })
   const changedBundle = buildProductionProtocolFactBundle({ program: changedProgram })
   const changedReport = evaluateProtocolContractBundle(changedBundle)

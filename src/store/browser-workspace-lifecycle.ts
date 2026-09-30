@@ -26,6 +26,10 @@ import {
   cancelBrowserWorkspaceBootstrap,
   finishBrowserWorkspaceBootstrap,
 } from './browser-workspace-bootstrap-authority'
+import type {
+  BrowserWorkspaceReplacementReopenOutcome,
+  BrowserWorkspaceReplacementRuntimeRequest,
+} from './browser-workspace-contract'
 import { recoverQuiescedBrowserWorkspaceReplacement } from './browser-workspace-database-cleanup'
 import {
   closeBrowserWorkspaceControlDatabase,
@@ -43,11 +47,13 @@ import type { BrowserWorkspaceReplacementHandoff } from './browser-workspace-mai
 import type {
   BrowserWorkspaceOpenOptions,
   BrowserWorkspaceOpenProgress,
+  BrowserWorkspaceOpenTarget,
 } from './browser-workspace-open-contract'
-import { installBrowserWorkspaceReplacementReopen } from './browser-workspace-replacement-runner'
+import { installBrowserWorkspaceReplacementSettlement } from './browser-workspace-replacement-runner'
 import {
   awaitBrowserWorkspaceSlotCoordinatorIdle,
   type BrowserWorkspaceSlotCoordinatorOwner,
+  type BrowserWorkspaceSlotRoundObservation,
   type BrowserWorkspaceSlotTransition,
   disposeBrowserWorkspaceSlotCoordinator,
   installBrowserWorkspaceSlotCoordinator,
@@ -160,15 +166,17 @@ import type { WorkspaceChange } from './workspace-protocol'
 import { publishLocalWorkspaceInvalidation } from './workspace-repository'
 import {
   claimWorkspaceRuntimeDemandBoundary,
-  isWorkspaceMaintenancePreemptedError,
   isWorkspaceRuntimeClosedError,
   isWorkspaceRuntimeReplacementTransitionOwned,
+  preemptWorkspaceMaintenanceForForegroundDemand,
   preemptWorkspaceReplacementContendersForRemoteTransition,
   releaseWorkspaceRuntimeDemandBoundary,
   subscribeWorkspaceRuntime,
   subscribeWorkspaceRuntimeIdle,
   subscribeWorkspaceRuntimeState,
+  type WorkspaceReplacementContinuation,
   type WorkspaceRuntimeDemandBoundaryOwner,
+  workspaceForegroundDemandInterruptionSignal,
 } from './workspace-runtime'
 import {
   abortWorkspaceRuntimeReconciliation,
@@ -435,7 +443,7 @@ const BROWSER_WORKSPACE_RECONCILIATION_MANIFEST = {
 } satisfies WorkspaceRuntimeReconciliationManifest
 
 export function installBrowserWorkspaceLifecycle(): void {
-  installBrowserWorkspaceReplacementReopen(openBrowserWorkspace)
+  installBrowserWorkspaceReplacementSettlement(settleBrowserWorkspaceForReplacement)
   const installation = browserWorkspaceLifecycleInstallation
   if (installation.kind === 'installed') return
   if (installation.kind === 'installing') {
@@ -470,6 +478,8 @@ export function installBrowserWorkspaceLifecycle(): void {
       receiveFatalWorkspaceEffectFailure,
     )
     slotCoordinator = installBrowserWorkspaceSlotCoordinator({
+      foregroundDemandSignal: workspaceForegroundDemandInterruptionSignal,
+      preemptMaintenance: preemptWorkspaceMaintenanceForForegroundDemand,
       validateQuiesce: validateBrowserWorkspaceSlotQuiesce,
       reconcile: reconcileBrowserWorkspaceSlotTransition,
     })
@@ -556,9 +566,21 @@ async function validateBrowserWorkspaceSlotQuiesce(
 async function reconcileBrowserWorkspaceSlotTransition(
   transition: BrowserWorkspaceSlotTransition,
   signal: AbortSignal,
+  round: BrowserWorkspaceSlotRoundObservation,
 ): Promise<void> {
+  if (round.signal.aborted) {
+    await round.finished
+    return
+  }
   preemptWorkspaceReplacementContendersForRemoteTransition()
-  await shutdownBrowserWorkspaceWhenIdle({ signal })
+  try {
+    await shutdownBrowserWorkspaceWhenIdle({ signal: round.signal })
+  } catch (error) {
+    if (signal.aborted || error !== round.signal.reason) throw error
+    await round.finished
+    return
+  }
+  await round.finished
   await recoverQuiescedBrowserWorkspaceReplacement(transition, signal)
   await raceWithAbortSignal(() => resumeBrowserWorkspace(), signal)
 }
@@ -618,6 +640,7 @@ interface WorkspaceShutdownTransition {
 }
 
 interface BrowserWorkspaceOpenAttempt {
+  readonly target: BrowserWorkspaceOpenTarget
   readonly id: number
   readonly authority: BrowserWorkspaceBootstrapAuthority
   readonly observers: Set<BrowserWorkspaceOpenOptions>
@@ -637,14 +660,27 @@ let nextOpenAttemptId = 0
 let terminalLifecycleFinalization: Promise<void> | null = null
 
 export function openBrowserWorkspace(options: BrowserWorkspaceOpenOptions = {}): Promise<void> {
+  return openBrowserWorkspaceAtTarget({ kind: 'active' }, options)
+}
+
+function openBrowserWorkspaceAtTarget(
+  target: BrowserWorkspaceOpenTarget,
+  options: BrowserWorkspaceOpenOptions,
+): Promise<void> {
   const snapshot = getWorkspaceRuntimeControlSnapshot()
-  if (snapshot.state === 'SEALED') {
+  if (snapshot.state === 'SEALED' || shutdownTransition?.terminal) {
     return Promise.reject(new Error('BrowserWorkspaceTerminalShutdown'))
   }
   installBrowserWorkspaceLifecycle()
   if (snapshot.state === 'RUNNING') return Promise.resolve()
   const existing = currentOpenAttempt
   if (existing) {
+    if (
+      target.kind === 'retained-source' &&
+      (existing.target.kind !== 'retained-source' ||
+        existing.target.journal.nonce !== target.journal.nonce)
+    )
+      return Promise.reject(new Error('BrowserWorkspaceRetainedOpenOwnerMismatch'))
     if (existing.desired === 'sealed') {
       return Promise.reject(new Error('BrowserWorkspaceTerminalShutdown'))
     }
@@ -654,10 +690,11 @@ export function openBrowserWorkspace(options: BrowserWorkspaceOpenOptions = {}):
       return existing.promise
     }
     return awaitExpectedBrowserWorkspaceOpenCancellation(existing).then(() =>
-      openBrowserWorkspace(options),
+      openBrowserWorkspaceAtTarget(target, options),
     )
   }
   const attempt: BrowserWorkspaceOpenAttempt = {
+    target,
     id: ++nextOpenAttemptId,
     authority: beginBrowserWorkspaceBootstrap(),
     observers: new Set(),
@@ -679,6 +716,77 @@ export function openBrowserWorkspace(options: BrowserWorkspaceOpenOptions = {}):
   attempt.promise = opening
   currentOpenAttempt = attempt
   return opening
+}
+
+async function settleBrowserWorkspaceForReplacement(
+  request: BrowserWorkspaceReplacementRuntimeRequest,
+  continuation: WorkspaceReplacementContinuation,
+): Promise<BrowserWorkspaceReplacementReopenOutcome> {
+  const shutdownReason = () => {
+    const reason = continuation.cancellationReason
+    return reason?.reason === 'shutdown' ? reason : null
+  }
+  if (request.kind === 'observe-cancellation' || shutdownReason()) {
+    return observeCancelledBrowserWorkspaceReplacement(continuation)
+  }
+  const opening = openBrowserWorkspaceAtTarget(request.target, {})
+  const attempt = currentOpenAttempt
+  try {
+    await opening
+  } catch (error) {
+    if (
+      shutdownReason() !== null &&
+      attempt?.cancelled &&
+      error === attempt.cancellationReason &&
+      browserWorkspaceClosureVerified()
+    ) {
+      return { kind: 'cancelled-closed', reason: shutdownReason() ?? error }
+    }
+    throw error
+  }
+  const snapshot = getWorkspaceRuntimeControlSnapshot()
+  if (snapshot.state === 'RUNNING' && snapshot.workspaceId !== null) {
+    return {
+      kind: 'ready',
+      workspace: { workspaceId: snapshot.workspaceId, replacementEpoch: snapshot.replacementEpoch },
+    }
+  }
+  if (shutdownReason()) return observeCancelledBrowserWorkspaceReplacement(continuation)
+  throw new Error(`BrowserWorkspaceReplacementReopenIncomplete:${snapshot.state}`)
+}
+
+async function observeCancelledBrowserWorkspaceReplacement(
+  continuation: WorkspaceReplacementContinuation,
+): Promise<BrowserWorkspaceReplacementReopenOutcome> {
+  const opening = currentOpenAttempt
+  if (opening) await awaitExpectedBrowserWorkspaceOpenCancellation(opening)
+  if (getWorkspaceRuntimeControlSnapshot().state === 'QUIESCING') {
+    await awaitWorkspaceRuntimeQuiesced()
+  }
+  const snapshot = getWorkspaceRuntimeControlSnapshot()
+  if (snapshot.state === 'RUNNING' && snapshot.workspaceId !== null) {
+    return {
+      kind: 'ready',
+      workspace: { workspaceId: snapshot.workspaceId, replacementEpoch: snapshot.replacementEpoch },
+    }
+  }
+  if (!browserWorkspaceClosureVerified()) {
+    throw new Error('BrowserWorkspaceReplacementCancellationClosureUnproven', {
+      cause: continuation.signal.reason,
+    })
+  }
+  return { kind: 'cancelled-closed', reason: continuation.signal.reason }
+}
+
+function browserWorkspaceClosureVerified(): boolean {
+  const snapshot = getWorkspaceRuntimeControlSnapshot()
+  return (
+    snapshot.resourcesQuiesced &&
+    (snapshot.state === 'STARTING' ||
+      snapshot.state === 'QUIESCED' ||
+      snapshot.state === 'FAILED_CLOSED' ||
+      snapshot.state === 'SEALED')
+  )
 }
 
 function observeBrowserWorkspaceOpenAttempt(
@@ -711,6 +819,7 @@ export function shutdownBrowserWorkspace(options: { terminal?: boolean } = {}): 
     return finalizeTerminalBrowserWorkspaceLifecycle()
   }
   installBrowserWorkspaceLifecycle()
+  beginWorkspaceRuntimeQuiesce()
   const opening = currentOpenAttempt
   if (opening) {
     if (options.terminal) opening.desired = 'sealed'
@@ -731,7 +840,6 @@ export function shutdownBrowserWorkspace(options: { terminal?: boolean } = {}): 
     const transition = shutdownTransition
     return transition.promise.then(() => finishTerminalBrowserWorkspaceShutdown(transition))
   }
-  beginWorkspaceRuntimeQuiesce()
   return startBrowserWorkspaceShutdown(options.terminal ?? false)
 }
 
@@ -741,13 +849,12 @@ async function awaitExpectedBrowserWorkspaceOpenCancellation(
   try {
     await attempt.promise
   } catch (error) {
-    const snapshot = getWorkspaceRuntimeControlSnapshot()
-    const verifiedClosed =
-      snapshot.resourcesQuiesced &&
-      (snapshot.state === 'STARTING' ||
-        snapshot.state === 'QUIESCED' ||
-        snapshot.state === 'FAILED_CLOSED')
-    if (attempt.cancelled && error === attempt.cancellationReason && verifiedClosed) return
+    if (
+      attempt.cancelled &&
+      error === attempt.cancellationReason &&
+      browserWorkspaceClosureVerified()
+    )
+      return
     throw error
   }
 }
@@ -828,9 +935,9 @@ export function shutdownBrowserWorkspaceWhenIdle(
   options: { readonly signal?: AbortSignal } = {},
 ): Promise<void> {
   const { signal } = options
-  if (signal?.aborted) return Promise.reject(workspaceLifecycleError(signal.reason))
+  if (signal?.aborted) return Promise.reject(signal.reason)
   const immediate = tryShutdownBrowserWorkspaceIfIdle()
-  if (immediate) return raceWithAbortSignal(() => immediate, signal)
+  if (immediate) return immediate
   return new Promise<void>((resolve, reject) => {
     let settled = false
     let transitionSelected = false
@@ -849,7 +956,9 @@ export function shutdownBrowserWorkspaceWhenIdle(
       cleanup()
       publish()
     }
-    const abort = () => settle(() => reject(workspaceLifecycleError(signal?.reason)))
+    const abort = () => {
+      if (!transitionSelected) settle(() => reject(signal?.reason))
+    }
     const settleFrom = (transition: Promise<void>) => {
       if (settled || transitionSelected) return
       transitionSelected = true
@@ -858,11 +967,11 @@ export function shutdownBrowserWorkspaceWhenIdle(
       unsubscribeState()
       void transition.then(
         () => settle(resolve),
-        (error: unknown) => settle(() => reject(workspaceLifecycleError(error))),
+        (error: unknown) => settle(() => reject(error)),
       )
     }
     const fail = (error: unknown) => {
-      settle(() => reject(workspaceLifecycleError(error)))
+      settle(() => reject(error))
     }
     const attempt = () => {
       if (settled) return
@@ -896,12 +1005,6 @@ export function shutdownBrowserWorkspaceWhenIdle(
     signal?.addEventListener('abort', abort, { once: true })
     attempt()
   })
-}
-
-function workspaceLifecycleError(error: unknown): Error {
-  return error instanceof Error
-    ? error
-    : new Error('BrowserWorkspaceLifecycleOperationFailed', { cause: error })
 }
 
 function finishTerminalBrowserWorkspaceShutdown(
@@ -1013,10 +1116,7 @@ export function createBrowserWorkspacePromotedReplacementDrain(): BrowserWorkspa
   const finishFailure = (error: unknown): void => {
     try {
       if (isWorkspaceReplacementRecoveryRequiredError(error)) scheduleFatalWorkspaceReload()
-      else if (
-        !isWorkspaceMaintenancePreemptedError(error) &&
-        !(error instanceof DOMException && error.name === 'AbortError')
-      ) {
+      else {
         console.error('Promoted workspace replacement failed', error)
       }
     } finally {
@@ -1035,7 +1135,24 @@ export function createBrowserWorkspacePromotedReplacementDrain(): BrowserWorkspa
       activeCount += 1
       void handoff.completion
         .then(
-          () => finish(),
+          (outcome) => {
+            switch (outcome.kind) {
+              case 'committed-ready':
+              case 'committed-closed':
+              case 'cancelled':
+                finish()
+                return
+              case 'uncommitted-ready':
+              case 'uncommitted-closed':
+                finishFailure(outcome.error)
+                return
+              case 'committed-recovery-required':
+              case 'uncommitted-recovery-required':
+              case 'outcome-unknown':
+                scheduleFatalWorkspaceReload()
+                finish()
+            }
+          },
           (error: unknown) => finishFailure(error),
         )
         .catch(scheduleFatalWorkspaceReload)
@@ -1117,17 +1234,16 @@ async function performBrowserWorkspaceOpen(
   attempt: BrowserWorkspaceOpenAttempt,
   options: BrowserWorkspaceOpenOptions,
 ): Promise<void> {
-  let opened = false
   const cleanupFailures: unknown[] = []
   try {
     let snapshot = getWorkspaceRuntimeControlSnapshot()
     if (snapshot.state === 'RUNNING') {
-      opened = true
       return
     }
     if (snapshot.state === 'SEALED') throw new Error('BrowserWorkspaceTerminalShutdown')
     if (snapshot.state === 'QUIESCING') {
-      await (shutdownTransition?.promise ?? awaitWorkspaceRuntimeQuiesced())
+      await awaitWorkspaceRuntimeQuiesced()
+      assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
       snapshot = getWorkspaceRuntimeControlSnapshot()
     }
     if (snapshot.state === 'SEALED') throw new Error('BrowserWorkspaceTerminalShutdown')
@@ -1145,6 +1261,7 @@ async function performBrowserWorkspaceOpen(
         attempt.authority,
         options.onProgress,
         options.onBlocked,
+        attempt.target,
       ),
     )
     assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
@@ -1152,6 +1269,12 @@ async function performBrowserWorkspaceOpen(
       bootstrapBrowserWorkspace(attempt.authority, options),
     )
     assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
+    if (
+      attempt.target.kind === 'retained-source' &&
+      (workspace.workspaceId !== attempt.target.workspace.workspaceId ||
+        workspace.replacementEpoch !== attempt.target.workspace.replacementEpoch)
+    )
+      throw new Error('BrowserWorkspaceRetainedSourceFenceMismatch')
     options.onProgress?.({ kind: 'runtime-resources', operation: 'reconcile' })
     const authority = beginWorkspaceRuntimeReconciliation(workspace, {
       signal: attempt.authority.signal,
@@ -1180,7 +1303,6 @@ async function performBrowserWorkspaceOpen(
         dependencies: [{ kind: 'storage-maintenance', tasks: ['clean-replacement-database'] }],
       })
     }
-    opened = true
   } catch (error) {
     if (getWorkspaceRuntimeControlSnapshot().state === 'RECONCILING') {
       cleanupFailures.push(...(await abortWorkspaceRuntimeReconciliation()))
@@ -1204,10 +1326,17 @@ async function performBrowserWorkspaceOpen(
       }
     }
     if (getWorkspaceRuntimeControlSnapshot().state === 'SEALED') {
-      await finalizeTerminalBrowserWorkspaceLifecycle().catch((cleanupError) => {
-        cleanupFailures.push(cleanupError)
-      })
-      scheduleFatalWorkspaceReload()
+      void finalizeTerminalBrowserWorkspaceLifecycle().catch(scheduleFatalWorkspaceReload)
+      if (
+        !(
+          attempt.cancelled &&
+          error === attempt.cancellationReason &&
+          cleanupFailures.length === 0 &&
+          browserWorkspaceClosureVerified()
+        )
+      ) {
+        scheduleFatalWorkspaceReload()
+      }
     }
     if (cleanupFailures.length === 0) throw error
     throw new AggregateError(
@@ -1217,12 +1346,6 @@ async function performBrowserWorkspaceOpen(
     )
   } finally {
     finishBrowserWorkspaceBootstrap(attempt.authority)
-    if (!opened && attempt.desired === 'sealed') {
-      const stable = getWorkspaceRuntimeControlSnapshot().state
-      if (stable === 'STARTING' || stable === 'QUIESCED' || stable === 'FAILED_CLOSED') {
-        await finishTerminalBrowserWorkspaceShutdownBeforeOpen()
-      }
-    }
   }
 }
 

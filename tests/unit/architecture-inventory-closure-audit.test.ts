@@ -33,7 +33,7 @@ describe('architecture inventory closure meta-audit', () => {
       integratedClassifiedStageCount: VERIFICATION_STAGES.length,
       requiredIntegrationCount: 2,
       missingIntegrationCount: missingRequiredIntegrations.length,
-      mechanismCount: 25,
+      mechanismCount: 26,
       dimensionCount: 17,
       openDimensionCount: 17,
       openGapCount: 17 + missingRequiredIntegrations.length,
@@ -49,6 +49,7 @@ describe('architecture inventory closure meta-audit', () => {
         'production-work-memory',
         'scroll-continuity',
         'tab-cross-tab-locality',
+        'test-runtime-isolation',
       ]),
     )
     expect(result.report.integrationGaps.map((gap) => gap.id)).toEqual(missingRequiredIntegrations)

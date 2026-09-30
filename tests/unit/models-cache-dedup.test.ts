@@ -17,6 +17,10 @@ import {
 import { getCachedEndpoints, getCachedModels } from '../../src/store/models-cache'
 import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
 import { ownBrowserWorkspaceSuite } from '../helpers/browser-workspace-suite'
+import {
+  clearEndpointsCacheForProfile,
+  clearModelsCacheForProfile,
+} from '../helpers/discovery-cache'
 
 vi.mock('../../src/api/models', async () => {
   const actual = await vi.importActual<typeof ModelsModule>('../../src/api/models')
@@ -109,6 +113,44 @@ describe('unified model discovery single-flight', () => {
 
     expect(fetchModelsMock).toHaveBeenCalledTimes(2)
   })
+
+  it('force refresh does not treat a missing models row as a completed refresh', async () => {
+    const selected = await seedProfile()
+    fetchModelsMock.mockResolvedValue(modelsPayload('model-a'))
+    await configurationDiscoveryApplication.refreshModels(selected, query)
+    const baseline = await getCachedModels(selected.id, query)
+    expect(baseline).toBeDefined()
+    await clearModelsCacheForProfile(selected.id)
+
+    await configurationDiscoveryApplication.refreshModels(selected, query, {
+      force: true,
+      forceBaselineFetchedAt: baseline?.fetchedAt ?? null,
+    })
+
+    expect(fetchModelsMock).toHaveBeenCalledTimes(2)
+    expect(await getCachedModels(selected.id, query)).toBeDefined()
+  })
+
+  it.each(['missing', 'refreshed'] as const)(
+    'force refresh distinguishes a %s endpoints row from its captured baseline',
+    async (state) => {
+      const selected = await seedProfile()
+      const model = 'openai/gpt-5.4'
+      fetchEndpointsMock.mockResolvedValue(endpointsPayload(model))
+      const baseline = await resolveEndpointsDiscovery(selected, model)
+      if (state === 'missing') await clearEndpointsCacheForProfile(selected.id)
+      else await resolveEndpointsDiscovery(selected, model, { force: true })
+
+      const resolved = await resolveEndpointsDiscovery(selected, model, {
+        force: true,
+        forceBaselineFetchedAt: baseline.fetchedAt,
+      })
+
+      expect(fetchEndpointsMock).toHaveBeenCalledTimes(2)
+      expect(resolved).toBeDefined()
+      expect(await getCachedEndpoints(selected.id, model)).toEqual(resolved)
+    },
+  )
 
   it('keeps distinct profiles and query keys independent', async () => {
     const firstProfile = await seedProfile()

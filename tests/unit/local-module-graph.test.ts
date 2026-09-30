@@ -19,6 +19,117 @@ afterEach(() => {
 })
 
 describe('local module graph', () => {
+  it('follows CSS imports and decoded local asset URLs through the same source graph', () => {
+    const root = fixtureRoot({
+      'src/main.ts': "import './theme.css'",
+      'src/theme.css': [
+        '@import "tailwindcss";',
+        '@import url("tailwindcss");',
+        '@import "styles/palette.css" layer(theme);',
+        '@import url(./styles/fonts.css?inline) screen;',
+        '/* @import "./missing.css"; */',
+        '.a { content: "url(./not-a-reference.png)"; background: url(https://example.test/a.png) }',
+        '.b { background: url(//example.test/b.png); filter: url(#local); }',
+        '.c { background: url(data:image/png;base64,eA==); }',
+      ].join('\n'),
+      'src/styles/palette.css': '@import "../theme.css"; :root { --image: url(../image.svg#id); }',
+      'src/styles/fonts.css': '@font-face { src: url("../fonts/a\\2e woff2?v=1#font"); }',
+      'src/fonts/a.woff2': 'font',
+      'src/image.svg': '<svg/>',
+      'tests/unit/unrelated.test.ts': 'export const unrelated = 1',
+    })
+    const graph = buildLocalModuleGraph({ root })
+    expect(graph.diagnostics).toEqual([])
+    expect(graph.dependencies.get('src/theme.css')).toEqual([
+      'src/styles/fonts.css',
+      'src/styles/palette.css',
+    ])
+    expect(graph.dependencies.get('src/styles/fonts.css')).toEqual(['src/fonts/a.woff2'])
+    expect(graph.dependencies.get('src/styles/palette.css')).toEqual([
+      'src/image.svg',
+      'src/theme.css',
+    ])
+    expect(reverseReachableLocalModules(graph, ['src/fonts/a.woff2'])).toEqual([
+      'src/fonts/a.woff2',
+      'src/main.ts',
+      'src/styles/fonts.css',
+      'src/styles/palette.css',
+      'src/theme.css',
+    ])
+  })
+
+  it('reports malformed and unresolved CSS using only the injected immutable source', () => {
+    const root = fixtureRoot({ 'src/worktree.css': ':root {}' })
+    const bytes = Buffer.from(
+      [
+        '@import "./worktree.css";',
+        '@import "../../outside.css";',
+        '.a { background: url(../missing.png); }',
+        '.b { color: ); }',
+      ].join('\n'),
+    )
+    const graph = buildLocalModuleGraph({
+      root,
+      source: {
+        kind: 'git-tree',
+        allPaths: new Set(['src/theme.css']),
+        readFileBytes: () => bytes,
+        isExecutable: () => false,
+      },
+    })
+    expect(graph.dependencies.get('src/theme.css')).toEqual([])
+    expect(graph.diagnostics.map(({ code, line }) => ({ code, line }))).toEqual([
+      { code: 'unresolved-local-module', line: 1 },
+      { code: 'module-reference-outside-root', line: 2 },
+      { code: 'unresolved-local-module', line: 3 },
+      { code: 'parse-error', line: 4 },
+    ])
+  })
+
+  it('derives literal Node file-URL imports from immutable module bindings', () => {
+    const root = fixtureRoot({
+      'scripts/audit.mjs': 'export const audit = true\n',
+      'scripts/inventory.mjs': 'export const inventory = true\n',
+      'tests/unit/audit.test.ts': [
+        "import { resolve as resolvePath } from 'node:path'",
+        "import { pathToFileURL as fileUrl } from 'node:url'",
+        "const ROOT = resolvePath(__dirname, '../..')",
+        "const AUDIT_URL = fileUrl(resolvePath(ROOT, 'scripts/audit.mjs')).href",
+        'void import(AUDIT_URL)',
+        "void import(fileUrl(resolvePath(ROOT, 'scripts/inventory.mjs')).href)",
+      ].join('\n'),
+    })
+    const graph = buildLocalModuleGraph({ root })
+    expect(graph.diagnostics).toEqual([])
+    expect(graph.dependencies.get('tests/unit/audit.test.ts')).toEqual([
+      'scripts/audit.mjs',
+      'scripts/inventory.mjs',
+    ])
+    expect(reverseReachableLocalModules(graph, ['scripts/inventory.mjs'])).toEqual([
+      'scripts/inventory.mjs',
+      'tests/unit/audit.test.ts',
+    ])
+  })
+
+  it('keeps shadowed, mutable, cyclic and escaping file-URL targets unresolved', () => {
+    const source = [
+      "import { resolve } from 'node:path'",
+      "import { pathToFileURL } from 'node:url'",
+      "const ROOT = resolve(__dirname, '../..')",
+      "const SHADOWED = pathToFileURL(resolve(ROOT, 'scripts/audit.mjs')).href",
+      'function other(SHADOWED: string) { return import(SHADOWED) }',
+      "let MUTABLE = pathToFileURL(resolve(ROOT, 'scripts/audit.mjs')).href",
+      'void import(MUTABLE)',
+      'const A = B; const B = A; void import(A)',
+      "void import(pathToFileURL(resolve(ROOT, '../outside.mjs')).href)",
+    ].join('\n')
+    const root = fixtureRoot({ 'tests/unit/audit.test.ts': source })
+    const graph = buildLocalModuleGraph({ root })
+    expect(graph.dependencies.get('tests/unit/audit.test.ts')).toEqual([])
+    expect(graph.diagnostics).toHaveLength(4)
+    expect(graph.diagnostics.every((entry) => entry.code === 'opaque-module-reference')).toBe(true)
+  })
+
   it('resolves literal import forms and assets into one forward and reverse graph', () => {
     const root = fixtureRoot({
       'src/a.ts': "import './theme.css'\nexport const a = 1\n",

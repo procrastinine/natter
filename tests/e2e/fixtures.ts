@@ -8,6 +8,8 @@ import {
   type Page,
   type TestInfo,
 } from '@playwright/test'
+import { installNativeWorkspaceStorageFixture } from '../../scripts/native-workspace-storage-fixture.mjs'
+import { exportWorkspaceThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
 import { navigatePagesForLifecycleDrain } from './lifecycle-drain'
 import {
   armUiJourneyInvariantRecorder,
@@ -20,6 +22,12 @@ import {
   type UiJourneyInvariantRecorderConfig,
   type UiJourneyInvariantReport,
 } from './ui-journey-invariant-recorder'
+import {
+  addFirstRunConnection,
+  bindWorkspaceSeedTemplate,
+  createWorkspaceSeedTemplate,
+  type WorkspaceSeedTemplate,
+} from './workspace-seed'
 
 export type { CDPSession, Locator, Page } from '@playwright/test'
 export { expect }
@@ -71,6 +79,7 @@ interface RuntimeDiagnostic {
 }
 
 interface RuntimeDiagnosticFixtures {
+  workspaceSeedBinding: undefined
   runtimeDiagnosticPolicy: RuntimeDiagnosticPolicy
   runtimeDiagnosticAllowances: RuntimeDiagnosticAllowance[]
   runtimeDiagnosticExpectations: RuntimeDiagnosticExpectation[]
@@ -89,15 +98,15 @@ type NativeCdpConnect = (options: {
   artifactsDir: string
 }) => Promise<Browser>
 
-interface NativeCdpWorkerFixtures {
-  nativeCdpBrowser: Browser
+interface WorkspaceSeedWorkerFixtures {
+  workspaceSeedTemplate: WorkspaceSeedTemplate
 }
 
 const nativeCdpEndpoint = process.env.E2E_NATIVE_CDP_ENDPOINT
 const nativeCdpArtifactsDir = process.env.E2E_NATIVE_CDP_ARTIFACTS_DIR
 const fixtureBase = nativeCdpEndpoint
-  ? base.extend<object, NativeCdpWorkerFixtures>({
-      nativeCdpBrowser: [
+  ? base.extend({
+      browser: [
         async ({ browserName: _browserName }, use) => {
           if (!nativeCdpArtifactsDir) throw new Error('HeadedVisibilityArtifactsDirectoryMissing')
           const connectNative = chromium.connectOverCDP.bind(
@@ -122,8 +131,8 @@ const fixtureBase = nativeCdpEndpoint
         },
         { scope: 'worker' },
       ],
-      context: async ({ nativeCdpBrowser }, use) => {
-        const context = nativeCdpBrowser.contexts()[0]
+      context: async ({ browser }, use) => {
+        const context = browser.contexts()[0]
         if (!context) throw new Error('HeadedVisibilityDefaultContextMissing')
         await use(context)
       },
@@ -245,7 +254,163 @@ const activeSurfaceReadinessNode = Object.freeze({
   resetOnRouteChange: false,
 })
 
-export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
+async function installDefaultDiscoveryFixtures(context: BrowserContext): Promise<void> {
+  await context.route('https://openrouter.ai/api/v1/**', (route) => route.abort('blockedbyclient'))
+  await context.route('https://debug.invalid/**', (route) =>
+    route.fulfill({
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({ data: [] }),
+    }),
+  )
+  await context.route('**/_or_scrape/**', (route) =>
+    route.fulfill({
+      contentType: 'text/html',
+      body: `<script id="__NEXT_DATA__" type="application/json">${JSON.stringify({
+        props: {
+          pageProps: {
+            providers: [
+              {
+                provider_display_name: 'Natter',
+                provider_slug: 'natter',
+                data_policy: {
+                  training: false,
+                  trainingOpenRouter: false,
+                  retainsPrompts: false,
+                  canPublish: false,
+                  requiresUserIDs: false,
+                },
+              },
+            ],
+          },
+        },
+      })}</script>`,
+    }),
+  )
+  await context.route('https://openrouter.ai/api/v1/models*', (route) =>
+    route.fulfill({
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({
+        data: [
+          {
+            id: 'anthropic/claude-opus-4.8',
+            name: 'Claude Opus 4.8',
+            supported_parameters: ['tools'],
+          },
+        ],
+      }),
+    }),
+  )
+  await context.route('https://openrouter.ai/api/v1/models/**/endpoints', (route) => {
+    const pathname = new URL(route.request().url()).pathname
+    const modelId = decodeURIComponent(
+      pathname.slice('/api/v1/models/'.length, -'/endpoints'.length),
+    )
+    return route.fulfill({
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({
+        data: {
+          id: modelId,
+          name: modelId,
+          context_length: 131_072,
+          architecture: {
+            input_modalities: ['text'],
+            output_modalities: ['text'],
+            tokenizer: 'Other',
+          },
+          endpoints: [
+            {
+              provider_name: 'Natter',
+              provider_slug: 'natter',
+              supported_parameters: ['max_completion_tokens'],
+              context_length: 131_072,
+              max_prompt_tokens: 131_072,
+              max_completion_tokens: 4_096,
+              pricing: { prompt: '0', completion: '0' },
+              data_policy: {
+                training: false,
+                trainingOpenRouter: false,
+                retainsPrompts: false,
+                canPublish: false,
+                requiresUserIDs: false,
+              },
+            },
+          ],
+        },
+      }),
+    })
+  })
+}
+
+async function produceWorkspaceSeedTemplate(
+  browser: Browser,
+  baseURL: string,
+): Promise<Record<string, unknown>> {
+  const context = await browser.newContext({ baseURL })
+  const diagnostics: RuntimeDiagnostic[] = []
+  let backup: Record<string, unknown>
+  try {
+    const page = await context.newPage()
+    page.on('pageerror', (error) =>
+      diagnostics.push({
+        category: 'page-error',
+        source: 'pageerror',
+        level: 'error',
+        message: error.message,
+        allowed: false,
+      }),
+    )
+    page.on('console', (message) => {
+      if (message.type() !== 'warning' && message.type() !== 'error') return
+      diagnostics.push(
+        classifyAllowance(
+          {
+            category: classifyConsoleDiagnostic(message.text()) ?? 'console-other',
+            source: 'console',
+            level: message.type(),
+            message: message.text(),
+            allowed: false,
+          },
+          browser.browserType().name() === 'firefox' ? firefoxEngineDiagnosticAllowances : [],
+          [],
+        ),
+      )
+    })
+    await installDefaultDiscoveryFixtures(context)
+    await page.goto(baseURL)
+    await addFirstRunConnection(page)
+    backup = await exportWorkspaceThroughUi(page, null)
+  } finally {
+    await context.close()
+  }
+  const unexpected = diagnostics.filter((diagnostic) => !diagnostic.allowed)
+  expect(unexpected, formatUnexpectedDiagnostics(unexpected)).toEqual([])
+  return backup
+}
+
+export const test = fixtureBase.extend<RuntimeDiagnosticFixtures, WorkspaceSeedWorkerFixtures>({
+  workspaceSeedTemplate: [
+    async ({ browser }, use, workerInfo) => {
+      const baseURL = workerInfo.project.use.baseURL
+      if (!baseURL) throw new Error('WorkspaceSeedBaseUrlMissing')
+      await use(createWorkspaceSeedTemplate(() => produceWorkspaceSeedTemplate(browser, baseURL)))
+    },
+    { scope: 'worker' },
+  ],
+  workspaceSeedBinding: [
+    async ({ context, workspaceSeedTemplate, baseURL }, use) => {
+      if (!baseURL) throw new Error('WorkspaceSeedBaseUrlMissing')
+      const release = bindWorkspaceSeedTemplate(context, workspaceSeedTemplate, baseURL)
+      try {
+        await use(undefined)
+      } finally {
+        release()
+      }
+    },
+    { auto: true },
+  ],
   runtimeDiagnosticPolicy: [{ allowances: [] }, { option: true }],
   runtimeDiagnosticAllowances: async ({ runtimeDiagnosticPolicy }, use) => {
     await use([...runtimeDiagnosticPolicy.allowances])
@@ -280,95 +445,7 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
       const pendingConsoleDetails = new Set<Promise<void>>()
       let lifecycleDrainStarted = false
       if (!baseURL) throw new Error('RuntimeDiagnosticBaseUrlMissing')
-      await context.route('https://openrouter.ai/api/v1/**', (route) =>
-        route.abort('blockedbyclient'),
-      )
-      await context.route('https://debug.invalid/**', (route) =>
-        route.fulfill({
-          contentType: 'application/json',
-          headers: { 'access-control-allow-origin': '*' },
-          body: JSON.stringify({ data: [] }),
-        }),
-      )
-      await context.route('**/_or_scrape/**', (route) =>
-        route.fulfill({
-          contentType: 'text/html',
-          body: `<script id="__NEXT_DATA__" type="application/json">${JSON.stringify({
-            props: {
-              pageProps: {
-                providers: [
-                  {
-                    provider_display_name: 'Natter',
-                    provider_slug: 'natter',
-                    data_policy: {
-                      training: false,
-                      trainingOpenRouter: false,
-                      retainsPrompts: false,
-                      canPublish: false,
-                      requiresUserIDs: false,
-                    },
-                  },
-                ],
-              },
-            },
-          })}</script>`,
-        }),
-      )
-      await context.route('https://openrouter.ai/api/v1/models*', (route) =>
-        route.fulfill({
-          contentType: 'application/json',
-          headers: { 'access-control-allow-origin': '*' },
-          body: JSON.stringify({
-            data: [
-              {
-                id: 'anthropic/claude-opus-4.8',
-                name: 'Claude Opus 4.8',
-                supported_parameters: ['tools'],
-              },
-            ],
-          }),
-        }),
-      )
-      await context.route('https://openrouter.ai/api/v1/models/**/endpoints', (route) => {
-        const pathname = new URL(route.request().url()).pathname
-        const modelId = decodeURIComponent(
-          pathname.slice('/api/v1/models/'.length, -'/endpoints'.length),
-        )
-        return route.fulfill({
-          contentType: 'application/json',
-          headers: { 'access-control-allow-origin': '*' },
-          body: JSON.stringify({
-            data: {
-              id: modelId,
-              name: modelId,
-              context_length: 131_072,
-              architecture: {
-                input_modalities: ['text'],
-                output_modalities: ['text'],
-                tokenizer: 'Other',
-              },
-              endpoints: [
-                {
-                  provider_name: 'Natter',
-                  provider_slug: 'natter',
-                  supported_parameters: ['max_completion_tokens'],
-                  context_length: 131_072,
-                  max_prompt_tokens: 131_072,
-                  max_completion_tokens: 4_096,
-                  pricing: { prompt: '0', completion: '0' },
-                  data_policy: {
-                    training: false,
-                    trainingOpenRouter: false,
-                    retainsPrompts: false,
-                    canPublish: false,
-                    requiresUserIDs: false,
-                  },
-                },
-              ],
-            },
-          }),
-        })
-      })
+      await installDefaultDiscoveryFixtures(context)
       const onConsole = (message: ConsoleMessage) => {
         if (message.type() !== 'warning' && message.type() !== 'error') return
         const category = classifyConsoleDiagnostic(message.text())
@@ -423,6 +500,10 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
         page.off('console', onConsole)
         page.off('pageerror', onPageError)
       }
+      await context.addInitScript(installNativeWorkspaceStorageFixture)
+      await Promise.all(
+        context.pages().map((page) => page.evaluate(installNativeWorkspaceStorageFixture)),
+      )
       context.on('page', attachPage)
       for (const page of context.pages()) attachPage(page)
       try {

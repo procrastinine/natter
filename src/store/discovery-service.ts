@@ -377,8 +377,9 @@ function cacheSatisfiesRefresh(
 ): boolean {
   if (options.force) {
     return (
+      fetchedAt !== undefined &&
       options.forceBaselineFetchedAt !== undefined &&
-      (fetchedAt ?? null) !== options.forceBaselineFetchedAt
+      fetchedAt !== options.forceBaselineFetchedAt
     )
   }
   return fetchedAt !== undefined && isFresh(fetchedAt, ttlMs)

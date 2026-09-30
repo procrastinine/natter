@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import ts from 'typescript'
 import { beforeAll, describe, expect, it } from 'vitest'
 import { loadProtocolContractFactBundle } from '../helpers/protocol-contract-facts'
 
@@ -10,6 +11,10 @@ const AUDIT_URL = pathToFileURL(
 ).href
 const INVENTORY_URL = pathToFileURL(
   resolve(ROOT, 'scripts/production-discriminated-union-inventory.mjs'),
+).href
+
+const DISCOVERY_URL = pathToFileURL(
+  resolve(ROOT, 'scripts/discover-production-discriminated-unions.mjs'),
 ).href
 
 type Literal = string | number | boolean
@@ -527,3 +532,169 @@ function entry(id: string): DiscoveredUnion {
 function sum(counts: Readonly<Record<string, number>>): number {
   return Object.values(counts).reduce((total, count) => total + count, 0)
 }
+
+describe('constructor discovery work', () => {
+  it('resolves semantic object types only for candidate discriminants while preserving ambiguous owners', async () => {
+    const path = resolve(ROOT, 'src/discovery-counterexample.ts')
+    const text = `
+      export type First = { kind: 'shared'; first: number } | { kind: 'first' }
+      export type Second = { kind: 'shared'; second: string } | { kind: 'second' }
+      function first(): First { return { kind: 'shared', first: 1 } }
+      function second(): Second { return { kind: 'shared', second: 'two' } }
+      const unknown = { kind: 'unregistered' }
+      ${Array.from({ length: 1000 }, (_, i) => `const irrelevant${i} = { value: ${i} }`).join('\n')}
+    `
+    const options: ts.CompilerOptions = { noLib: true, types: [] }
+    const host = ts.createCompilerHost(options)
+    host.getSourceFile = (fileName, languageVersion) =>
+      fileName === path ? ts.createSourceFile(path, text, languageVersion, true) : undefined
+    const program = ts.createProgram({ rootNames: [path], options, host })
+    const checker = program.getTypeChecker()
+    const objectQueries: string[] = []
+    const contextQueries: string[] = []
+    const observedChecker: ts.TypeChecker = {
+      ...checker,
+      getTypeAtLocation(node) {
+        if (ts.isObjectLiteralExpression(node)) objectQueries.push(node.getText())
+        return checker.getTypeAtLocation(node)
+      },
+      getContextualType(node) {
+        contextQueries.push(node.getText())
+        return checker.getContextualType(node)
+      },
+    }
+    const discovery = (await import(DISCOVERY_URL)) as {
+      discoverProductionDiscriminatedUnions(
+        root: string,
+        options: { program: ts.Program },
+      ): {
+        unions: Array<{
+          type: string
+          constructorSites: Array<{ owner: string; confidence: string }>
+        }>
+      }
+    }
+    const report = discovery.discoverProductionDiscriminatedUnions(ROOT, {
+      program: { ...program, getTypeChecker: () => observedChecker },
+    })
+    expect(report.unions.map(({ type, constructorSites }) => ({ type, constructorSites }))).toEqual(
+      [
+        {
+          type: 'First',
+          constructorSites: [
+            expect.objectContaining({ owner: 'first', confidence: 'type-assignable' }),
+          ],
+        },
+        {
+          type: 'Second',
+          constructorSites: [
+            expect.objectContaining({ owner: 'second', confidence: 'type-assignable' }),
+          ],
+        },
+      ],
+    )
+    expect(objectQueries).toEqual([
+      "{ kind: 'shared', first: 1 }",
+      "{ kind: 'shared', second: 'two' }",
+    ])
+    expect(contextQueries).toEqual(objectQueries)
+  })
+
+  it('scopes constructor work without changing ambiguity, fallback or site identity', async () => {
+    const path = resolve(ROOT, 'src/discovery-scope-counterexample.ts')
+    const text = `
+      export type First = { kind: 'shared'; first: number } | { kind: 'first'; value: number }
+      export type Second = { kind: 'shared'; second: string } | { kind: 'second'; value: string }
+      function first(): First { return { kind: 'shared', first: 1 } }
+      function second(): Second { return { kind: 'shared', second: 'two' } }
+      function ambiguous() { return { kind: 'shared' } }
+      function uniqueFallback() { return { kind: 'first' } }
+      function excluded(): Second { return { kind: 'second', value: 'two' } }
+      export type Unrelated = { phase: 'queued'; state: 'ready' } | { phase: 'complete'; state: 'done' }
+      export type UnrelatedAlias = Unrelated
+      function unrelated(): Unrelated { return { phase: 'queued', state: 'ready' } }
+    `
+    const options: ts.CompilerOptions = { noLib: true, types: [] }
+    const host = ts.createCompilerHost(options)
+    host.getSourceFile = (fileName, languageVersion) =>
+      fileName === path ? ts.createSourceFile(path, text, languageVersion, true) : undefined
+    const program = ts.createProgram({ rootNames: [path], options, host })
+    const checker = program.getTypeChecker()
+    const objectQueries: string[] = []
+    const contextQueries: string[] = []
+    const propertyQueries: string[] = []
+    const declarationQueries: string[] = []
+    const observedChecker: ts.TypeChecker = {
+      ...checker,
+      getTypeFromTypeNode(node) {
+        declarationQueries.push(node.getText())
+        return checker.getTypeFromTypeNode(node)
+      },
+      getTypeOfSymbolAtLocation(symbol, node) {
+        propertyQueries.push(symbol.name)
+        return checker.getTypeOfSymbolAtLocation(symbol, node)
+      },
+      getTypeAtLocation(node) {
+        if (ts.isObjectLiteralExpression(node)) objectQueries.push(node.getText())
+        return checker.getTypeAtLocation(node)
+      },
+      getContextualType(node) {
+        contextQueries.push(node.getText())
+        return checker.getContextualType(node)
+      },
+    }
+    const discovery = (await import(DISCOVERY_URL)) as {
+      discoverProductionDiscriminatedUnions(
+        root: string,
+        options: { program: ts.Program; unionIds?: string[] },
+      ): {
+        sourceFiles: number
+        discriminatedUnions: number
+        unions: Array<{
+          id: string
+          type: string
+          constructorSites: Array<{ owner: string; confidence: string }>
+        }>
+      }
+    }
+    const full = discovery.discoverProductionDiscriminatedUnions(ROOT, { program })
+    const firstId = 'src/discovery-scope-counterexample.ts#First|kind'
+    const scopedProgram = { ...program, getTypeChecker: () => observedChecker }
+    const scoped = discovery.discoverProductionDiscriminatedUnions(ROOT, {
+      program: scopedProgram,
+      unionIds: [firstId],
+    })
+    expect(scoped).toEqual({
+      ...full,
+      discriminatedUnions: 1,
+      unions: full.unions.filter(({ id }) => id === firstId),
+    })
+    expect(scoped.unions[0]?.constructorSites).toEqual([
+      expect.objectContaining({ owner: 'first', confidence: 'type-assignable' }),
+      expect.objectContaining({ owner: 'uniqueFallback', confidence: 'unique-literal' }),
+    ])
+    expect(objectQueries).toEqual([
+      "{ kind: 'shared', first: 1 }",
+      "{ kind: 'shared', second: 'two' }",
+      "{ kind: 'shared' }",
+      "{ kind: 'first' }",
+    ])
+    expect(contextQueries).toEqual(objectQueries)
+    expect(new Set(propertyQueries)).toEqual(new Set(['kind']))
+    expect(declarationQueries).toHaveLength(4)
+    propertyQueries.length = 0
+    declarationQueries.length = 0
+    objectQueries.length = 0
+    contextQueries.length = 0
+    expect(
+      discovery.discoverProductionDiscriminatedUnions(ROOT, {
+        program: scopedProgram,
+        unionIds: [],
+      }),
+    ).toEqual({ sourceFiles: full.sourceFiles, discriminatedUnions: 0, unions: [] })
+    expect(objectQueries).toEqual([])
+    expect(contextQueries).toEqual([])
+    expect(propertyQueries).toEqual([])
+    expect(declarationQueries).toEqual([])
+  })
+})

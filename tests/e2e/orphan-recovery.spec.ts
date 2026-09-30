@@ -1,5 +1,5 @@
 import { expect, test } from './fixtures'
-import { activeWorkspaceDatabaseName, clearIndexedDb, seedFirstRun } from './helpers'
+import { clearIndexedDb, seedFirstRun } from './helpers'
 
 // The orphan sweep (Shell.tsx → recoverOrphans on mount) rescues any message
 // whose `generation.startedAt` is set without `finishedAt` by marking it
@@ -18,22 +18,16 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
 
   // Inject an orphan assistant message directly into the messages store.
   const orphanId = 'orphan-01HYZ9V4T9EXAMPLE0000000'
-  const databaseName = await activeWorkspaceDatabaseName(page)
+
   await page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open(databaseName)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        const chatId = await new Promise<string>((resolve, reject) => {
-          const tx = db.transaction('chats', 'readonly')
-          const req = tx.objectStore('chats').getAll()
-          req.onsuccess = () => resolve((req.result as Array<{ id: string }>)[0]?.id ?? '')
-          req.onerror = () => reject(req.error)
-        })
-        await new Promise<void>((resolve, reject) => {
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'fault-injection' },
+        async (db, request) => {
+          const chats = (await request(
+            db.transaction('chats', 'readonly').objectStore('chats').getAll(),
+          )) as Array<{ id: string }>
+          const chatId = chats[0]?.id ?? ''
           const tx = db.transaction(['messages', 'messageBodies'], 'readwrite')
           tx.objectStore('messages').put({
             id,
@@ -64,41 +58,28 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
             updatedAt: 100,
             content: [{ type: 'output_text', text: 'partial' }],
           })
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
+        },
+      )
     },
-    { databaseName, id: orphanId },
+    { id: orphanId },
   )
 
   // Reload so Shell.tsx's useEffect fires recoverOrphans.
   await page.reload()
   // Wait until recoverOrphans commits.
   await page.waitForFunction(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open(databaseName)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        const row = await new Promise<{ generation?: { abortReason?: string } }>(
-          (resolve, reject) => {
-            const tx = db.transaction('messages', 'readonly')
-            const req = tx.objectStore('messages').get(id)
-            req.onsuccess = () => resolve(req.result as { generation?: { abortReason?: string } })
-            req.onerror = () => reject(req.error)
-          },
-        )
-        return row.generation?.abortReason === 'tab-close'
-      } finally {
-        db.close()
-      }
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          const row = (await request(
+            db.transaction('messages', 'readonly').objectStore('messages').get(id),
+          )) as { generation?: { abortReason?: string } }
+          return row.generation?.abortReason === 'tab-close'
+        },
+      )
     },
-    { databaseName, id: orphanId },
+    { id: orphanId },
     { timeout: 5000 },
   )
 })

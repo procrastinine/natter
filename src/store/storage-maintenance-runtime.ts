@@ -560,7 +560,7 @@ class StorageMaintenanceController {
       return { kind: 'blocked', on: 'slot' }
     }
     if (started.kind === 'blocked') return { kind: 'blocked', on: 'runtime-idle' }
-    if (started.kind === 'skipped') return { kind: 'done' }
+    if (started.kind === 'skipped' || started.kind === 'cancelled') return { kind: 'done' }
     this.#replacementHandoffs.transfer(started.handoff)
     return { kind: 'handoff' }
   }

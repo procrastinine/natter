@@ -215,7 +215,10 @@ function compareFixtureSiblings(left, right) {
   )
 }
 
-async function exportWorkspaceThroughUi(page) {
+export async function exportWorkspaceThroughUi(
+  page,
+  nativeDownloadDirectory = process.env.E2E_NATIVE_CDP_ARTIFACTS_DIR,
+) {
   const returnUrl = page.url()
   const storageUrl = new URL('/#/storage', returnUrl).href
   await page.goto(storageUrl, { waitUntil: 'domcontentloaded' })
@@ -223,7 +226,6 @@ async function exportWorkspaceThroughUi(page) {
   await page
     .locator('[data-ui="storage-action"][title="Export the full IndexedDB workspace"]')
     .click()
-  const nativeDownloadDirectory = process.env.E2E_NATIVE_CDP_ARTIFACTS_DIR
   if (nativeDownloadDirectory) {
     const priorNames = new Set(await readdir(nativeDownloadDirectory))
     const downloadPromise = downloadJsonFromDirectory(nativeDownloadDirectory, priorNames)
@@ -235,9 +237,9 @@ async function exportWorkspaceThroughUi(page) {
   return downloadJson(await downloadPromise)
 }
 
-async function restoreWorkspaceThroughUi(page, backup, options = {}) {
+export async function restoreWorkspaceThroughUi(page, backup, options = {}) {
   const returnUrl = options.returnUrl ?? page.url()
-  const storageUrl = new URL('/#/storage', returnUrl).href
+  const storageUrl = new URL('/#/storage', options.applicationUrl ?? returnUrl).href
   if (page.url() !== storageUrl) {
     await page.goto(storageUrl, { waitUntil: 'domcontentloaded' })
   }
@@ -446,24 +448,24 @@ function configureChatSettings(settings, options) {
   }
 }
 
+export function configureWorkspaceBackup(backup, options = {}) {
+  if (!isRecord(backup.payload)) throw new Error('workspace fixture payload missing')
+  for (const tableName of ['presets', 'chats']) {
+    const rows = backup.payload[tableName]
+    if (!Array.isArray(rows)) throw new Error(`workspace fixture table missing: ${tableName}`)
+    backup.payload[tableName] = rows.map((row) => {
+      if (!isRecord(row)) throw new Error(`workspace fixture ${tableName} row invalid`)
+      return { ...row, settings: configureChatSettings(row.settings, options) }
+    })
+  }
+  if (options.workspaceSettings) putWorkspaceSettings(backup, options.workspaceSettings)
+  return refreshWorkspaceManifest(backup)
+}
+
 export async function configureWorkspaceThroughUi(page, options = {}) {
-  await transformWorkspaceThroughUi(
-    page,
-    (backup) => {
-      if (!isRecord(backup.payload)) throw new Error('workspace fixture payload missing')
-      for (const tableName of ['presets', 'chats']) {
-        const rows = backup.payload[tableName]
-        if (!Array.isArray(rows)) throw new Error(`workspace fixture table missing: ${tableName}`)
-        backup.payload[tableName] = rows.map((row) => {
-          if (!isRecord(row)) throw new Error(`workspace fixture ${tableName} row invalid`)
-          return { ...row, settings: configureChatSettings(row.settings, options) }
-        })
-      }
-      if (options.workspaceSettings) putWorkspaceSettings(backup, options.workspaceSettings)
-      return backup
-    },
-    { filename: 'natter-workspace-configuration-fixture.json' },
-  )
+  await transformWorkspaceThroughUi(page, (backup) => configureWorkspaceBackup(backup, options), {
+    filename: 'natter-workspace-configuration-fixture.json',
+  })
 }
 
 export async function appendChatCatalogFixturesThroughUi(page, fixture) {

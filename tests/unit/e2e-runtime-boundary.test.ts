@@ -21,23 +21,6 @@ const BROWSER_INSTRUMENTATION_PATTERN =
   /(?:['"`]\/src\/|\b__debug[A-Za-z0-9_]*\b|\b__nuke\b|VITE_NATTER_DEBUG|instrumented-helpers|E2E_LANE)/u
 const HARDCODED_PHYSICAL_WORKSPACE_PATTERN =
   /indexedDB\s*\.\s*(?:open|deleteDatabase)\(\s*['"]natter['"]\s*\)/u
-const EXPECTED_RAW_E2E_DATABASE_MUTATIONS = {
-  'error-boundary.spec.ts': 1,
-  'helpers.ts': 2,
-  'large-workspace-startup.spec.ts': 7,
-  'orphan-recovery.spec.ts': 2,
-  'startup-recovery.spec.ts': 13,
-  'storage-reclamation.spec.ts': 2,
-} as const
-const EXPECTED_RAW_E2E_READWRITE_TRANSACTIONS = {
-  'error-boundary.spec.ts': 1,
-  'helpers.ts': 2,
-  'large-workspace-startup.spec.ts': 2,
-  'orphan-recovery.spec.ts': 1,
-  'startup-recovery.spec.ts': 4,
-  'storage-reclamation.spec.ts': 2,
-} as const
-
 function readText(path: string): string {
   return readFileSync(resolve(ROOT, path), 'utf8')
 }
@@ -157,111 +140,6 @@ function e2eRuntimeSourceImportOffenders(path: string): string[] {
   }
   visit(sourceFile)
   return offenders
-}
-
-function rawE2eDatabaseMutations(path: string): string[] {
-  const sourcePath = relativePath(E2E_ROOT, path)
-  const sourceFile = ts.createSourceFile(
-    sourcePath,
-    readFileSync(path, 'utf8'),
-    ts.ScriptTarget.Latest,
-    true,
-    sourcePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
-  )
-  const objectStoreVariables = new Set<string>()
-  const cursorRequestVariables = new Set<string>()
-  const cursorVariables = new Set<string>()
-  const isObjectStoreCall = (node: ts.Node | undefined): node is ts.CallExpression =>
-    node !== undefined &&
-    ts.isCallExpression(node) &&
-    ts.isPropertyAccessExpression(node.expression) &&
-    node.expression.name.text === 'objectStore'
-  const collectObjectStores = (node: ts.Node) => {
-    if (
-      ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
-      isObjectStoreCall(node.initializer)
-    ) {
-      objectStoreVariables.add(node.name.text)
-    }
-    if (
-      ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      ts.isCallExpression(node.initializer) &&
-      ts.isPropertyAccessExpression(node.initializer.expression) &&
-      node.initializer.expression.name.text === 'openCursor'
-    ) {
-      cursorRequestVariables.add(node.name.text)
-    }
-    node.forEachChild(collectObjectStores)
-  }
-  collectObjectStores(sourceFile)
-  const collectCursors = (node: ts.Node) => {
-    if (
-      ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      ts.isPropertyAccessExpression(node.initializer) &&
-      node.initializer.name.text === 'result' &&
-      ts.isIdentifier(node.initializer.expression) &&
-      cursorRequestVariables.has(node.initializer.expression.text)
-    ) {
-      cursorVariables.add(node.name.text)
-    }
-    node.forEachChild(collectCursors)
-  }
-  collectCursors(sourceFile)
-
-  const mutations: string[] = []
-  const visit = (node: ts.Node) => {
-    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
-      const method = node.expression.name.text
-      const receiver = node.expression.expression
-      if (
-        (['add', 'clear', 'delete', 'put'].includes(method) &&
-          (isObjectStoreCall(receiver) ||
-            (ts.isIdentifier(receiver) && objectStoreVariables.has(receiver.text)))) ||
-        (['delete', 'update'].includes(method) &&
-          ts.isIdentifier(receiver) &&
-          cursorVariables.has(receiver.text))
-      ) {
-        const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
-        mutations.push(`${sourcePath}:${line}:${method}`)
-      }
-    }
-    node.forEachChild(visit)
-  }
-  visit(sourceFile)
-  return mutations
-}
-
-function rawE2eReadwriteTransactions(path: string): string[] {
-  const sourcePath = relativePath(E2E_ROOT, path)
-  const sourceFile = ts.createSourceFile(
-    sourcePath,
-    readFileSync(path, 'utf8'),
-    ts.ScriptTarget.Latest,
-    true,
-    sourcePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
-  )
-  const transactions: string[] = []
-  const visit = (node: ts.Node) => {
-    if (
-      ts.isCallExpression(node) &&
-      ts.isPropertyAccessExpression(node.expression) &&
-      node.expression.name.text === 'transaction' &&
-      node.arguments.some(
-        (argument) => ts.isStringLiteralLike(argument) && argument.text === 'readwrite',
-      )
-    ) {
-      const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
-      transactions.push(`${sourcePath}:${line}`)
-    }
-    node.forEachChild(visit)
-  }
-  visit(sourceFile)
-  return transactions
 }
 
 function rawBrowserDatabaseImportOffenders(path: string): string[] {
@@ -627,20 +505,6 @@ describe('built-app runtime boundary', () => {
   it('keeps ordinary E2E setup on public application boundaries', () => {
     const files = filesBelow(E2E_ROOT).filter((path) => SOURCE_EXTENSION_PATTERN.test(path))
     expect(files.flatMap((path) => e2eRuntimeSourceImportOffenders(path)).sort()).toEqual([])
-
-    const mutationCounts: Record<string, number> = {}
-    for (const entry of files.flatMap((path) => rawE2eDatabaseMutations(path))) {
-      const path = entry.split(':', 1)[0] ?? ''
-      mutationCounts[path] = (mutationCounts[path] ?? 0) + 1
-    }
-    expect(mutationCounts).toEqual(EXPECTED_RAW_E2E_DATABASE_MUTATIONS)
-
-    const readwriteTransactionCounts: Record<string, number> = {}
-    for (const entry of files.flatMap((path) => rawE2eReadwriteTransactions(path))) {
-      const path = entry.split(':', 1)[0] ?? ''
-      readwriteTransactionCounts[path] = (readwriteTransactionCounts[path] ?? 0) + 1
-    }
-    expect(readwriteTransactionCounts).toEqual(EXPECTED_RAW_E2E_READWRITE_TRANSACTIONS)
   })
 
   it('keeps browser tests and profile tools independent of the active physical workspace slot', () => {
@@ -654,10 +518,12 @@ describe('built-app runtime boundary', () => {
       .filter((path) => HARDCODED_PHYSICAL_WORKSPACE_PATTERN.test(readFileSync(path, 'utf8')))
       .map((path) => relativePath(ROOT, path))
       .sort()
-    expect(offenders).toEqual(['tests/e2e/legacy-import-recovery.spec.ts'])
-    expect(readText('tests/e2e/helpers.ts')).toContain("indexedDB.open('natter-control')")
-    expect(readText('scripts/profile-stream-harness.mjs')).toContain(
-      "const control = await openDatabase('natter-control')",
+    expect(offenders).toEqual([])
+    expect(readText('tests/e2e/helpers.ts')).toContain(
+      '__natterNativeStorageFixture.readActiveIdentity()',
+    )
+    expect(readText('scripts/profile-stream-harness.mjs')).not.toContain(
+      'activeWorkspaceDatabaseName',
     )
   })
 
@@ -680,40 +546,30 @@ describe('built-app runtime boundary', () => {
     expect(config).toMatch(/url: `\$\{fakeProviderURL\}\/healthz`/u)
     expect(config).toContain("process.env.E2E_REUSE_EXISTING_SERVER === '1'")
     expect(readText('scripts/run-verification.mjs')).toContain("E2E_REUSE_EXISTING_SERVER: '0'")
-    expect(readText('scripts/run-verification.mjs')).toContain(
-      "E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE: '1'",
+    expect(readText('scripts/run-verification.mjs')).not.toContain(
+      'E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE',
     )
-    expect(config).toContain("process.env.E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE === '1'")
-    expect(config).toContain("{ dependencies: ['large-workspace-setup'] }")
-    expect(config).toContain("? ['chromium'] : ['large-workspace-setup']")
-    expect(readText('scripts/run-verification.mjs')).toContain("'firefox-e2e',")
-    const runner = readText('scripts/run-verification.mjs')
-    expect(runner.indexOf("stage('production-build'")).toBeLessThan(
-      runner.indexOf("stage('chromium-e2e'"),
-    )
-    expect(runner.indexOf("stage('chromium-e2e'")).toBeLessThan(runner.indexOf("'firefox-e2e',"))
-    expect(runner.indexOf("'firefox-e2e',")).toBeLessThan(
-      runner.indexOf("'headed-hidden-tab-visual-continuity',"),
-    )
-    expect(runner.indexOf("'headed-hidden-tab-visual-continuity',")).toBeLessThan(
-      runner.indexOf("'dev-preview-parity',"),
-    )
-    expect(runner.indexOf("'dev-preview-parity',")).toBeLessThan(
-      runner.indexOf("stage('stream-profile-single'"),
-    )
-    expect(runner.indexOf("'stream-profile-concurrent'")).toBeLessThan(
-      runner.indexOf("stage('performance'"),
-    )
+    const runtimeStageOrder = [
+      'production-build',
+      'chromium-e2e',
+      'firefox-e2e',
+      'headed-hidden-tab-visual-continuity',
+      'dev-preview-parity',
+      'stream-profile-single',
+      'stream-profile-concurrent',
+      'performance',
+    ]
+    expect(
+      VERIFICATION_STAGES.filter((stage) => runtimeStageOrder.includes(stage.id)).map(
+        (stage) => stage.id,
+      ),
+    ).toEqual(runtimeStageOrder)
     expect(config).toContain('--strictPort')
     expect(config).toContain("process.env.E2E_DEV_PREVIEW_PARITY === '1'")
     expect(config).toContain('command: devServerCommand')
     expect(config).toContain('url: `$' + '{devBaseURL}/src/main.tsx`')
-    expect(config).toContain("name: 'chromium-preview-parity'")
-    expect(config).toContain("name: 'chromium-dev-parity'")
-    expect(config).toContain("process.env.E2E_HEADED_VISIBILITY === '1'")
-    expect(config).toContain("name: 'chromium-headed-visibility'")
-    expect(config).toContain('headless: false')
-    expect(config).toContain('testMatch: devPreviewParitySpec')
+    expect(config).toContain('projects: selectedPlaywrightProjects(process.env)')
+    expect(config).toContain('./scripts/playwright-proof-reporter.mjs')
     const headedRunner = readText('scripts/run-headed-visibility.mjs')
     expect(headedRunner).toContain("process.env.E2E_NATIVE_TMP_ROOT ?? '/tmp'")
     expect(headedRunner).toContain("mkdtempSync(join(nativeTmpRoot, 'ntr-hv-'))")
@@ -721,34 +577,36 @@ describe('built-app runtime boundary', () => {
     expect(headedRunner).toContain('TMP: workingDirectory')
     expect(headedRunner).toContain('TMPDIR: workingDirectory')
     expect(headedRunner).toContain('env: nativeChildEnvironment')
+    expect(headedRunner).toMatch(
+      /env:\s*\{\s*\.\.\.nativeChildEnvironment,\s*E2E_HEADED_VISIBILITY:/u,
+    )
     expect(headedRunner).not.toContain('mkdtempSync(join(tmpdir()')
     expect(config).not.toContain('VITE_NATTER_DEBUG')
     expect(config).not.toContain('E2E_LANE')
-    expect(config).toContain("name: 'large-workspace-setup'")
-    expect(config).toContain("name: 'chromium-large-workspace'")
-    expect(config).toContain("name: 'chromium-send-performance'")
-    expect(config).toContain("name: 'firefox-send-performance'")
-    expect(config).toContain('testMatch: [sendPerformanceSpec, renderWindowPerformanceSpec]')
-    expect(config).toContain('renderWindowPerformanceSpec')
-    expect(config).toContain("? ['chromium-large-workspace']")
-    expect(config).toContain("dependencies: ['firefox']")
-    expect(config).toContain('workers: 1')
-    expect(config).toContain('large-workspace-startup')
-    expect(config).toContain('large-workspace\\.setup')
 
-    expect(packageJson.scripts.e2e).toBe('playwright test --project=chromium-send-performance')
+    expect(packageJson.scripts.e2e).toBe('node scripts/run-verification.mjs --browser chromium')
     expect(packageJson.scripts['e2e:production']).toBe(
-      'playwright test --project=chromium-send-performance',
+      'node scripts/run-verification.mjs --browser chromium',
     )
     expect(packageJson.scripts['e2e:headed-visibility']).toContain('xvfb-run --auto-servernum')
     expect(packageJson.scripts['e2e:startup-scale']).toBe(
-      'playwright test --project=chromium-large-workspace',
+      'node scripts/run-verification.mjs --browser chromium-large-workspace',
     )
     expect(packageJson.scripts['e2e:instrumented']).toBeUndefined()
     expect(packageJson.scripts['e2e:smoke']).toMatch(/^playwright test /u)
     expect(packageJson.scripts['e2e:production-startup']).toMatch(/^playwright test /u)
     expect(packageJson.scripts['build:pages']).toBeUndefined()
     expect(packageJson.scripts['fake-provider']).toBe('node scripts/fake-stream-server.mjs')
+  })
+
+  it('uses one native worker browser for the default test context and isolated seed contexts', () => {
+    const fixtures = readText('tests/e2e/fixtures.ts')
+    expect(fixtures).toMatch(/base\.extend\(\{\s*browser:\s*\[/u)
+    expect(fixtures).not.toContain('nativeCdpBrowser')
+    expect(fixtures).toMatch(/context:\s*async\s*\(\{\s*browser\s*\},\s*use\)/u)
+    expect(fixtures).toContain('const context = browser.contexts()[0]')
+    expect(fixtures).toContain('const context = await browser.newContext({ baseURL })')
+    expect(fixtures).toContain('exportWorkspaceThroughUi(page, null)')
   })
 
   it('retargets fake-provider workspaces through one production import boundary', () => {
@@ -874,11 +732,10 @@ describe('built-app runtime boundary', () => {
     expect(verify).toContain('test-results/verification-stages/')
     expect(verifyE2e?.label).toBe('Test the built app against the loopback fake provider')
     expect(verifyE2e?.argv).toEqual([
-      'pnpm',
-      'exec',
-      'playwright',
-      'test',
-      '--project=chromium-send-performance',
+      'node',
+      'scripts/run-verification.mjs',
+      '--browser',
+      'chromium',
     ])
     expect(readText('scripts/run-verification.mjs')).toContain("E2E_FAKE_PROVIDER_PORT: '4174'")
     expect(verifyE2eIndex).toBeGreaterThanOrEqual(0)
@@ -932,18 +789,16 @@ describe('built-app runtime boundary', () => {
       'run',
     ])
     expect(VERIFICATION_STAGES.find((stage) => stage.id === 'chromium-e2e')?.argv).toEqual([
-      'pnpm',
-      'exec',
-      'playwright',
-      'test',
-      '--project=chromium-send-performance',
+      'node',
+      'scripts/run-verification.mjs',
+      '--browser',
+      'chromium',
     ])
     expect(VERIFICATION_STAGES.find((stage) => stage.id === 'firefox-e2e')?.argv).toEqual([
-      'pnpm',
-      'exec',
-      'playwright',
-      'test',
-      '--project=firefox-send-performance',
+      'node',
+      'scripts/run-verification.mjs',
+      '--browser',
+      'firefox',
     ])
     expect(
       VERIFICATION_STAGES.find((stage) => stage.id === 'headed-hidden-tab-visual-continuity')?.argv,
@@ -959,7 +814,7 @@ describe('built-app runtime boundary', () => {
     expect(packageJson.scripts['test:run']).toBe(
       'node scripts/audit-protocol-contracts.mjs --mode inventory --facts-output test-results/protocol-contract-facts.json --mutation-output test-results/protocol-contract-mutation-proof.json && vitest run',
     )
-    expect(packageJson.scripts.e2e).toBe('playwright test --project=chromium-send-performance')
+    expect(packageJson.scripts.e2e).toBe('node scripts/run-verification.mjs --browser chromium')
   })
 
   it('limits build-mode behavior to the privacy proxy and keeps devtools outside the app entry', () => {

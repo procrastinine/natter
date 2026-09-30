@@ -9,7 +9,11 @@ import {
   WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS,
   WorkspaceForegroundDemandInterruptedError,
   WorkspaceMaintenancePreemptedError,
+  type WorkspaceReconcileAuthority,
   WorkspaceReplacementContenderPreemptedError,
+  type WorkspaceReplacementContinuation,
+  WorkspaceReplacementContinuationCancelledError,
+  type WorkspaceRuntimeActionOptions,
   type WorkspaceWritePermit,
 } from '../../src/store/workspace-runtime'
 import {
@@ -35,6 +39,39 @@ function createRuntimeHarness() {
       WORKSPACE_RUNTIME_RECONCILIATION_PARTICIPANT_IDS,
     }),
   }
+}
+
+function withRequiredReplacement<T>(
+  runtime: ReturnType<typeof createRuntimeHarness>['runtime'],
+  control: ReturnType<typeof createRuntimeHarness>['control'],
+  operation: (owner: {
+    readonly permit: WorkspaceWritePermit
+    readonly continuation: WorkspaceReplacementContinuation
+    readonly launch: () => WorkspaceReconcileAuthority | null
+  }) => T | PromiseLike<T>,
+  options: WorkspaceRuntimeActionOptions = {},
+): Promise<T> {
+  return runtime.runWorkspaceAction(
+    'workspace-replacement',
+    async (permit) => {
+      const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+      try {
+        return await operation({
+          permit,
+          continuation,
+          launch: () =>
+            control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
+              continuation,
+              lineageId: permit.lineageId,
+              requireIdle: false,
+            }),
+        })
+      } finally {
+        runtime.releaseWorkspaceReplacementContinuation(continuation)
+      }
+    },
+    options,
+  )
 }
 
 const retainedCollectionInventory = discoverProductionCoordination({
@@ -312,6 +349,36 @@ describe('workspace runtime resource manifest', () => {
     expect(openAttempts).toBe(1)
   })
 
+  it.each([new DOMException('cancelled by caller', 'AbortError'), { source: 'caller' }, null])(
+    'preserves exact rejection identity across root and child composition: %s',
+    async (reason: unknown) => {
+      const { runtime } = createRuntimeHarness()
+      const fence = { workspaceId: 'workspace-rejection-identity', replacementEpoch: 0 }
+      runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+      runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+      await expect(
+        runtime.runWorkspaceAction('chat-metadata', () => {
+          throw reason
+        }),
+      ).rejects.toBe(reason)
+      await runtime.runWorkspaceAction('chat-metadata', async (permit) => {
+        const child = runtime.reserveWorkspaceChild(permit, 'post-commit')
+        await expect(
+          runtime.runWorkspacePhase(child, () => {
+            throw reason
+          }),
+        ).rejects.toBe(reason)
+      })
+      const signal = AbortSignal.abort(reason)
+      await expect(
+        runtime.waitForWorkspaceRuntimeReplacementBlockers({ signal, requireIdle: true }),
+      ).rejects.toBe(reason)
+      await expect(runtime.tryRunWorkspaceActionIfIdle('maintenance', () => 'idle')).resolves.toBe(
+        'idle',
+      )
+    },
+  )
+
   it('keeps pre-running demand behind one exact lifecycle owner', async () => {
     const { runtime } = createRuntimeHarness()
     const ownerA = runtime.claimWorkspaceRuntimeDemandBoundary(async () => {})
@@ -421,6 +488,77 @@ describe('workspace runtime resource manifest', () => {
     expect(runtime.workspaceForegroundDemandInterruptionSignal().aborted).toBe(false)
   })
 
+  it('keeps maintenance admission pending until foreground preparation releases', async () => {
+    const { runtime } = createRuntimeHarness()
+    const fence = { workspaceId: 'workspace-foreground-admission', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    const demand = runtime.claimWorkspaceForegroundDemand()
+    let ready = false
+    const waiting = runtime
+      .waitForWorkspaceRuntimeReplacementBlockers({ requireIdle: true })
+      .then(() => {
+        ready = true
+      })
+    try {
+      await Promise.resolve()
+      expect(ready).toBe(false)
+      const attempt = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+        const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+        try {
+          expect(
+            runtime.workspaceRuntimeInternal.launchReplacementNow(
+              'maintenance',
+              { continuation, lineageId: permit.lineageId, requireIdle: true },
+              () => undefined,
+            ),
+          ).toBeNull()
+        } finally {
+          runtime.releaseWorkspaceReplacementContinuation(continuation)
+        }
+      })
+      if (!attempt) throw new Error('Expected maintenance producer admission')
+      await attempt
+    } finally {
+      runtime.releaseWorkspaceForegroundDemand(demand)
+      await waiting
+    }
+    expect(ready).toBe(true)
+  })
+
+  it.each(['maintenance', 'workspace-replacement'] as const)(
+    'foreground preparation preempts only disposable replacement: %s',
+    async (kind) => {
+      const { runtime } = createRuntimeHarness()
+      const fence = { workspaceId: 'workspace-foreground-preemption', replacementEpoch: 0 }
+      runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+      runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+      await runtime.runWorkspaceAction(kind, (permit) => {
+        const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+        try {
+          const replacement = runtime.workspaceRuntimeInternal.launchReplacementNow(
+            kind,
+            { continuation, lineageId: permit.lineageId, requireIdle: kind === 'maintenance' },
+            () => undefined,
+          )
+          if (!replacement) throw new Error('Expected replacement authority')
+          const demand = runtime.claimWorkspaceForegroundDemand()
+          try {
+            expect(replacement.signal.aborted).toBe(kind === 'maintenance')
+            if (kind === 'maintenance') {
+              expect(replacement.signal.reason).toBeInstanceOf(WorkspaceMaintenancePreemptedError)
+              expect(continuation.signal.aborted).toBe(false)
+            }
+          } finally {
+            runtime.releaseWorkspaceForegroundDemand(demand)
+          }
+        } finally {
+          runtime.releaseWorkspaceReplacementContinuation(continuation)
+        }
+      })
+    },
+  )
+
   it('lets an admitted replacement producer preempt active maintenance preparation', async () => {
     const { runtime } = createRuntimeHarness()
     const fence = { workspaceId: 'workspace-maintenance-preparation', replacementEpoch: 0 }
@@ -495,16 +633,21 @@ describe('workspace runtime resource manifest', () => {
     })
     if (!ownerPermit) throw new Error('Expected replacement owner permit')
 
-    const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
-      lineageId: ownerPermit.lineageId,
-      requireIdle: false,
-    })
-
-    expect(authority).not.toBeNull()
-    expect(contenderSignal?.aborted).toBe(true)
-    await expect(contender).rejects.toBeInstanceOf(WorkspaceReplacementContenderPreemptedError)
-    releaseOwner()
-    await owner
+    const continuation = runtime.claimWorkspaceReplacementContinuation(ownerPermit)
+    try {
+      const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
+        continuation,
+        lineageId: ownerPermit.lineageId,
+        requireIdle: false,
+      })
+      expect(authority).not.toBeNull()
+      expect(contenderSignal?.aborted).toBe(true)
+      await expect(contender).rejects.toBeInstanceOf(WorkspaceReplacementContenderPreemptedError)
+    } finally {
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+      releaseOwner()
+      await owner
+    }
   })
 
   it('refuses idle quiescence while a generation root is active and never aborts it', async () => {
@@ -616,42 +759,43 @@ describe('workspace runtime resource manifest', () => {
       })
     })
 
-    const replacementAuthority = control.launchWorkspaceRuntimeReplacementNow(
-      'workspace-replacement',
-      { requireIdle: false },
-    )
-    expect(replacementAuthority).not.toBeNull()
-    const replacement = control.awaitWorkspaceRuntimeQuiesced()
+    await withRequiredReplacement(runtime, control, async ({ launch }) => {
+      const replacementAuthority = launch()
+      expect(replacementAuthority).not.toBeNull()
+      const replacement = control.awaitWorkspaceRuntimeQuiesced()
 
-    expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
-    expect(peerPermit?.signal.aborted).toBe(false)
-    expect(disposablePermit?.signal.aborted).toBe(true)
-    expect(disposableAborted).toBe(true)
-    expect(() => runtime.runWorkspaceRead('repository-query', async () => undefined)).toThrow(
-      'WorkspaceRuntimeClosed:repository-query:QUIESCING',
-    )
-    const child = runtime.reserveWorkspaceChild(
-      peerPermit as Parameters<typeof runtime.reserveWorkspaceChild>[0],
-      'post-commit',
-    )
-    await runtime.runWorkspacePhase(child, async () => undefined)
+      expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
+      expect(peerPermit?.signal.aborted).toBe(false)
+      expect(disposablePermit?.signal.aborted).toBe(true)
+      expect(disposableAborted).toBe(true)
+      expect(() => runtime.runWorkspaceRead('repository-query', async () => undefined)).toThrow(
+        'WorkspaceRuntimeClosed:repository-query:QUIESCING',
+      )
+      const child = runtime.reserveWorkspaceChild(
+        peerPermit as Parameters<typeof runtime.reserveWorkspaceChild>[0],
+        'post-commit',
+      )
+      await runtime.runWorkspacePhase(child, async () => undefined)
 
-    releasePeer()
-    await peer
-    await disposable
-    await replacement
-    expect(peerPermit?.signal.aborted).toBe(false)
-    expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
-      state: 'QUIESCED',
-      resourcesQuiesced: true,
+      releasePeer()
+      await peer
+      await disposable
+      await replacement
+      expect(peerPermit?.signal.aborted).toBe(false)
+      expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
+        state: 'QUIESCED',
+        resourcesQuiesced: true,
+      })
+      expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['conversation-generation']).toBe(
+        'block',
+      )
+      expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['chat-metadata']).toBe('drain')
+      expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['cache-refresh']).toBe('cancel')
     })
-    expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['conversation-generation']).toBe('block')
-    expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['chat-metadata']).toBe('drain')
-    expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['cache-refresh']).toBe('cancel')
   })
 
   it('drains cleanup started by graceful resource abort before proving closure', async () => {
-    const { control } = createRuntimeHarness()
+    const { control, runtime } = createRuntimeHarness()
     let producerAttached = false
     let producerAborted = false
     let releaseAbortCleanup!: () => void
@@ -702,19 +846,19 @@ describe('workspace runtime resource manifest', () => {
     await control.resumeWorkspaceRuntimeResources(opening)
     await control.finishWorkspaceRuntimeReconciliation(fence)
 
-    const replacement = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
-      requireIdle: false,
-    })
-    expect(replacement).not.toBeNull()
-    const quiescing = control.awaitWorkspaceRuntimeQuiesced()
-    await vi.waitFor(() => expect(producerAborted).toBe(true))
-    expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
+    await withRequiredReplacement(runtime, control, async ({ launch }) => {
+      const replacement = launch()
+      expect(replacement).not.toBeNull()
+      const quiescing = control.awaitWorkspaceRuntimeQuiesced()
+      await vi.waitFor(() => expect(producerAborted).toBe(true))
+      expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
 
-    releaseAbortCleanup()
-    await quiescing
-    expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
-      state: 'QUIESCED',
-      resourcesQuiesced: true,
+      releaseAbortCleanup()
+      await quiescing
+      expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
+        state: 'QUIESCED',
+        resourcesQuiesced: true,
+      })
     })
   })
 
@@ -841,33 +985,37 @@ describe('workspace runtime resource manifest', () => {
       },
       { lineageId: 'generation:late-copy-blocker' },
     )
-    let promoted = false
-    const promotion = runtime
-      .waitForWorkspaceRuntimeReplacementBlockers({ lineageId: 'foreground-import' })
-      .then(() => {
-        const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
-          lineageId: 'foreground-import',
-          requireIdle: false,
-        })
-        promoted = authority !== null
-        return authority
-      })
+    await withRequiredReplacement(
+      runtime,
+      control,
+      async ({ launch }) => {
+        let promoted = false
+        const promotion = runtime
+          .waitForWorkspaceRuntimeReplacementBlockers({ lineageId: 'foreground-import' })
+          .then(() => {
+            const authority = launch()
+            promoted = authority !== null
+            return authority
+          })
 
-    await Promise.resolve()
-    expect(promoted).toBe(false)
-    expect(generationAborted).toBe(false)
-    expect(runtime.getWorkspaceRuntimeState()).toBe('RUNNING')
+        await Promise.resolve()
+        expect(promoted).toBe(false)
+        expect(generationAborted).toBe(false)
+        expect(runtime.getWorkspaceRuntimeState()).toBe('RUNNING')
 
-    releaseGeneration()
-    await generation
-    const authority = await promotion
-    expect(authority).not.toBeNull()
-    expect(generationAborted).toBe(false)
-    expect(runtime.getWorkspaceRuntimeState()).toBe('QUIESCING')
-    expect(() => runtime.runWorkspaceAction('conversation-generation', () => undefined)).toThrow(
-      'WorkspaceRuntimeClosed:conversation-generation:QUIESCING',
+        releaseGeneration()
+        await generation
+        const authority = await promotion
+        expect(authority).not.toBeNull()
+        expect(generationAborted).toBe(false)
+        expect(runtime.getWorkspaceRuntimeState()).toBe('QUIESCING')
+        expect(() =>
+          runtime.runWorkspaceAction('conversation-generation', () => undefined),
+        ).toThrow('WorkspaceRuntimeClosed:conversation-generation:QUIESCING')
+        await control.awaitWorkspaceRuntimeQuiesced()
+      },
+      { lineageId: 'foreground-import' },
     )
-    await control.awaitWorkspaceRuntimeQuiesced()
   })
 
   it('waits for maintenance readiness without admitting replacement or blocking unrelated generation', async () => {
@@ -880,7 +1028,9 @@ describe('workspace runtime resource manifest', () => {
     const recoveryGate = new Promise<void>((resolve) => {
       releaseRecovery = resolve
     })
+    let continuation!: WorkspaceReplacementContinuation
     const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', async (permit) => {
+      continuation = runtime.claimWorkspaceReplacementContinuation(permit)
       const recovery = runtime.runWorkspaceAction('stream-recovery', () => recoveryGate)
       let ready = false
       const waiting = runtime
@@ -903,14 +1053,19 @@ describe('workspace runtime resource manifest', () => {
       await waiting
       expect(
         control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+          continuation,
           lineageId: permit.lineageId,
           requireIdle: true,
         }),
       ).not.toBeNull()
     })
     if (!maintenance) throw new Error('Expected maintenance admission')
-    await maintenance
-    await control.awaitWorkspaceRuntimeQuiesced()
+    try {
+      await maintenance
+      await control.awaitWorkspaceRuntimeQuiesced()
+    } finally {
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+    }
   })
 
   it('promotes maintenance from the settled release of one overlapping local root', async () => {
@@ -925,7 +1080,9 @@ describe('workspace runtime resource manifest', () => {
     })
     let promoted = false
 
+    let continuation!: WorkspaceReplacementContinuation
     const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', async (permit) => {
+      continuation = runtime.claimWorkspaceReplacementContinuation(permit)
       const localRoot = runtime.runWorkspaceAction('chat-metadata', () => localRootGate)
       const promotion = runtime
         .waitForWorkspaceRuntimeReplacementBlockers({
@@ -935,6 +1092,7 @@ describe('workspace runtime resource manifest', () => {
         })
         .then(() => {
           const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+            continuation,
             lineageId: permit.lineageId,
             requireIdle: true,
           })
@@ -952,11 +1110,14 @@ describe('workspace runtime resource manifest', () => {
       expect(authority).not.toBeNull()
     })
     if (!maintenance) throw new Error('Expected maintenance admission')
-    await maintenance
-
-    expect(promoted).toBe(true)
-    expect(runtime.getWorkspaceRuntimeState()).toBe('QUIESCING')
-    await control.awaitWorkspaceRuntimeQuiesced()
+    try {
+      await maintenance
+      expect(promoted).toBe(true)
+      expect(runtime.getWorkspaceRuntimeState()).toBe('QUIESCING')
+      await control.awaitWorkspaceRuntimeQuiesced()
+    } finally {
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+    }
   })
 
   it('rechecks idle admission after readiness and wakes when the last reserved child releases', async () => {
@@ -965,15 +1126,18 @@ describe('workspace runtime resource manifest', () => {
     const fence = { workspaceId: 'workspace-replacement-readiness-race', replacementEpoch: 0 }
     runtime.workspaceRuntimeInternal.beginReconciliation(fence)
     runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let continuation!: WorkspaceReplacementContinuation
     const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', async (permit) => {
-      const options = { lineageId: permit.lineageId, signal: permit.signal, requireIdle: true }
-      await runtime.waitForWorkspaceRuntimeReplacementBlockers(options)
+      continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+      const options = { continuation, lineageId: permit.lineageId, requireIdle: true }
+      const readiness = { lineageId: permit.lineageId, signal: permit.signal, requireIdle: true }
+      await runtime.waitForWorkspaceRuntimeReplacementBlockers(readiness)
       const child = await runtime.runWorkspaceAction('chat-metadata', (parent) =>
         runtime.reserveWorkspaceChild(parent, 'post-commit'),
       )
       expect(control.launchWorkspaceRuntimeReplacementNow('maintenance', options)).toBeNull()
       let ready = false
-      const waiting = runtime.waitForWorkspaceRuntimeReplacementBlockers(options).then(() => {
+      const waiting = runtime.waitForWorkspaceRuntimeReplacementBlockers(readiness).then(() => {
         ready = true
       })
       await Promise.resolve()
@@ -983,8 +1147,12 @@ describe('workspace runtime resource manifest', () => {
       expect(control.launchWorkspaceRuntimeReplacementNow('maintenance', options)).not.toBeNull()
     })
     if (!maintenance) throw new Error('Expected maintenance admission')
-    await maintenance
-    await control.awaitWorkspaceRuntimeQuiesced()
+    try {
+      await maintenance
+      await control.awaitWorkspaceRuntimeQuiesced()
+    } finally {
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+    }
   })
 
   it.each([false, true])(
@@ -1021,7 +1189,7 @@ describe('workspace runtime resource manifest', () => {
     },
   )
 
-  it('keeps caller cancellation linked after promotion to replacement authority', () => {
+  it('keeps caller cancellation linked after promotion to replacement authority', async () => {
     const { control, runtime } = createRuntimeHarness()
     installNoopResourceManifest(control)
     const fence = { workspaceId: 'workspace-replacement-cancellation', replacementEpoch: 0 }
@@ -1030,17 +1198,22 @@ describe('workspace runtime resource manifest', () => {
     const caller = new AbortController()
     const reason = new Error('replacement-caller-cancelled')
 
-    const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
-      signal: caller.signal,
-      requireIdle: false,
-    })
-    if (!authority) throw new Error('Expected replacement authority')
-    expect(authority.signal.aborted).toBe(false)
+    await withRequiredReplacement(
+      runtime,
+      control,
+      async ({ launch }) => {
+        const authority = launch()
+        if (!authority) throw new Error('Expected replacement authority')
+        expect(authority.signal.aborted).toBe(false)
 
-    caller.abort(reason)
+        caller.abort(reason)
 
-    expect(authority.signal.aborted).toBe(true)
-    expect(authority.signal.reason).toBe(reason)
+        expect(authority.signal.aborted).toBe(true)
+        expect(authority.signal.reason).toBe(reason)
+        await control.awaitWorkspaceRuntimeQuiesced()
+      },
+      { signal: caller.signal },
+    )
   })
 
   it('transfers a promoted maintenance root away from producer cancellation', async () => {
@@ -1051,11 +1224,14 @@ describe('workspace runtime resource manifest', () => {
     runtime.workspaceRuntimeInternal.finishReconciliation(fence)
     const producer = new AbortController()
     let authoritySignal: AbortSignal | undefined
+    let continuation!: WorkspaceReplacementContinuation
 
     const maintenance = runtime.tryRunWorkspaceActionIfIdle(
       'maintenance',
       (permit) => {
+        continuation = runtime.claimWorkspaceReplacementContinuation(permit)
         const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+          continuation,
           lineageId: permit.lineageId,
           requireIdle: false,
         })
@@ -1065,12 +1241,15 @@ describe('workspace runtime resource manifest', () => {
       { signal: producer.signal },
     )
     if (!maintenance) throw new Error('Expected maintenance admission')
-    await maintenance
-
-    producer.abort(new Error('producer resource closed'))
-
-    expect(authoritySignal?.aborted).toBe(false)
-    await control.awaitWorkspaceRuntimeQuiesced()
+    try {
+      await maintenance
+      producer.abort(new Error('producer resource closed'))
+      expect(authoritySignal?.aborted).toBe(false)
+      expect(continuation.signal.aborted).toBe(false)
+      await control.awaitWorkspaceRuntimeQuiesced()
+    } finally {
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+    }
   })
 
   it('promotes an admitted replacement lineage without a second active root', async () => {
@@ -1082,22 +1261,18 @@ describe('workspace runtime resource manifest', () => {
     let authoritySignal: AbortSignal | undefined
     let permitSignal: AbortSignal | undefined
 
-    await runtime.runWorkspaceAction('workspace-replacement', (permit) => {
+    await withRequiredReplacement(runtime, control, async ({ permit, launch }) => {
       permitSignal = permit.signal
-      const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
-        lineageId: permit.lineageId,
-        requireIdle: false,
-      })
+      const authority = launch()
       if (!authority) throw new Error('Expected import replacement authority')
       authoritySignal = authority.signal
       expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
-    })
-
-    expect(authoritySignal).toBe(permitSignal)
-    await control.awaitWorkspaceRuntimeQuiesced()
-    expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
-      state: 'QUIESCED',
-      resourcesQuiesced: true,
+      expect(authoritySignal).toBe(permitSignal)
+      await control.awaitWorkspaceRuntimeQuiesced()
+      expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
+        state: 'QUIESCED',
+        resourcesQuiesced: true,
+      })
     })
   })
 
@@ -1106,7 +1281,7 @@ describe('workspace runtime resource manifest', () => {
       Parameters<typeof tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle>[0]
     >
 
-    expectTypeOf<keyof MaintenanceAuthorityOptions>().toEqualTypeOf<'lineageId'>()
+    expectTypeOf<keyof MaintenanceAuthorityOptions>().toEqualTypeOf<'continuation' | 'lineageId'>()
   })
 
   it('preempts maintenance replacement for a foreground intent and admits it after rollback', async () => {
@@ -1122,29 +1297,314 @@ describe('workspace runtime resource manifest', () => {
       releaseDemand = resolve
     })
     const demandOwner = runtime.claimWorkspaceRuntimeDemandBoundary(() => demand)
-    const maintenance = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
-      requireIdle: true,
+    let continuation!: WorkspaceReplacementContinuation
+    const starting = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+      continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+      return control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+        continuation,
+        lineageId: permit.lineageId,
+        requireIdle: true,
+      })
     })
-    if (!maintenance) throw new Error('Expected maintenance replacement authority')
+    if (!starting) throw new Error('Expected maintenance producer admission')
+    try {
+      const maintenance = await starting
+      if (!maintenance) throw new Error('Expected maintenance replacement authority')
 
-    let admitted = 0
-    const foreground = runtime.runWorkspaceAction('message-edit', () => {
-      admitted += 1
+      let admitted = 0
+      const foreground = runtime.runWorkspaceAction('message-edit', () => {
+        admitted += 1
+      })
+
+      expect(maintenance.signal.aborted).toBe(true)
+      expect(maintenance.signal.reason).toBeInstanceOf(WorkspaceMaintenancePreemptedError)
+      expect(admitted).toBe(0)
+
+      await control.awaitWorkspaceRuntimeQuiesced()
+      const rollback = control.beginWorkspaceRuntimeReconciliation(fence)
+      await control.resumeWorkspaceRuntimeResources(rollback)
+      await control.finishWorkspaceRuntimeReconciliation(fence)
+      releaseDemand()
+      await foreground
+
+      expect(admitted).toBe(1)
+    } finally {
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+      runtime.releaseWorkspaceRuntimeDemandBoundary(demandOwner)
+    }
+  })
+
+  it('cancels untransferred continuation with its producer and removes that link on release', async () => {
+    const { runtime } = createRuntimeHarness()
+    const fence = { workspaceId: 'continuation-producer', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    const producer = new AbortController()
+    let continuation!: WorkspaceReplacementContinuation
+    let finish!: () => void
+    const active = runtime.tryRunWorkspaceActionIfIdle(
+      'maintenance',
+      (permit) => {
+        continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+        return new Promise<void>((resolve) => {
+          finish = resolve
+        })
+      },
+      { signal: producer.signal },
+    )
+    if (!active) throw new Error('Expected maintenance admission')
+    const reason = new Error('producer stopped before handoff')
+    producer.abort(reason)
+    expect(continuation.signal.reason).toBe(reason)
+    runtime.releaseWorkspaceReplacementContinuation(continuation)
+    runtime.releaseWorkspaceReplacementContinuation(continuation)
+    finish()
+    await active
+
+    const releasedProducer = new AbortController()
+    const released = runtime.tryRunWorkspaceActionIfIdle(
+      'maintenance',
+      (permit) => {
+        const owner = runtime.claimWorkspaceReplacementContinuation(permit)
+        runtime.releaseWorkspaceReplacementContinuation(owner)
+        releasedProducer.abort(new Error('released producer stopped'))
+        expect(owner.signal.aborted).toBe(false)
+        return owner
+      },
+      { signal: releasedProducer.signal },
+    )
+    if (!released) throw new Error('Expected maintenance admission')
+    const owner = await released
+    await runtime.runWorkspaceAction('workspace-replacement', (permit) => {
+      runtime.preemptWorkspaceMaintenancePreparation(permit)
     })
+    expect(owner.signal.aborted).toBe(false)
+  })
 
-    expect(maintenance.signal.aborted).toBe(true)
-    expect(maintenance.signal.reason).toBeInstanceOf(WorkspaceMaintenancePreemptedError)
-    expect(admitted).toBe(0)
-
-    await control.awaitWorkspaceRuntimeQuiesced()
-    const rollback = control.beginWorkspaceRuntimeReconciliation(fence)
-    await control.resumeWorkspaceRuntimeResources(rollback)
+  it('retains continuation across producer close, foreground preemption, and a fresh runtime round', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'continuation-rounds', replacementEpoch: 0 }
+    const opening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(opening)
     await control.finishWorkspaceRuntimeReconciliation(fence)
-    releaseDemand()
-    await foreground
+    const producer = new AbortController()
+    const initial = runtime.tryRunWorkspaceActionIfIdle(
+      'maintenance',
+      (permit) => {
+        const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+        const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+          continuation,
+          lineageId: permit.lineageId,
+          requireIdle: true,
+        })
+        if (!authority) throw new Error('Expected first round')
+        return { continuation, authority, generation: permit.runtimeGeneration }
+      },
+      { signal: producer.signal },
+    )
+    if (!initial) throw new Error('Expected maintenance admission')
+    const first = await initial
+    producer.abort(new Error('scheduler closed after handoff'))
+    expect(first.continuation.signal.aborted).toBe(false)
+    expect(first.authority.signal.aborted).toBe(false)
 
-    expect(admitted).toBe(1)
-    runtime.releaseWorkspaceRuntimeDemandBoundary(demandOwner)
+    const demand = runtime.claimWorkspaceForegroundDemand()
+    expect(first.authority.signal.reason).toBeInstanceOf(WorkspaceMaintenancePreemptedError)
+    expect(first.continuation.signal.aborted).toBe(false)
+    runtime.releaseWorkspaceForegroundDemand(demand)
+    await control.awaitWorkspaceRuntimeQuiesced()
+    const reopening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(reopening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    expect(first.continuation.signal.aborted).toBe(false)
+
+    const next = runtime.tryRunWorkspaceActionIfIdle(
+      'maintenance',
+      (permit) => {
+        expect(permit.runtimeGeneration).toBeGreaterThan(first.generation)
+        expect(() => runtime.assertWorkspaceExecutionPermit(first.authority)).toThrow()
+        return control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+          continuation: first.continuation,
+          lineageId: permit.lineageId,
+          requireIdle: true,
+        })
+      },
+      { signal: first.continuation.signal },
+    )
+    if (!next) throw new Error('Expected fresh maintenance admission')
+    const second = await next
+    if (!second) throw new Error('Expected second round')
+    expect(second.signal).not.toBe(first.authority.signal)
+    runtime.cancelWorkspaceReplacementContinuation(first.continuation, 'shutdown')
+    expect(second.signal.reason).toBe(first.continuation.signal.reason)
+    expect(second.signal.reason).toBeInstanceOf(WorkspaceReplacementContinuationCancelledError)
+    await control.awaitWorkspaceRuntimeQuiesced()
+    runtime.releaseWorkspaceReplacementContinuation(first.continuation)
+  })
+
+  it('preempts continuation synchronously in the RUNNING handback gap without a maintenance root', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'continuation-handback', replacementEpoch: 0 }
+    const opening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(opening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    const initial = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+      const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+      const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+        continuation,
+        lineageId: permit.lineageId,
+        requireIdle: true,
+      })
+      if (!authority) throw new Error('Expected replacement round')
+      return continuation
+    })
+    if (!initial) throw new Error('Expected maintenance admission')
+    const continuation = await initial
+    await control.awaitWorkspaceRuntimeQuiesced()
+    const reopening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(reopening)
+    const required: Promise<void>[] = []
+    const unsubscribe = runtime.subscribeWorkspaceRuntimeState(() => {
+      if (runtime.getWorkspaceRuntimeState() !== 'RUNNING') return
+      required.push(
+        runtime.runWorkspaceAction('workspace-replacement', (permit) => {
+          runtime.preemptWorkspaceMaintenancePreparation(permit)
+          expect(continuation.signal.aborted).toBe(true)
+        }),
+      )
+    })
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    unsubscribe()
+    expect(required).toHaveLength(1)
+    await Promise.all(required)
+    expect(continuation.signal.reason).toBeInstanceOf(
+      WorkspaceReplacementContinuationCancelledError,
+    )
+    expect(continuation.signal.reason).toMatchObject({ reason: 'required-replacement' })
+    let resumed = false
+    expect(() =>
+      runtime.tryRunWorkspaceActionIfIdle(
+        'maintenance',
+        () => {
+          resumed = true
+        },
+        { signal: continuation.signal },
+      ),
+    ).toThrow(continuation.signal.reason)
+    expect(resumed).toBe(false)
+    runtime.releaseWorkspaceReplacementContinuation(continuation)
+  })
+
+  it.each(['abortive-quiesce', 'seal', 'invariant-seal'] as const)(
+    'cancels retained continuation on %s without counting it as active runtime work',
+    async (closing) => {
+      const { runtime } = createRuntimeHarness()
+      const fence = { workspaceId: `continuation-${closing}`, replacementEpoch: 0 }
+      runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+      runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+      const initial = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+        const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+        const authority = runtime.workspaceRuntimeInternal.launchReplacementNow(
+          'maintenance',
+          {
+            continuation,
+            lineageId: permit.lineageId,
+            requireIdle: true,
+          },
+          () => undefined,
+        )
+        if (!authority) throw new Error('Expected replacement round')
+        return continuation
+      })
+      if (!initial) throw new Error('Expected maintenance admission')
+      const continuation = await initial
+      runtime.workspaceRuntimeInternal.markQuiesced()
+      if (closing === 'seal') {
+        runtime.workspaceRuntimeInternal.seal()
+      } else {
+        runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+        if (closing === 'invariant-seal') {
+          runtime.workspaceRuntimeInternal.sealAfterClosedInvariantFailure()
+        } else {
+          runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+          runtime.workspaceRuntimeInternal.beginQuiesce()
+          runtime.workspaceRuntimeInternal.markQuiesced()
+        }
+      }
+      expect(continuation.signal.reason).toBeInstanceOf(
+        WorkspaceReplacementContinuationCancelledError,
+      )
+      expect(continuation.signal.reason).toMatchObject({ reason: 'shutdown' })
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+    },
+  )
+
+  it.each(['QUIESCING', 'QUIESCED', 'FAILED_CLOSED'] as const)(
+    'cancels a retained continuation when explicit shutdown finds runtime already %s',
+    async (closedState) => {
+      const { control, runtime } = createRuntimeHarness()
+      installNoopResourceManifest(control)
+      const fence = { workspaceId: `continuation-closed-${closedState}`, replacementEpoch: 0 }
+      runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+      runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+      const initial = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+        const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+        const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+          continuation,
+          lineageId: permit.lineageId,
+          requireIdle: true,
+        })
+        if (!authority) throw new Error('Expected replacement round')
+        return continuation
+      })
+      if (!initial) throw new Error('Expected maintenance admission')
+      const continuation = await initial
+      if (closedState === 'QUIESCED') await control.awaitWorkspaceRuntimeQuiesced()
+      if (closedState === 'FAILED_CLOSED') runtime.workspaceRuntimeInternal.markFailedClosed()
+      expect(continuation.signal.aborted).toBe(false)
+      control.beginWorkspaceRuntimeQuiesce()
+      expect(runtime.getWorkspaceRuntimeState()).toBe(closedState)
+      expect(continuation.signal.reason).toBeInstanceOf(
+        WorkspaceReplacementContinuationCancelledError,
+      )
+      expect(continuation.signal.reason).toMatchObject({ reason: 'shutdown' })
+      if (closedState === 'QUIESCING') await control.awaitWorkspaceRuntimeQuiesced()
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+    },
+  )
+
+  it('releases the last authority cancellation listener without awaiting another reopen', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'continuation-authority-release', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    const initial = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+      const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+      const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+        continuation,
+        lineageId: permit.lineageId,
+        requireIdle: true,
+      })
+      if (!authority) throw new Error('Expected replacement round')
+      return { continuation, authority }
+    })
+    if (!initial) throw new Error('Expected maintenance admission')
+    const { continuation, authority } = await initial
+    const remove = vi.spyOn(continuation.signal, 'removeEventListener')
+    runtime.releaseWorkspaceReplacementContinuation(continuation)
+    runtime.releaseWorkspaceReplacementContinuation(continuation)
+    expect(remove).toHaveBeenCalledExactlyOnceWith('abort', expect.any(Function))
+    expect(authority.signal.aborted).toBe(false)
+    await control.awaitWorkspaceRuntimeQuiesced()
+    const reopening = control.beginWorkspaceRuntimeReconciliation(fence)
+    expect(remove).toHaveBeenCalledTimes(1)
+    expect(authority.signal.aborted).toBe(true)
+    await control.resumeWorkspaceRuntimeResources(reopening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    remove.mockRestore()
   })
 
   it('attaches every capability before RUNNING and starts background work after the commit', async () => {
@@ -1983,3 +2443,110 @@ function resourceStatus(
   return control.getWorkspaceRuntimeResourceStatuses().find((resource) => resource.id === id)
     ?.status
 }
+
+describe('replacement shutdown during bootstrap', () => {
+  it('records initial shutdown without attempting to quiesce a missing workspace identity', () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    expect(() => control.beginWorkspaceRuntimeQuiesce()).not.toThrow()
+    expect(runtime.getWorkspaceRuntimeState()).toBe('STARTING')
+  })
+
+  it('cancels continuation during reconciliation while bootstrap retains rollback ownership', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'continuation-shutdown-reconciling', replacementEpoch: 0 }
+    const opening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(opening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    const started = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+      const continuation = runtime.claimWorkspaceReplacementContinuation(permit)
+      const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
+        continuation,
+        lineageId: permit.lineageId,
+        requireIdle: true,
+      })
+      if (!authority) throw new Error('Expected replacement round')
+      return continuation
+    })
+    if (!started) throw new Error('Expected maintenance admission')
+    const continuation = await started
+    try {
+      await control.awaitWorkspaceRuntimeQuiesced()
+      control.beginWorkspaceRuntimeReconciliation(fence)
+      control.beginWorkspaceRuntimeQuiesce()
+      expect(runtime.getWorkspaceRuntimeState()).toBe('RECONCILING')
+      expect(continuation.signal.reason).toBeInstanceOf(
+        WorkspaceReplacementContinuationCancelledError,
+      )
+      expect(continuation.signal.reason).toMatchObject({ reason: 'shutdown' })
+      await expect(control.abortWorkspaceRuntimeReconciliation()).resolves.toEqual([])
+      expect(runtime.getWorkspaceRuntimeState()).toBe('QUIESCED')
+    } finally {
+      runtime.releaseWorkspaceReplacementContinuation(continuation)
+    }
+  })
+})
+
+describe('shared replacement continuation custody', () => {
+  it('retains shutdown after caller cancellation without replacing the exact first abort reason', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'required-continuation-shutdown', replacementEpoch: 0 }
+    const opening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(opening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    const caller = new AbortController()
+    const callerReason = new DOMException('required caller cancelled', 'AbortError')
+    await withRequiredReplacement(
+      runtime,
+      control,
+      async ({ continuation, launch }) => {
+        const authority = launch()
+        if (!authority) throw new Error('Expected required replacement authority')
+        caller.abort(callerReason)
+        expect(continuation.signal.reason).toBe(callerReason)
+        expect(authority.signal.reason).toBe(callerReason)
+        expect(continuation.cancellationReason).toBeNull()
+        control.beginWorkspaceRuntimeQuiesce()
+        expect(continuation.cancellationReason).toBeInstanceOf(
+          WorkspaceReplacementContinuationCancelledError,
+        )
+        expect(continuation.cancellationReason?.reason).toBe('shutdown')
+        const shutdownReason = continuation.cancellationReason
+        runtime.cancelWorkspaceReplacementContinuation(continuation, 'required-replacement')
+        control.beginWorkspaceRuntimeQuiesce()
+        expect(continuation.cancellationReason).toBe(shutdownReason)
+        expect(continuation.signal.reason).toBe(callerReason)
+        await control.awaitWorkspaceRuntimeQuiesced()
+      },
+      { signal: caller.signal },
+    )
+  })
+
+  it('keeps required custody through authority retirement and cancels it in the reopen gap', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'required-continuation-retirement', replacementEpoch: 0 }
+    const opening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(opening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    await withRequiredReplacement(runtime, control, async ({ continuation, launch }) => {
+      const authority = launch()
+      if (!authority) throw new Error('Expected required replacement authority')
+      await control.awaitWorkspaceRuntimeQuiesced()
+      const reopening = control.beginWorkspaceRuntimeReconciliation(fence)
+      expect(authority.signal.aborted).toBe(true)
+      expect(continuation.signal.aborted).toBe(false)
+      await control.resumeWorkspaceRuntimeResources(reopening)
+      await control.finishWorkspaceRuntimeReconciliation(fence)
+      await runtime.runWorkspaceAction('workspace-replacement', (permit) => {
+        runtime.preemptWorkspaceMaintenancePreparation(permit)
+      })
+      expect(continuation.signal.aborted).toBe(false)
+      control.beginWorkspaceRuntimeQuiesce()
+      expect(continuation.cancellationReason?.reason).toBe('shutdown')
+      await control.awaitWorkspaceRuntimeQuiesced()
+    })
+  })
+})

@@ -1,3 +1,5 @@
+import type { TestCompilerProof, VerificationCompilerEvidence, VerificationMetadata } from './run-verification.mjs'
+import type { VerificationAssurance, VerificationPolicy, VerificationStage } from './run-verification.mjs'
 import type { Writable } from 'node:stream'
 import type { SliceVerificationPlan, VerificationSnapshot } from './verification-impact-plan.mjs'
 import type {
@@ -6,13 +8,16 @@ import type {
 } from './verification-candidate-workspace.mjs'
 
 export interface SliceTaskBatch {
+  readonly stage: VerificationStage
   readonly id: string
   readonly kind: 'node' | 'playwright' | 'vitest'
   readonly command: string
   readonly args: readonly string[]
+  readonly browserTasks?: readonly { project: string; files: readonly string[] }[]
 }
 
 export interface SliceBatchExecution {
+  readonly evidence?: VerificationCompilerEvidence
   readonly exitCode: number | null
   readonly signal: NodeJS.Signals | null
   readonly diagnostics: readonly string[]
@@ -38,11 +43,15 @@ export interface SliceVerificationSummary {
   readonly openGuarantees: readonly { readonly id: string; readonly status: string }[]
   readonly unregisteredAffectedTests: readonly string[]
   readonly batches: readonly {
+    readonly evidence?: VerificationCompilerEvidence | null
     readonly id: string
+    readonly stageId: string
+    readonly policy: VerificationPolicy
+    readonly assurance: VerificationAssurance
     readonly kind: SliceTaskBatch['kind']
     readonly command: string
     readonly args: readonly string[]
-    readonly status: 'failed' | 'passed' | 'planned'
+    readonly status: 'failed' | 'inventoried' | 'passed' | 'planned'
     readonly exitCode: number | null
     readonly signal: NodeJS.Signals | null
     readonly diagnostics: readonly string[]
@@ -91,6 +100,8 @@ export interface SliceVerificationOptions {
 }
 
 export interface PreparedSliceVerificationOptions {
+  readonly metadata?: VerificationMetadata
+  readonly testCompilerProof?: TestCompilerProof
   readonly baselineId: string
   readonly evidenceRoot?: string
   readonly runtimeRoot: string

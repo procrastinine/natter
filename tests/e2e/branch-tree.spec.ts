@@ -646,31 +646,23 @@ test('shared and child connector targets remain distinct and shared insertion mo
   await page.getByRole('button', { name: 'Import', exact: true }).click()
 
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
-  const databaseName = await activeWorkspaceDatabaseName(page)
+
   const topology = await page.evaluate(
-    async ({ chatId, databaseName }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-          const tx = db.transaction(['messages'], 'readonly')
-          const request = tx.objectStore('messages').getAll()
-          request.onsuccess = () =>
-            resolve(
-              (request.result as Array<Record<string, unknown>>).filter(
-                (row) => row.chatId === chatId,
-              ),
-            )
-          request.onerror = () => reject(request.error)
-        })
-      } finally {
-        db.close()
-      }
+    async ({ chatId }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          return (await request(
+            db
+              .transaction('messages', 'readonly')
+              .objectStore('messages')
+              .index('chatId')
+              .getAll(chatId),
+          )) as Array<Record<string, unknown>>
+        },
+      )
     },
-    { chatId: fixture.chatId, databaseName },
+    { chatId: fixture.chatId },
   )
   const sourceIds = new Set([fixture.root, fixture.A1, fixture.A2, fixture.B1, fixture.B2])
   const inserted = topology.find((row) => typeof row.id === 'string' && !sourceIds.has(row.id))
@@ -750,36 +742,25 @@ test('every leaf exposes an append target that inserts a child after it', async 
 
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
   await expect(leafTargets).toHaveCount(2)
-  const databaseName = await activeWorkspaceDatabaseName(page)
+
   const inserted = await page.evaluate(
-    async ({ chatId, databaseName, sourceIds }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        return await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
-          const tx = db.transaction(['messages'], 'readonly')
-          const request = tx.objectStore('messages').getAll()
-          request.onsuccess = () =>
-            resolve(
-              (request.result as Array<Record<string, unknown>>).find(
-                (row) =>
-                  row.chatId === chatId &&
-                  typeof row.id === 'string' &&
-                  !sourceIds.includes(row.id),
-              ),
-            )
-          request.onerror = () => reject(request.error)
-        })
-      } finally {
-        db.close()
-      }
+    async ({ chatId, sourceIds }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
+          const rows = (await request(
+            db
+              .transaction('messages', 'readonly')
+              .objectStore('messages')
+              .index('chatId')
+              .getAll(chatId),
+          )) as Array<Record<string, unknown>>
+          return rows.find((row) => typeof row.id === 'string' && !sourceIds.includes(row.id))
+        },
+      )
     },
     {
       chatId: fixture.chatId,
-      databaseName,
       sourceIds: [fixture.root, fixture.A1, fixture.A2, fixture.B1, fixture.B2],
     },
   )
@@ -1331,7 +1312,7 @@ async function seedBranchTreeChat(
   const now = Date.now()
   const chatId = 'branch-tree-chat'
   const modelId = 'google/gemini-3.1-flash-lite-preview:free'
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -1576,37 +1557,23 @@ async function readStoredMessage(
   page: Page,
   messageId: string,
 ): Promise<Record<string, unknown> | undefined> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, id }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        return await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
+    async ({ id }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, request) => {
           const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
-          const headerRequest = tx.objectStore('messages').get(id)
-          headerRequest.onsuccess = () => {
-            const header = headerRequest.result as Record<string, unknown> | undefined
-            if (!header) {
-              resolve(undefined)
-              return
-            }
-            const bodyRequest = tx.objectStore('messageBodies').get(id)
-            bodyRequest.onsuccess = () => {
-              const body = bodyRequest.result as Record<string, unknown> | undefined
-              resolve(body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header)
-            }
-            bodyRequest.onerror = () => reject(bodyRequest.error)
-          }
-          headerRequest.onerror = () => reject(headerRequest.error)
-        })
-      } finally {
-        db.close()
-      }
+          const header = (await request(tx.objectStore('messages').get(id))) as
+            | Record<string, unknown>
+            | undefined
+          if (!header) return undefined
+          const body = (await request(tx.objectStore('messageBodies').get(id))) as
+            | Record<string, unknown>
+            | undefined
+          return body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header
+        },
+      )
     },
-    { databaseName, id: messageId },
+    { id: messageId },
   )
 }

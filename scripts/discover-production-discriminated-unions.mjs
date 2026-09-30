@@ -10,8 +10,15 @@ const DEFAULT_ROOT = resolve(import.meta.dirname, '..')
 
 export function discoverProductionDiscriminatedUnions(root = DEFAULT_ROOT, options = {}) {
   const program = options.program ?? createProductionTypeScriptProgram(root)
-  const checker = program.getTypeChecker()
   const productionSources = productionTypeScriptSources(program, root)
+  const requestedIds = options.unionIds === undefined ? undefined : new Set(options.unionIds)
+  if (requestedIds?.size === 0) {
+    return { sourceFiles: productionSources.length, discriminatedUnions: 0, unions: [] }
+  }
+  const checker = program.getTypeChecker()
+  const requestedProperties = requestedIds
+    ? new Set([...requestedIds].map((id) => id.slice(id.lastIndexOf('|') + 1)))
+    : undefined
   const unions = []
   const runtimeUnions = []
 
@@ -21,10 +28,23 @@ export function discoverProductionDiscriminatedUnions(root = DEFAULT_ROOT, optio
       if (!ts.isTypeAliasDeclaration(statement)) continue
       const type = checker.getTypeFromTypeNode(statement.type)
       if (!type.isUnion() || type.types.length < 2) continue
-      const discriminants = commonLiteralDiscriminants(type.types, statement, checker)
+      const discriminants = commonLiteralDiscriminants(
+        type.types,
+        statement,
+        checker,
+        requestedProperties,
+      )
       for (const discriminant of discriminants) {
+        const id = `${path}#${statement.name.text}|${discriminant.property}`
+        if (requestedIds && !requestedIds.has(id)) {
+          runtimeUnions.push({
+            entry: { id, property: discriminant.property, variants: discriminant.variants },
+            type,
+          })
+          continue
+        }
         const entry = {
-          id: `${path}#${statement.name.text}|${discriminant.property}`,
+          id,
           path,
           type: statement.name.text,
           property: discriminant.property,
@@ -62,8 +82,8 @@ export function discoverProductionDiscriminatedUnions(root = DEFAULT_ROOT, optio
     const occurrences = new Map()
     visit(source, (node) => {
       if (!ts.isObjectLiteralExpression(node)) return
-      const objectType = checker.getTypeAtLocation(node)
-      const contextualType = checker.getContextualType(node)
+      let objectType
+      let contextualType
       for (const property of node.properties) {
         if (!ts.isPropertyAssignment(property)) continue
         const propertyKey = propertyName(property.name)
@@ -73,14 +93,22 @@ export function discoverProductionDiscriminatedUnions(root = DEFAULT_ROOT, optio
           `${propertyKey}\u0000${String(variant)}`,
         )
         if (!candidates) continue
-        const assignable = candidates.filter(
+        const requestedCandidates = requestedIds
+          ? candidates.filter(({ entry }) => requestedIds.has(entry.id))
+          : candidates
+        if (requestedCandidates.length === 0) continue
+        if (!objectType) {
+          objectType = checker.getTypeAtLocation(node)
+          contextualType = checker.getContextualType(node)
+        }
+        const assignable = requestedCandidates.filter(
           (candidate) =>
             checker.isTypeAssignableTo(objectType, candidate.type) ||
             (contextualType !== undefined &&
               checker.isTypeAssignableTo(contextualType, candidate.type)),
         )
         const accepted =
-          assignable.length > 0 ? assignable : candidates.length === 1 ? candidates : []
+          assignable.length > 0 ? assignable : candidates.length === 1 ? requestedCandidates : []
         for (const candidate of accepted) {
           const owner = enclosingOwner(node)
           const start = source.getLineAndCharacterOfPosition(node.getStart(source))
@@ -104,14 +132,15 @@ export function discoverProductionDiscriminatedUnions(root = DEFAULT_ROOT, optio
     })
   }
 
-  for (const union of unions) {
+  const selectedUnions = requestedIds ? unions.filter(({ id }) => requestedIds.has(id)) : unions
+  for (const union of selectedUnions) {
     union.constructorSites.sort((left, right) => left.id.localeCompare(right.id))
   }
-  unions.sort((left, right) => left.id.localeCompare(right.id))
+  selectedUnions.sort((left, right) => left.id.localeCompare(right.id))
   return {
     sourceFiles: productionSources.length,
-    discriminatedUnions: unions.length,
-    unions,
+    discriminatedUnions: selectedUnions.length,
+    unions: selectedUnions,
   }
 }
 
@@ -119,12 +148,23 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   process.stdout.write(`${JSON.stringify(discoverProductionDiscriminatedUnions(), null, 2)}\n`)
 }
 
-function commonLiteralDiscriminants(members, declaration, checker) {
-  const commonNames = new Set(members[0].getProperties().map((property) => property.name))
-  for (const member of members.slice(1)) {
-    const names = new Set(member.getProperties().map((property) => property.name))
-    for (const name of commonNames) {
-      if (!names.has(name)) commonNames.delete(name)
+function commonLiteralDiscriminants(members, declaration, checker, requestedProperties) {
+  const commonNames = requestedProperties
+    ? new Set(requestedProperties)
+    : new Set(members[0].getProperties().map((property) => property.name))
+  if (requestedProperties) {
+    for (const member of members) {
+      for (const name of commonNames) {
+        if (!member.getProperty(name)) commonNames.delete(name)
+      }
+      if (commonNames.size === 0) return []
+    }
+  } else {
+    for (const member of members.slice(1)) {
+      const names = new Set(member.getProperties().map((property) => property.name))
+      for (const name of commonNames) {
+        if (!names.has(name)) commonNames.delete(name)
+      }
     }
   }
 

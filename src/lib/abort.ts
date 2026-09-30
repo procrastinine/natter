@@ -1,11 +1,3 @@
-import { errorFromUnknown } from './error'
-
-function abortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new DOMException('Request aborted.', 'AbortError')
-}
-
 export function raceWithAbortSignal<T>(
   start: () => T | PromiseLike<T>,
   signal?: AbortSignal,
@@ -14,10 +6,10 @@ export function raceWithAbortSignal<T>(
     try {
       return Promise.resolve(start())
     } catch (error) {
-      return Promise.reject(errorFromUnknown(error))
+      return Promise.reject(error)
     }
   }
-  if (signal.aborted) return Promise.reject(abortError(signal))
+  if (signal.aborted) return Promise.reject(signal.reason)
 
   return new Promise<T>((resolve, reject) => {
     let settled = false
@@ -27,19 +19,19 @@ export function raceWithAbortSignal<T>(
       signal.removeEventListener('abort', onAbort)
       publish()
     }
-    const onAbort = () => finish(() => reject(abortError(signal)))
+    const onAbort = () => finish(() => reject(signal.reason))
     signal.addEventListener('abort', onAbort, { once: true })
 
     let pending: T | PromiseLike<T>
     try {
       pending = start()
     } catch (error) {
-      finish(() => reject(errorFromUnknown(error)))
+      finish(() => reject(error))
       return
     }
     void Promise.resolve(pending).then(
       (value) => finish(() => resolve(value)),
-      (error: unknown) => finish(() => reject(errorFromUnknown(error))),
+      (error: unknown) => finish(() => reject(error)),
     )
   })
 }

@@ -264,6 +264,30 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
     'RUNNING',
   )
   await expect(observer).toHaveURL(new RegExp(`#/chat/${observerChatId}/message/[^/]+$`, 'u'))
+  const observerDiscovery = await observer.evaluate(async (modelId) => {
+    const [catalogResponse, endpointsResponse, privacyResponse] = await Promise.all([
+      fetch('https://openrouter.ai/api/v1/models'),
+      fetch(`https://openrouter.ai/api/v1/models/${modelId}/endpoints`),
+      fetch(`/_or_scrape/${modelId}/providers`),
+    ])
+    const catalog: unknown = await catalogResponse.json()
+    const endpoints: unknown = await endpointsResponse.json()
+    const privacyDocument = new DOMParser().parseFromString(
+      await privacyResponse.text(),
+      'text/html',
+    )
+    const privacy: unknown = JSON.parse(
+      privacyDocument.querySelector('#__NEXT_DATA__')?.textContent ?? 'null',
+    )
+    return { catalog, endpoints, privacy }
+  }, VIDEO_MODEL)
+  expect(observerDiscovery).toEqual({
+    catalog: openRouterModelsPayload(VIDEO_MODEL),
+    endpoints: openRouterEndpointsPayload(VIDEO_MODEL),
+    privacy: {
+      props: { pageProps: { providers: openRouterProviderPolicyRows(VIDEO_MODEL) } },
+    },
+  })
   const observerComposerForm = observer.locator(
     'form[data-ui="composer"]:not([data-presentation-only])',
   )
@@ -505,7 +529,7 @@ async function mockChatCompletions(
 }
 
 async function mockOpenAiDirect(page: Page, responsesRequests: CapturedRequest[]): Promise<void> {
-  await page.route('https://api.openai.com/v1/models**', async (route) => {
+  await page.context().route('https://api.openai.com/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -527,21 +551,21 @@ async function mockOpenAiDirect(page: Page, responsesRequests: CapturedRequest[]
 }
 
 async function mockOpenRouterDiscovery(page: Page, modelId: string = OSS_MODEL): Promise<void> {
-  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify(openRouterModelsPayload(modelId)),
     })
   })
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify(openRouterEndpointsPayload(modelId)),
     })
   })
-  await page.route('**/_or_scrape/**', async (route) => {
+  await page.context().route('**/_or_scrape/**', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'text/html',

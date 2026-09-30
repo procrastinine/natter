@@ -3,6 +3,8 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatRow } from '../../src/core/chat-metadata'
 import { probeBrowserWorkspaceCurrent } from '../../src/store/browser-workspace-current-probe'
+import { cleanPendingBrowserWorkspaceDatabase } from '../../src/store/browser-workspace-database-cleanup'
+import * as browserWorkspaceControl from '../../src/store/browser-workspace-database-control'
 import {
   __resetBrowserWorkspaceControlDatabaseForTests,
   readBrowserWorkspaceDatabaseManifest,
@@ -26,6 +28,7 @@ import {
 } from '../../src/store/browser-workspace-slot-coordination'
 import { ensureBrowserWorkspaceCurrentForSelection } from '../../src/store/browser-workspace-startup-repair'
 import { isValidChatSidebarFolderAggregateRow } from '../../src/store/chat-sidebar-projection'
+import * as browserWorkspaceDb from '../../src/store/db'
 import {
   __resetBrowserWorkspaceFatalInvalidationOwnerForTests,
   __resetDbForTests,
@@ -42,65 +45,49 @@ import {
   resumeBrowserWorkspaceSessionAdmissions,
 } from '../../src/store/db'
 import { installFreshFakeIndexedDbForTests } from '../helpers/fake-indexeddb'
+import { TestWebLockManager } from '../helpers/web-locks'
 
 const originalBroadcastChannel = globalThis.BroadcastChannel
 const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
 
-class ImmediateLockManager {
-  request<T>(
+class RecordingWebLockManager extends TestWebLockManager {
+  readonly requests: { readonly name: string; readonly mode: LockMode }[] = []
+  onRequest: ((name: string, options: LockOptions) => void) | null = null
+
+  override request<T>(
     name: string,
-    options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
-    callback: (lock: Lock) => Promise<T> | T,
+    optionsOrCallback: LockOptions | ((lock: Lock | null) => T | PromiseLike<T>),
+    callback?: (lock: Lock | null) => T | PromiseLike<T>,
   ): Promise<T> {
-    return Promise.resolve(callback({ name, mode: options.mode }))
+    const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
+    this.requests.push({ name, mode: options.mode ?? 'exclusive' })
+    const requested = super.request(name, optionsOrCallback, callback)
+    this.onRequest?.(name, options)
+    return requested
   }
 }
 
-class SerializedLockManager extends ImmediateLockManager {
-  private readonly tails = new Map<string, Promise<void>>()
-  readonly requests: { readonly name: string; readonly mode: 'shared' | 'exclusive' }[] = []
-
-  override async request<T>(
-    name: string,
-    options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
-    callback: (lock: Lock) => Promise<T> | T,
-  ): Promise<T> {
-    this.requests.push({ name, mode: options.mode })
-    const prior = this.tails.get(name) ?? Promise.resolve()
-    let release!: () => void
-    const current = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const tail = prior.then(() => current)
-    this.tails.set(name, tail)
-    await prior
-    try {
-      options.signal?.throwIfAborted()
-      return await callback({ name, mode: options.mode })
-    } finally {
-      release()
-      if (this.tails.get(name) === tail) this.tails.delete(name)
-    }
-  }
-}
-
-class RejectingReentrantLockManager extends ImmediateLockManager {
-  readonly requests: { readonly name: string; readonly mode: 'shared' | 'exclusive' }[] = []
+class RejectingReentrantLockManager extends RecordingWebLockManager {
   private readonly active = new Set<string>()
 
-  override async request<T>(
+  override request<T>(
     name: string,
-    options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
-    callback: (lock: Lock) => Promise<T> | T,
+    optionsOrCallback: LockOptions | ((lock: Lock | null) => T | PromiseLike<T>),
+    callback?: (lock: Lock | null) => T | PromiseLike<T>,
   ): Promise<T> {
-    this.requests.push({ name, mode: options.mode })
     if (this.active.has(name)) throw new Error(`ReentrantLockRequest:${name}`)
-    this.active.add(name)
-    try {
-      return await super.request(name, options, callback)
-    } finally {
-      this.active.delete(name)
-    }
+    const operation = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback
+    if (!operation) throw new Error('LockCallbackMissing')
+    const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
+    return super.request(name, options, async (lock) => {
+      if (!lock) return operation(lock)
+      this.active.add(name)
+      try {
+        return await operation(lock)
+      } finally {
+        this.active.delete(name)
+      }
+    })
   }
 }
 
@@ -355,7 +342,7 @@ describe('openDb recovery events', () => {
   it('elects one registered upgrader when many startup tabs arrive together', async () => {
     await createValidV97Workspace('natter')
     const progress: BrowserWorkspaceOpenProgress[] = []
-    const lockManager = new SerializedLockManager()
+    const lockManager = new RecordingWebLockManager()
     const coordinator = installStartupRepairRuntime(lockManager)
     try {
       const proofs = await Promise.all(
@@ -548,7 +535,7 @@ describe('openDb recovery events', () => {
     ).toHaveLength(0)
   })
 
-  it('normalizes observed v95.8 rows on an inactive destination and deletes only the old slot', async () => {
+  it('normalizes observed v95.8 rows and hands old-slot deletion to cleanup', async () => {
     const legacy = new Dexie('natter')
     legacy.version(95.8).stores(WAVE_A_V94_STORES)
     await legacy.open()
@@ -578,6 +565,12 @@ describe('openDb recovery events', () => {
       id: 'workspace',
       activeDatabaseName: 'natter-workspace-a',
       activationSequence: 1,
+      pending: {
+        nonce: expect.any(String) as string,
+        phase: 'cleanup',
+        sourceDatabaseName: 'natter',
+        destinationDatabaseName: 'natter-workspace-a',
+      },
     })
     const repaired = new NatterDb(proof.databaseName)
     await repaired.open()
@@ -628,6 +621,13 @@ describe('openDb recovery events', () => {
           event.operation === 'write-sidebar-folder-completion',
       ),
     ).toBe(true)
+    expect((await indexedDB.databases()).map((database) => database.name)).toContain('natter')
+    await expect(cleanPendingBrowserWorkspaceDatabase()).resolves.toEqual({
+      status: 'cleaned',
+      phase: 'cleanup',
+      databaseName: 'natter',
+    })
+    expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
     expect((await indexedDB.databases()).map((database) => database.name)).not.toContain('natter')
   })
 
@@ -718,7 +718,425 @@ describe('openDb recovery events', () => {
     repaired.close()
   })
 
-  it('keeps a malformed authoritative source selected and cleans under one selection admission', async () => {
+  it.each([
+    {
+      label: 'round DOMException',
+      admission: 'round',
+      reason: new DOMException('cancel startup', 'AbortError'),
+    },
+    { label: 'round object', admission: 'round', reason: { caller: 'startup-round' } },
+    { label: 'round null', admission: 'round', reason: null },
+    {
+      label: 'slot DOMException',
+      admission: 'slot',
+      reason: new DOMException('cancel startup', 'AbortError'),
+    },
+    { label: 'slot object', admission: 'slot', reason: { caller: 'startup-slot' } },
+    { label: 'slot null', admission: 'slot', reason: null },
+  ])(
+    'settles startup staging on cancellation before $label admission',
+    async ({ admission, reason }) => {
+      await createLegacyRepairWorkspace()
+      const locks = new RecordingWebLockManager()
+      const coordinator = installStartupRepairRuntime(locks)
+      const controller = new AbortController()
+      const slot = 'natter:workspace-slot:natter-workspace-a'
+      const held = startupBoundaryGate()
+      const release = startupBoundaryGate()
+      const queued = startupBoundaryGate()
+      const holder = locks.request(slot, { mode: 'shared' }, async () => {
+        held.release()
+        await release.promise
+      })
+      await held.promise
+      locks.onRequest = (name, options) => {
+        if (admission === 'round' && name.startsWith('natter:workspace-slot-round:')) {
+          controller.abort(reason)
+          queued.release()
+        } else if (admission === 'slot' && name === slot && options.mode === 'exclusive') {
+          queued.release()
+        }
+      }
+      const disposing = startupBoundaryGate()
+      const releaseDisposition = startupBoundaryGate()
+      const dispositions: LockManagerSnapshot[] = []
+      const originalAbandon = browserWorkspaceControl.abandonPreparedBrowserWorkspaceDatabase
+      const abandon = vi
+        .spyOn(browserWorkspaceControl, 'abandonPreparedBrowserWorkspaceDatabase')
+        .mockImplementation(async (...args) => {
+          if (admission === 'slot') {
+            disposing.release()
+            await releaseDisposition.promise
+          }
+          await originalAbandon(...args)
+          dispositions.push(await locks.query())
+        })
+      const opening = ensureBrowserWorkspaceCurrentForSelection(controller.signal)
+      const observed = opening.then(
+        () => ({ kind: 'fulfilled' as const }),
+        (failure: unknown) => ({ kind: 'rejected' as const, failure }),
+      )
+      try {
+        await queued.promise
+        if (admission === 'slot') {
+          expect((await locks.query()).pending).toContainEqual({ name: slot, mode: 'exclusive' })
+          controller.abort(reason)
+          expect((await locks.query()).pending).not.toContainEqual({
+            name: slot,
+            mode: 'exclusive',
+          })
+          const reachedDisposition = await Promise.race([
+            disposing.promise.then(() => true),
+            observed.then(() => false),
+          ])
+          expect(reachedDisposition).toBe(true)
+          const duringDisposition = await locks.query()
+          expect(
+            duringDisposition.held?.some((lock) =>
+              lock.name?.startsWith('natter:workspace-slot-round:'),
+            ),
+          ).toBe(true)
+          expect(duringDisposition.held).toContainEqual({
+            name: 'natter:workspace-slot-selection:v1',
+            mode: 'exclusive',
+          })
+          expect((await readBrowserWorkspaceDatabaseManifest()).pending?.phase).toBe('preparing')
+          releaseDisposition.release()
+        }
+        const outcome = await observed
+        expect(outcome.kind).toBe('rejected')
+        if (outcome.kind !== 'rejected') throw new Error('Expected startup cancellation')
+        expect(outcome.failure).toBe(reason)
+        expect(dispositions).toHaveLength(1)
+        expect(
+          dispositions[0]?.held?.some((lock) =>
+            lock.name?.startsWith('natter:workspace-slot-round:'),
+          ),
+        ).toBe(admission === 'slot')
+        expect(await readBrowserWorkspaceDatabaseManifest()).toMatchObject({
+          activeDatabaseName: 'natter',
+          activationSequence: 0,
+          pending: {
+            phase: 'discard',
+            sourceDatabaseName: 'natter',
+            destinationDatabaseName: 'natter-workspace-a',
+          },
+        })
+        expect(await locks.query()).toEqual({ held: [{ name: slot, mode: 'shared' }], pending: [] })
+        if (admission === 'round') {
+          expect(
+            locks.requests.filter(
+              (request) =>
+                request.name.startsWith('natter:workspace-slot:') && request.mode === 'exclusive',
+            ),
+          ).toEqual([])
+        }
+      } finally {
+        locks.onRequest = null
+        controller.abort(reason)
+        releaseDisposition.release()
+        release.release()
+        await holder
+        await observed
+        abandon.mockRestore()
+        disposeBrowserWorkspaceSlotCoordinator(coordinator)
+      }
+    },
+  )
+
+  it('retains an independent staging-disposition failure when startup cancellation wins admission', async () => {
+    await createLegacyRepairWorkspace()
+    const locks = new RecordingWebLockManager()
+    const coordinator = installStartupRepairRuntime(locks)
+    const controller = new AbortController()
+    const reason = { caller: 'cancel before round' }
+    const cleanupFailure = new Error('control journal unavailable')
+    const abandon = vi
+      .spyOn(browserWorkspaceControl, 'abandonPreparedBrowserWorkspaceDatabase')
+      .mockRejectedValue(cleanupFailure)
+    locks.onRequest = (name) => {
+      if (name.startsWith('natter:workspace-slot-round:')) controller.abort(reason)
+    }
+    try {
+      const failure = await ensureBrowserWorkspaceCurrentForSelection(controller.signal).then(
+        () => {
+          throw new Error('Expected startup rejection')
+        },
+        (error: unknown) => error,
+      )
+      expect(failure).toBeInstanceOf(AggregateError)
+      expect((failure as AggregateError).errors).toHaveLength(2)
+      expect((failure as AggregateError).errors[0]).toBe(reason)
+      expect((failure as AggregateError).errors[1]).toBe(cleanupFailure)
+      expect(abandon).toHaveBeenCalledOnce()
+      expect(await readBrowserWorkspaceDatabaseManifest()).toMatchObject({
+        activeDatabaseName: 'natter',
+        activationSequence: 0,
+        pending: { phase: 'preparing' },
+      })
+      expect(await locks.query()).toEqual({ held: [], pending: [] })
+    } finally {
+      abandon.mockRestore()
+      locks.onRequest = null
+      disposeBrowserWorkspaceSlotCoordinator(coordinator)
+    }
+  })
+
+  it('retains uncertain activation evidence without discarding a possibly committed destination', async () => {
+    await createLegacyRepairWorkspace()
+    const locks = new RecordingWebLockManager()
+    const coordinator = installStartupRepairRuntime(locks)
+    const failure = new browserWorkspaceControl.BrowserWorkspaceActivationOutcomeUncertainError([
+      new Error('activation inspection unavailable'),
+    ])
+    const activate = browserWorkspaceControl.activatePreparedBrowserWorkspaceDatabase
+    vi.spyOn(
+      browserWorkspaceControl,
+      'activatePreparedBrowserWorkspaceDatabase',
+    ).mockImplementation(async (...args) => {
+      await activate(...args)
+      throw failure
+    })
+    const abandon = vi.spyOn(browserWorkspaceControl, 'abandonPreparedBrowserWorkspaceDatabase')
+    try {
+      await expect(
+        ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal),
+      ).rejects.toBe(failure)
+      expect(abandon).not.toHaveBeenCalled()
+      expect(await readBrowserWorkspaceDatabaseManifest()).toMatchObject({
+        activeDatabaseName: 'natter-workspace-a',
+        activationSequence: 1,
+        pending: {
+          phase: 'cleanup',
+          sourceDatabaseName: 'natter',
+          destinationDatabaseName: 'natter-workspace-a',
+        },
+      })
+      expect(await locks.query()).toEqual({ held: [], pending: [] })
+    } finally {
+      disposeBrowserWorkspaceSlotCoordinator(coordinator)
+    }
+  })
+
+  it.each(['source-rejection', 'destination-rejection', 'cancel-after-source'] as const)(
+    'releases every acquired raw repair handle on %s',
+    async (boundary) => {
+      await createLegacyRepairWorkspace()
+      const locks = new RecordingWebLockManager()
+      const coordinator = installStartupRepairRuntime(locks)
+      const controller = new AbortController()
+      const failure = new Error(`raw repair ${boundary}`)
+      const opened: IDBDatabase[] = []
+      let rawCopy = false
+      let destinationRequests = 0
+      const recreate = browserWorkspaceDb.recreateAndVerifyBrowserWorkspaceDatabase
+      vi.spyOn(browserWorkspaceDb, 'recreateAndVerifyBrowserWorkspaceDatabase').mockImplementation(
+        async (...args) => {
+          await recreate(...args)
+          rawCopy = true
+        },
+      )
+      const nativeOpen = indexedDB.open.bind(indexedDB)
+      const closed = vi.spyOn(IDBDatabase.prototype, 'close')
+      vi.spyOn(indexedDB, 'open').mockImplementation((name, version) => {
+        if (!rawCopy || version !== undefined)
+          return version === undefined ? nativeOpen(name) : nativeOpen(name, version)
+        const source = name === 'natter'
+        if (!source) destinationRequests += 1
+        if (
+          (source && boundary === 'source-rejection') ||
+          (!source && boundary === 'destination-rejection')
+        ) {
+          rawCopy = false
+          throw failure
+        }
+        const request = nativeOpen(name)
+        request.addEventListener(
+          'success',
+          () => {
+            opened.push(request.result)
+            if (source && boundary === 'cancel-after-source') {
+              rawCopy = false
+              controller.abort(failure)
+            }
+          },
+          { once: true },
+        )
+        return request
+      })
+      try {
+        await expect(ensureBrowserWorkspaceCurrentForSelection(controller.signal)).rejects.toBe(
+          failure,
+        )
+        expect(opened).toHaveLength(boundary === 'source-rejection' ? 0 : 1)
+        for (const database of opened) expect(closed.mock.contexts).toContain(database)
+        expect(destinationRequests).toBe(boundary === 'destination-rejection' ? 1 : 0)
+        const manifest = await readBrowserWorkspaceDatabaseManifest()
+        expect(manifest).toMatchObject({ activeDatabaseName: 'natter', activationSequence: 0 })
+        expect(manifest.pending?.phase).toBe('discard')
+        expect(await locks.query()).toEqual({ held: [], pending: [] })
+        await expect(cleanPendingBrowserWorkspaceDatabase()).resolves.toMatchObject({
+          status: 'cleaned',
+          phase: 'discard',
+          databaseName: 'natter-workspace-a',
+        })
+        expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
+      } finally {
+        disposeBrowserWorkspaceSlotCoordinator(coordinator)
+      }
+    },
+  )
+
+  it('returns the repaired active source while old-source reclamation waits on an independent holder', async () => {
+    await createLegacyRepairWorkspace()
+    const locks = new RecordingWebLockManager()
+    const coordinator = installStartupRepairRuntime(locks)
+    const slot = 'natter:workspace-slot:natter'
+    const held = startupBoundaryGate()
+    const release = startupBoundaryGate()
+    const cleanupQueued = startupBoundaryGate()
+    let holder: Promise<void> | undefined
+    let cleaning: ReturnType<typeof cleanPendingBrowserWorkspaceDatabase> | undefined
+    try {
+      const proof = await ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal)
+      expect(proof).toMatchObject({
+        databaseName: 'natter-workspace-a',
+        activationSequence: 1,
+        physicalVersion: 980,
+      })
+      expect((await readBrowserWorkspaceDatabaseManifest()).pending).toMatchObject({
+        phase: 'cleanup',
+        sourceDatabaseName: 'natter',
+      })
+      expect((await indexedDB.databases()).map((database) => database.name)).toContain('natter')
+      holder = locks.request(slot, { mode: 'shared' }, async () => {
+        held.release()
+        await release.promise
+      })
+      await held.promise
+      locks.onRequest = (name, options) => {
+        if (name === slot && options.mode === 'exclusive') cleanupQueued.release()
+      }
+      cleaning = cleanPendingBrowserWorkspaceDatabase()
+      expect(
+        await Promise.race([
+          cleanupQueued.promise.then(() => 'queued' as const),
+          cleaning.then(() => 'completed' as const),
+        ]),
+      ).toBe('queued')
+      expect((await locks.query()).pending).toContainEqual({ name: slot, mode: 'exclusive' })
+      await expect(
+        ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal),
+      ).resolves.toEqual(proof)
+      expect((await locks.query()).held).toContainEqual({ name: slot, mode: 'shared' })
+      release.release()
+      await holder
+      await expect(cleaning).resolves.toEqual({
+        status: 'cleaned',
+        phase: 'cleanup',
+        databaseName: 'natter',
+      })
+      expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
+      expect((await indexedDB.databases()).map((database) => database.name)).not.toContain('natter')
+      expect(await locks.query()).toEqual({ held: [], pending: [] })
+    } finally {
+      locks.onRequest = null
+      release.release()
+      await Promise.all([holder, cleaning])
+      disposeBrowserWorkspaceSlotCoordinator(coordinator)
+    }
+  })
+
+  it('reports malformed-source failure before waiting for destination reclamation', async () => {
+    const legacy = new Dexie('natter')
+    legacy.version(95.8).stores(WAVE_A_V94_STORES)
+    await legacy.open()
+    await legacy.table('messages').put({
+      id: 'held-destination-poison',
+      chatId: 'chat-poison',
+      bodyVersion: 0,
+      nodeVersion: 0,
+      requestContextVersion: 0,
+    })
+    legacy.close()
+    const locks = new RecordingWebLockManager()
+    const coordinator = installStartupRepairRuntime(locks)
+    const slot = 'natter:workspace-slot:natter-workspace-a'
+    const held = startupBoundaryGate()
+    const release = startupBoundaryGate()
+    const cleanupQueued = startupBoundaryGate()
+    let holder: Promise<void> | undefined
+    let cleaning: ReturnType<typeof cleanPendingBrowserWorkspaceDatabase> | undefined
+    let exclusiveRequests = 0
+    locks.onRequest = (name, options) => {
+      if (name !== slot || options.mode !== 'exclusive') return
+      exclusiveRequests += 1
+      if (exclusiveRequests === 1) {
+        holder = locks.request(slot, { mode: 'shared' }, async () => {
+          held.release()
+          await release.promise
+        })
+      } else cleanupQueued.release()
+    }
+    const observed = ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal).then(
+      () => ({ kind: 'fulfilled' as const }),
+      (failure: unknown) => ({ kind: 'rejected' as const, failure }),
+    )
+    try {
+      expect(
+        await Promise.race([
+          held.promise.then(() => 'held' as const),
+          observed.then(() => 'settled' as const),
+        ]),
+      ).toBe('held')
+      const beforeCleanupAdmission = await Promise.race([
+        observed.then(() => true),
+        cleanupQueued.promise.then(() => false),
+      ])
+      expect(beforeCleanupAdmission).toBe(true)
+      const outcome = await observed
+      expect(outcome.kind).toBe('rejected')
+      if (outcome.kind !== 'rejected') throw new Error('Expected malformed-source failure')
+      expect(outcome.failure).toBeInstanceOf(Error)
+      expect((outcome.failure as Error).message).toContain(
+        'WaveAMessageBodyMissing:held-destination-poison',
+      )
+      expect((await readBrowserWorkspaceDatabaseManifest()).pending).toMatchObject({
+        phase: 'discard',
+        sourceDatabaseName: 'natter',
+        destinationDatabaseName: 'natter-workspace-a',
+      })
+      expect(await locks.query()).toEqual({ held: [{ name: slot, mode: 'shared' }], pending: [] })
+      cleaning = cleanPendingBrowserWorkspaceDatabase()
+      expect(
+        await Promise.race([
+          cleanupQueued.promise.then(() => 'queued' as const),
+          cleaning.then(() => 'completed' as const),
+        ]),
+      ).toBe('queued')
+      expect((await locks.query()).pending).toContainEqual({ name: slot, mode: 'exclusive' })
+      release.release()
+      await holder
+      await expect(cleaning).resolves.toEqual({
+        status: 'cleaned',
+        phase: 'discard',
+        databaseName: 'natter-workspace-a',
+      })
+      expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
+        id: 'workspace',
+        activeDatabaseName: 'natter',
+        activationSequence: 0,
+      })
+      expect(await locks.query()).toEqual({ held: [], pending: [] })
+    } finally {
+      locks.onRequest = null
+      release.release()
+      await Promise.all([holder, cleaning, observed])
+      disposeBrowserWorkspaceSlotCoordinator(coordinator)
+    }
+  })
+
+  it('keeps a malformed source selected with durable discard before separate cleanup admission', async () => {
     const locks = new RejectingReentrantLockManager()
     const legacy = new Dexie('natter')
     legacy.version(95.8).stores(WAVE_A_V94_STORES)
@@ -745,6 +1163,12 @@ describe('openDb recovery events', () => {
       id: 'workspace',
       activeDatabaseName: 'natter',
       activationSequence: 0,
+      pending: {
+        nonce: expect.any(String) as string,
+        phase: 'discard',
+        sourceDatabaseName: 'natter',
+        destinationDatabaseName: 'natter-workspace-a',
+      },
     })
     const source = await openRawDatabase('natter')
     expect(
@@ -753,6 +1177,18 @@ describe('openDb recovery events', () => {
       ),
     ).toEqual({ key: 'canonical-proof', value: 'still-source' })
     source.close()
+    expect((await indexedDB.databases()).map((database) => database.name)).toContain(
+      'natter-workspace-a',
+    )
+    await expect(cleanPendingBrowserWorkspaceDatabase()).resolves.toEqual({
+      status: 'cleaned',
+      phase: 'discard',
+      databaseName: 'natter-workspace-a',
+    })
+    expect(
+      locks.requests.filter(({ name }) => name === 'natter:workspace-slot-selection:v1'),
+    ).toHaveLength(2)
+    expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
     expect((await indexedDB.databases()).map((database) => database.name)).not.toContain(
       'natter-workspace-a',
     )
@@ -847,7 +1283,7 @@ describe('openDb recovery events', () => {
 async function runStartupRepair(
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
   onBlocked?: (event: IDBVersionChangeEvent) => void,
-  lockManager: ImmediateLockManager = new ImmediateLockManager(),
+  lockManager: TestWebLockManager = new RecordingWebLockManager(),
 ) {
   const coordinator = installStartupRepairRuntime(lockManager)
   try {
@@ -861,7 +1297,7 @@ async function runStartupRepair(
   }
 }
 
-function installStartupRepairRuntime(lockManager: ImmediateLockManager) {
+function installStartupRepairRuntime(lockManager: TestWebLockManager) {
   Object.defineProperty(globalThis, 'BroadcastChannel', {
     configurable: true,
     value: SilentBroadcastChannel,
@@ -871,6 +1307,8 @@ function installStartupRepairRuntime(lockManager: ImmediateLockManager) {
     value: lockManager,
   })
   return installBrowserWorkspaceSlotCoordinator({
+    foregroundDemandSignal: () => new AbortController().signal,
+    preemptMaintenance: () => undefined,
     validateQuiesce: async () => false,
     reconcile: async () => undefined,
   })
@@ -938,4 +1376,23 @@ function upgradeRawDatabase(
 
 function currentRawVersion(): number {
   return Math.round(getDb().verno * 10)
+}
+
+function startupBoundaryGate() {
+  let release!: () => void
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { promise, release }
+}
+
+async function createLegacyRepairWorkspace(): Promise<void> {
+  const legacy = new Dexie('natter')
+  legacy.version(95.8).stores(WAVE_A_V94_STORES)
+  try {
+    await legacy.open()
+    await legacy.table('settings').put({ key: 'canonical-proof', value: 'still-source' })
+  } finally {
+    legacy.close()
+  }
 }

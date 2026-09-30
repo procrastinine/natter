@@ -38,7 +38,7 @@ export async function runCheckpointVerification(options) {
       runId: `checkpoint-${candidate.id}`,
       purpose: `candidate-checkpoint:${candidate.id}`,
     },
-    async ({ runtime, environment }) => {
+    async ({ runtime, environment, testCompilerProof }) => {
       let unchanged = false
       let validationError = null
       const provenance = checkpointProvenance(options.baselineId, baseline, candidate)
@@ -52,6 +52,7 @@ export async function runCheckpointVerification(options) {
         root: candidate.runtimeRoot,
         baseEnv: environment,
         executionRuntime: runtime,
+        testCompilerProof,
         metadata,
         artifactRoot: evidenceRoot,
         runDirectory: resolve(runDirectory, 'stages'),

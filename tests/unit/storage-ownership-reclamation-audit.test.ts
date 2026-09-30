@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
@@ -35,6 +36,14 @@ let evaluateStorageOwnershipReclamation: (
   mode: 'inventory' | 'enforce',
 ) => StorageOwnershipReclamationReport
 let defaultInventory: unknown
+let inspectCompactionContinuation: (source: string) => string[]
+let inspectWorkspacePeerRecovery: (sources: {
+  cleanup: string
+  coordination: string
+  lifecycle: string
+}) => string[]
+let compactionSource: string
+let peerSources: Parameters<typeof inspectWorkspacePeerRecovery>[0]
 
 beforeAll(async () => {
   evaluateStorageOwnershipReclamation = (
@@ -42,6 +51,24 @@ beforeAll(async () => {
       evaluateStorageOwnershipReclamation: typeof evaluateStorageOwnershipReclamation
     }
   ).evaluateStorageOwnershipReclamation
+  const sourceAudits = (await import(AUDIT_URL)) as {
+    inspectCompactionContinuation: typeof inspectCompactionContinuation
+    inspectWorkspacePeerRecovery: typeof inspectWorkspacePeerRecovery
+  }
+  inspectCompactionContinuation = sourceAudits.inspectCompactionContinuation
+  inspectWorkspacePeerRecovery = sourceAudits.inspectWorkspacePeerRecovery
+  compactionSource = readFileSync(
+    resolve(ROOT, 'src/store/browser-workspace-compaction.ts'),
+    'utf8',
+  )
+  peerSources = {
+    cleanup: readFileSync(resolve(ROOT, 'src/store/browser-workspace-database-cleanup.ts'), 'utf8'),
+    coordination: readFileSync(
+      resolve(ROOT, 'src/store/browser-workspace-slot-coordination.ts'),
+      'utf8',
+    ),
+    lifecycle: readFileSync(resolve(ROOT, 'src/store/browser-workspace-lifecycle.ts'), 'utf8'),
+  }
   defaultInventory = await import(INVENTORY_URL)
 })
 
@@ -94,6 +121,57 @@ describe('storage ownership and reclamation architecture audit', () => {
     expect(result.report.structurallyValid).toBe(true)
     expect(result.report.gapCount).toBe(4)
     expect(result.report.problems).toEqual([])
+  })
+
+  it('rejects claim release for noncancelled outcomes and unbounded catch-up advance', () => {
+    expect(inspectCompactionContinuation(compactionSource)).toEqual([])
+    const unsafeRelease = compactionSource.replace(
+      "if (outcome.kind === 'cancelled' && attemptState.claim !== null)",
+      'if (attemptState.claim !== null)',
+    )
+    expect(inspectCompactionContinuation(unsafeRelease)).toContain(
+      'compaction-continuation: missing exact terminal cancellation-only claim release',
+    )
+    const unbounded = compactionSource.replace(
+      'estimatedBytes < COMPACTION_COPY_MAX_PAGE_BYTES',
+      'true',
+    )
+    expect(inspectCompactionContinuation(unbounded)).toContain(
+      'compaction-continuation: missing exact bounded cursor advance after admitted row',
+    )
+    expect(
+      inspectCompactionContinuation(
+        `${compactionSource}\nfunction isRetryableBrowserWorkspaceCompactionError() {}`,
+      ),
+    ).toContain('compaction-continuation: retained isRetryableBrowserWorkspaceCompactionError')
+  })
+
+  it('rejects full-preparation peer waits, reused rounds and stale-round quiescence', () => {
+    expect(inspectWorkspacePeerRecovery(peerSources)).toEqual([])
+    expect(
+      inspectWorkspacePeerRecovery({
+        ...peerSources,
+        cleanup: peerSources.cleanup.replace(
+          'return tryWithBrowserWorkspaceSelectionGate(() => recover(true), signal)',
+          'return withBrowserWorkspaceSelectionGate(() => recover(true), signal)',
+        ),
+      }),
+    ).toContain('workspace-peer-recovery: peer waits for the full preparation owner')
+    expect(
+      inspectWorkspacePeerRecovery({
+        ...peerSources,
+        coordination: peerSources.coordination.replace(
+          'roundId: newId()',
+          'roundId: message.nonce',
+        ),
+      }),
+    ).toContain('workspace-peer-recovery: missing exact fresh promotion round identity')
+    expect(
+      inspectWorkspacePeerRecovery({
+        ...peerSources,
+        coordination: peerSources.coordination.replace('if (ended) return', 'if (false) return'),
+      }),
+    ).toContain('workspace-peer-recovery: missing exact ended round cannot quiesce a peer')
   })
 
   it('rejects a missing table and manifest policy drift', async () => {

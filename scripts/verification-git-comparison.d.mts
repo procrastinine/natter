@@ -14,7 +14,7 @@ export interface CommittedVerificationComparison {
   readonly comparisonBaseOid?: string
   readonly commitOid: string
   readonly treeOid: string
-  readonly snapshotSchemaVersion: 2
+  readonly snapshotSchemaVersion: 3
   readonly sourceStats: {
     readonly treeEntryCount: number
     readonly selectedFileCount: number

@@ -27,6 +27,7 @@ interface LocalityRecord {
 }
 
 interface LocalityInventory {
+  readonly WORKSPACE_SLOT_MESSAGE_LOCALITY: Readonly<Record<string, LocalityRecord>>
   readonly WORKSPACE_QUERY_LOCALITY: Readonly<Record<string, LocalityRecord>>
   readonly WORKSPACE_COMMAND_LOCALITY: Readonly<Record<string, LocalityRecord>> & {
     readonly 'chat.touch-viewed': LocalityRecord
@@ -113,13 +114,36 @@ interface LocalityAuditModule {
 
 let canonicalInventory: LocalityInventory
 let auditModule: LocalityAuditModule
-let localitySourceFacts: unknown
+interface LocalitySourceFacts {
+  readonly surfaceFacts: readonly {
+    readonly id: string
+    readonly variants: readonly string[]
+    readonly constructorSites: readonly {
+      readonly owner: string
+      readonly variant: string
+      readonly confidence: string
+    }[]
+  }[]
+  readonly stringSurfaceFacts: readonly {
+    readonly id: string
+    readonly variants: readonly string[]
+  }[]
+  readonly resourceIds: readonly string[]
+  readonly streamLeaseOperations: readonly string[]
+  readonly attemptControllerOperations: readonly string[]
+  readonly routeActions: readonly string[]
+  readonly rootAdmissions: readonly unknown[]
+  readonly childReservations: readonly unknown[]
+  readonly typedDeltaSites: readonly unknown[]
+}
+
+let localitySourceFacts: LocalitySourceFacts
 
 beforeAll(async () => {
   const [loadedAudit, loadedInventory, bundle] = await Promise.all([
     import(AUDIT_URL) as Promise<unknown>,
     import(INVENTORY_URL) as Promise<unknown>,
-    loadProtocolContractFactBundle<{ readonly locality: unknown }>(),
+    loadProtocolContractFactBundle<{ readonly locality: LocalitySourceFacts }>(),
   ])
   auditModule = loadedAudit as LocalityAuditModule
   localitySourceFacts = bundle.locality
@@ -141,13 +165,13 @@ describe('tab and cross-tab locality audit', () => {
     expect(report).toMatchObject({
       ok: true,
       structurallyValid: true,
-      surfaces: 20,
-      records: 345,
-      constructorSites: 773,
+      surfaces: Object.keys(expectedSurfaceCounts()).length,
+      records: Object.values(expectedSurfaceCounts()).reduce((sum, count) => sum + count, 0),
+      constructorSites: expectedConstructorCount(),
       unconstructedOrUnadmittedSites: 4,
-      ownerClassifiedSites: 773,
+      ownerClassifiedSites: expectedConstructorCount(),
       ownerSiteGaps: 0,
-      rootAdmissionSites: 113,
+      rootAdmissionSites: 115,
       unadmittedRoots: 0,
       childReservationSites: 3,
       unreservedChildren: 4,
@@ -171,28 +195,58 @@ describe('tab and cross-tab locality audit', () => {
       acceptanceOpen: 6,
       problems: [],
     })
-    expect(report.surfaceCounts).toMatchObject({
-      'workspace-query': 66,
-      'workspace-command': 65,
-      'configuration-command': 44,
-      'workspace-root': 16,
-      'workspace-child': 7,
-      'generation-intent': 6,
-      'conversation-selection-delivery': 2,
-      'conversation-route-delivery': 2,
-      'route-action': 11,
-      'stream-lease-operation': 22,
-      'attempt-controller-operation': 33,
-      'workspace-change': 3,
-      'workspace-delta-fact': 9,
-      'workspace-dependency': 23,
-      'runtime-resource': 17,
-    })
+    expect(report.surfaceCounts).toEqual(expectedSurfaceCounts())
     expect(report.limitations).toEqual(
       expect.arrayContaining([
         expect.stringContaining('not necessarily the human interaction'),
         expect.stringContaining('browser-native navigation'),
         expect.stringContaining('absence of consumer-side steering'),
+      ]),
+    )
+  })
+
+  it('owns both slot messages exactly and rejects omitted, invented, or unowned variants', () => {
+    const surface = localitySourceFacts.surfaceFacts.find(
+      ({ id }) => id === 'workspace-slot-message',
+    )
+    expect(
+      surface?.constructorSites
+        .map(({ owner, variant, confidence }) => ({ owner, variant, confidence }))
+        .sort((left, right) => left.variant.localeCompare(right.variant)),
+    ).toEqual([
+      {
+        owner: 'receiveSlotMessage.onForegroundDemand',
+        variant: 'foreground-demand',
+        confidence: 'type-assignable',
+      },
+      {
+        owner: 'withBrowserWorkspaceSlotRound.quiesce',
+        variant: 'quiesce',
+        confidence: 'type-assignable',
+      },
+    ])
+    const quiesce = canonicalInventory.WORKSPACE_SLOT_MESSAGE_LOCALITY.quiesce
+    if (!quiesce) throw new Error('WorkspaceSlotQuiesceLocalityMissing')
+    const changed = {
+      ...canonicalInventory,
+      WORKSPACE_SLOT_MESSAGE_LOCALITY: {
+        quiesce,
+        'invented-demand': quiesce,
+      },
+      OWNER_PATH_CLASSIFICATIONS: Object.fromEntries(
+        Object.entries(canonicalInventory.OWNER_PATH_CLASSIFICATIONS).map(([owner, paths]) => [
+          owner,
+          paths.filter((path) => path !== 'src/store/browser-workspace-slot-coordination.ts'),
+        ]),
+      ),
+    }
+    const report = evaluateTabCrossTabLocality(changed, 'inventory')
+    expect(report.structurallyValid).toBe(false)
+    expect(report.problems).toEqual(
+      expect.arrayContaining([
+        'workspace-slot-message variants: missing foreground-demand',
+        'workspace-slot-message variants: unclassified invented-demand',
+        'initiating-owner paths: missing src/store/browser-workspace-slot-coordination.ts',
       ]),
     )
   })
@@ -464,4 +518,29 @@ function remoteInvalidation(dependency: WorkspaceDependency): WorkspaceChange {
     replacementEpoch: 1,
     dependencies: [dependency],
   }
+}
+
+function expectedSurfaceCounts(): Record<string, number> {
+  return Object.fromEntries([
+    ...localitySourceFacts.surfaceFacts.map(({ id, variants }) => [id, variants.length] as const),
+    ...localitySourceFacts.stringSurfaceFacts.map(
+      ({ id, variants }) => [id, variants.length] as const,
+    ),
+    ['runtime-resource', localitySourceFacts.resourceIds.length],
+    ['stream-lease-operation', localitySourceFacts.streamLeaseOperations.length],
+    ['attempt-controller-operation', localitySourceFacts.attemptControllerOperations.length],
+    ['route-action', localitySourceFacts.routeActions.length],
+  ])
+}
+
+function expectedConstructorCount(): number {
+  return (
+    localitySourceFacts.surfaceFacts.reduce(
+      (sum, surface) => sum + surface.constructorSites.length,
+      0,
+    ) +
+    localitySourceFacts.rootAdmissions.length +
+    localitySourceFacts.childReservations.length +
+    localitySourceFacts.typedDeltaSites.length
+  )
 }

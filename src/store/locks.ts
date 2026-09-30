@@ -393,7 +393,7 @@ class WebLocksBackend implements LockBackend {
         ),
     }
     const acquire = (index: number): Promise<T> => {
-      if (signal?.aborted) return Promise.reject(lockAbortError(signal.reason))
+      if (signal?.aborted) return Promise.reject(signal.reason)
       if (index >= normalized.length) return Promise.resolve(fn(grant))
       const name = normalized[index] as string
       return signal
@@ -423,7 +423,7 @@ class CoordinationWebLocksBackend implements ResourceLockBackend {
         ),
     }
     const acquire = (index: number): Promise<T> => {
-      if (signal?.aborted) return Promise.reject(lockAbortError(signal.reason))
+      if (signal?.aborted) return Promise.reject(signal.reason)
       if (index >= logicalNames.length) return Promise.resolve(fn(grant))
       const name = logicalNames[index] as string
       return signal
@@ -451,8 +451,12 @@ class IndexedDbLockBackend implements LockBackend {
     | undefined
   private queue: Promise<void> = Promise.resolve()
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
-  private readonly delayRejectors = new Map<ReturnType<typeof setTimeout>, (error: Error) => void>()
+  private readonly delayRejectors = new Map<
+    ReturnType<typeof setTimeout>,
+    (reason: unknown) => void
+  >()
   private disposed = false
+  private disposalReason: unknown
   private readonly disposedSignal: Promise<void>
   private readonly resolveDisposedSignal: () => void
   private physicalWork = 0
@@ -495,7 +499,7 @@ class IndexedDbLockBackend implements LockBackend {
     fn: (grant: LockGrant) => Promise<T> | T,
     options: { database?: Dexie; signal?: AbortSignal } = {},
   ): Promise<T> {
-    if (this.disposed) throw new Error('LockBackendDisposed')
+    if (this.disposed) throw this.disposalReason
     throwIfAborted(options.signal)
     this.beginPhysicalWork()
     const prior = this.queue
@@ -507,10 +511,10 @@ class IndexedDbLockBackend implements LockBackend {
     let cleanupOwnsQueue = false
     try {
       await this.waitForQueueTurn(prior, options.signal)
-      if (this.isDisposed()) throw new Error('LockBackendDisposed')
+      if (this.isDisposed()) throw this.disposalReason
       throwIfAborted(options.signal)
       const db = options.database ?? (await this.openDatabaseUntilDisposed())
-      if (this.isDisposed()) throw new Error('LockBackendDisposed')
+      if (this.isDisposed()) throw this.disposalReason
       throwIfAborted(options.signal)
       const identity = await this.acquire(db, options.signal)
       const owned = await this.runOwned(db, identity, logicalNames, fn)
@@ -554,8 +558,9 @@ class IndexedDbLockBackend implements LockBackend {
     )
   }
 
-  dispose(): void {
+  dispose(reason: unknown = new Error('LockBackendDisposed')): void {
     if (this.disposed) return
+    this.disposalReason = reason
     this.disposed = true
     this.resolveDisposedSignal()
     for (const timer of this.timers) {
@@ -564,7 +569,7 @@ class IndexedDbLockBackend implements LockBackend {
     this.timers.clear()
     for (const [timer, reject] of this.delayRejectors) {
       clearTimeout(timer)
-      reject(new Error('LockBackendDisposed'))
+      reject(this.disposalReason)
     }
     this.delayRejectors.clear()
   }
@@ -588,14 +593,14 @@ class IndexedDbLockBackend implements LockBackend {
     return Promise.race([
       opening,
       this.disposedSignal.then(() => {
-        throw new Error('LockBackendDisposed')
+        throw this.disposalReason
       }),
     ])
   }
 
   private waitForQueueTurn(prior: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
-    if (this.disposed) return Promise.reject(new Error('LockBackendDisposed'))
-    if (signal?.aborted) return Promise.reject(abortError(signal))
+    if (this.disposed) return Promise.reject(this.disposalReason)
+    if (signal?.aborted) return Promise.reject(signal.reason)
     return new Promise((resolve, reject) => {
       let settled = false
       const finish = (operation: () => void) => {
@@ -604,16 +609,16 @@ class IndexedDbLockBackend implements LockBackend {
         signal?.removeEventListener('abort', onAbort)
         operation()
       }
-      const onAbort = () => finish(() => reject(abortError(signal as AbortSignal)))
+      const onAbort = () => finish(() => reject(signal?.reason))
       signal?.addEventListener('abort', onAbort, { once: true })
       void prior.then(() => finish(resolve))
-      void this.disposedSignal.then(() => finish(() => reject(new Error('LockBackendDisposed'))))
+      void this.disposedSignal.then(() => finish(() => reject(this.disposalReason)))
     })
   }
 
   private async acquire(db: Dexie, signal: AbortSignal | undefined): Promise<FenceIdentity> {
     for (;;) {
-      if (this.disposed) throw new Error('LockBackendDisposed')
+      if (this.disposed) throw this.disposalReason
       throwIfAborted(signal)
       const wake = subscribeLockWake(db.name, this.recordName)
       const now = this.now()
@@ -655,7 +660,7 @@ class IndexedDbLockBackend implements LockBackend {
         if (result.kind === 'acquired') {
           if (!signal?.aborted) return result.identity
           await this.release(db, result.identity)
-          throw abortError(signal)
+          throw signal.reason
         }
         await this.waitForWakeOrDeadline(
           wake.promise,
@@ -707,7 +712,7 @@ class IndexedDbLockBackend implements LockBackend {
       logicalNames,
       ownershipLost: ownershipController.signal,
       runTransaction: async (db, tables, transactionFn) => {
-        if (this.disposed) throw new Error('LockBackendDisposed')
+        if (this.disposed) throw this.disposalReason
         if (ownership === 'lost') {
           throw new LockFenceLostError(identity.fencingToken, this.recordName)
         }
@@ -718,7 +723,7 @@ class IndexedDbLockBackend implements LockBackend {
             'rw',
             uniqueTransactionTables(db, tables, true),
             async (tx: Transaction) => {
-              if (this.disposed) throw new Error('LockBackendDisposed')
+              if (this.disposed) throw this.disposalReason
               const row = await tx
                 .table<BrowserLockRow, string>('browserLocks')
                 .get(this.recordName)
@@ -802,24 +807,23 @@ class IndexedDbLockBackend implements LockBackend {
     if (this.waitForWakeOrDeadlinePort) {
       return this.waitForWakeOrDeadlinePort(wake, delay, signal)
     }
-    if (this.disposed) return Promise.reject(new Error('LockBackendDisposed'))
-    if (signal?.aborted) return Promise.reject(abortError(signal))
+    if (this.disposed) return Promise.reject(this.disposalReason)
+    if (signal?.aborted) return Promise.reject(signal.reason)
     return new Promise((resolve, reject) => {
       let settled = false
-      const finish = (error?: Error) => {
+      const finish = (publish: () => void) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
         this.delayRejectors.delete(timer)
         signal?.removeEventListener('abort', onAbort)
-        if (error) reject(error)
-        else resolve()
+        publish()
       }
-      const onAbort = () => finish(abortError(signal as AbortSignal))
-      const timer = setTimeout(() => finish(), delay)
-      this.delayRejectors.set(timer, (error) => finish(error))
+      const onAbort = () => finish(() => reject(signal?.reason))
+      const timer = setTimeout(() => finish(resolve), delay)
+      this.delayRejectors.set(timer, (reason) => finish(() => reject(reason)))
       signal?.addEventListener('abort', onAbort, { once: true })
-      void wake.then(() => finish())
+      void wake.then(() => finish(resolve))
     })
   }
 
@@ -891,7 +895,7 @@ function createAuthoritativeCommandLockSession(
       operation: (grant: LockGrant) => Promise<T> | T,
     ): Promise<T> {
       if (resourceScopeActive) throw new Error('AuthoritativeCommandNestedResourceLocks')
-      if (ownershipLost?.aborted) throw abortError(ownershipLost)
+      if (ownershipLost?.aborted) throw ownershipLost.reason
       const normalized = normalizeNamedLocks(resourceNames)
       if (normalized.includes(WORKSPACE_AUTHORITATIVE_GATE) || normalized.includes('db:global')) {
         throw new Error('AuthoritativeCommandGlobalResourceForbidden')
@@ -921,7 +925,7 @@ export async function withCoordinationLock<T>(
 ): Promise<T> {
   const lockName = coordinationLockName(resourceName)
   if (lockRuntimeDisposed) throw new Error('LockRuntimeDisposed')
-  if (options.signal?.aborted) throw new DOMException('Coordination aborted', 'AbortError')
+  if (options.signal?.aborted) throw options.signal.reason
   if (hasWebLocks()) {
     return runWithLockRuntime([lockName], (grant) => fn(grant), {
       backend: coordinationWebLocksBackend,
@@ -934,7 +938,7 @@ export async function withCoordinationLock<T>(
     deleteRecordOnRelease: true,
   })
   coordinationBackends.add(coordinationBackend)
-  const abort = () => coordinationBackend.dispose()
+  const abort = () => coordinationBackend.dispose(options.signal?.reason)
   options.signal?.addEventListener('abort', abort, { once: true })
   try {
     return await runWithLockRuntime([lockName], (grant) => fn(grant), {
@@ -972,7 +976,7 @@ export async function withSharedGenerationLifetime<T>(
   options: { signal?: AbortSignal } = {},
 ): Promise<T> {
   const signal = options.signal
-  if (signal?.aborted) return Promise.reject(abortError(signal))
+  if (signal?.aborted) return Promise.reject(signal.reason)
   if (!hasWebLocks()) return Promise.resolve().then(operation)
   const manager = navigator.locks
   const ownerName = `${GENERATION_OWNER_PREFIX}${newId()}`
@@ -1003,7 +1007,7 @@ export async function withExclusiveGenerationLifetime<T>(
   options: { signal?: AbortSignal } = {},
 ): Promise<T> {
   const signal = options.signal
-  if (signal?.aborted) return Promise.reject(abortError(signal))
+  if (signal?.aborted) return Promise.reject(signal.reason)
   if (!hasWebLocks()) return Promise.reject(new Error('GenerationLifetimeGateUnavailable'))
   const manager = navigator.locks
   for (;;) {
@@ -1085,7 +1089,7 @@ export async function withQuiescedWorkspaceReplacementLock<T>(
 ): Promise<T> {
   const logicalNames = ['db:global'] as const
   const signal = options.signal
-  if (signal?.aborted) throw lockAbortError(signal.reason)
+  if (signal?.aborted) throw signal.reason
   if (hasWebLocks()) {
     const grant: LockGrant = {
       kind: 'web-locks',
@@ -1101,12 +1105,12 @@ export async function withQuiescedWorkspaceReplacementLock<T>(
       WORKSPACE_AUTHORITATIVE_GATE,
       { mode: 'exclusive', ...(signal ? { signal } : {}) },
       () => {
-        if (signal?.aborted) throw lockAbortError(signal.reason)
+        if (signal?.aborted) throw signal.reason
         return navigator.locks.request(
           logicalNames[0],
           { mode: 'exclusive', ...(signal ? { signal } : {}) },
           () => {
-            if (signal?.aborted) throw lockAbortError(signal.reason)
+            if (signal?.aborted) throw signal.reason
             return fn(grant)
           },
         )
@@ -1119,38 +1123,24 @@ export async function withQuiescedWorkspaceReplacementLock<T>(
   })
   const admission = { entered: false }
   const abortPending = () => {
-    if (!admission.entered) backend.dispose()
+    if (!admission.entered) backend.dispose(signal?.reason)
   }
   signal?.addEventListener('abort', abortPending, { once: true })
   try {
     return await backend.run(
       logicalNames,
       (grant) => {
-        if (signal?.aborted) throw lockAbortError(signal.reason)
+        if (signal?.aborted) throw signal.reason
         admission.entered = true
         signal?.removeEventListener('abort', abortPending)
         return fn(grant)
       },
       { database: db },
     )
-  } catch (error) {
-    if (
-      !admission.entered &&
-      signal?.aborted &&
-      error instanceof Error &&
-      error.message === 'LockBackendDisposed'
-    ) {
-      throw lockAbortError(signal.reason)
-    }
-    throw error
   } finally {
     signal?.removeEventListener('abort', abortPending)
     await backend.disposeAndDrain()
   }
-}
-
-function lockAbortError(reason: unknown): Error {
-  return reason instanceof Error ? reason : new Error('LockOperationAborted', { cause: reason })
 }
 
 export function coordinationLockName(resourceName: string): string {
@@ -1249,12 +1239,6 @@ function linkAbortSignal(source: AbortSignal | undefined, target: AbortControlle
   return () => source.removeEventListener('abort', abort)
 }
 
-function abortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new DOMException('Lock acquisition aborted', 'AbortError')
-}
-
 function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw abortError(signal)
+  if (signal?.aborted) throw signal.reason
 }

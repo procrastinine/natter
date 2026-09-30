@@ -4,8 +4,8 @@ import Dexie from 'dexie'
 import { afterEach, expect, it, vi } from 'vitest'
 import { yieldToEventLoop } from '../../src/lib/yield-to-event-loop'
 import type { BrowserWorkspaceCompactionResult } from '../../src/store/browser-workspace-compaction'
-import type { BrowserWorkspaceReplacementCommit } from '../../src/store/browser-workspace-contract'
 import { createBrowserWorkspacePromotedReplacementDrain } from '../../src/store/browser-workspace-lifecycle'
+import type { BrowserWorkspaceReplacementTerminalOutcome } from '../../src/store/browser-workspace-maintenance-contract'
 import { createDbForTests } from '../../src/store/db'
 import {
   __linkedStorageMaintenanceAbortControllerForTests,
@@ -71,69 +71,6 @@ it('transfers promoted replacement custody before ending the finalized maintenan
   )
 })
 
-it('owns online replacement preparation before preflight and pauses it for foreground demand', () => {
-  const source = readFileSync(
-    resolve(__dirname, '../../src/store/browser-workspace-replacement-runner.ts'),
-    'utf8',
-  )
-  const onlineStart = source.indexOf(
-    'export function tryStartBrowserWorkspaceOnlineReplacementIfIdle',
-  )
-  const launchStart = source.indexOf('function launchBrowserWorkspaceReplacement', onlineStart)
-  const onlineAdmission = source.slice(onlineStart, launchStart)
-  const requiredStart = source.indexOf('export async function runBrowserWorkspaceReplacement')
-  const requiredEnd = source.indexOf(
-    'export function tryStartBrowserWorkspaceOnlineReplacementIfIdle',
-    requiredStart,
-  )
-  const requiredAdmission = source.slice(requiredStart, requiredEnd)
-  const gatedStart = source.indexOf('async function runGatedBrowserWorkspaceReplacementAttempt')
-  const authorityStart = source.indexOf('function launchReplacementAuthority', gatedStart)
-  const gatedAttempt = source.slice(gatedStart, authorityStart)
-  const slottedPrepared = gatedAttempt.slice(gatedAttempt.indexOf('const onlinePrepared'))
-  const commitStart = source.indexOf('async function runSlottedReplacementCommit')
-  const commitEnd = source.indexOf('function createReplacementMutationCapability', commitStart)
-  const slottedCommit = source.slice(commitStart, commitEnd)
-
-  expect(onlineAdmission.indexOf("tryRunWorkspaceActionIfIdle(\n    'maintenance'")).toBeLessThan(
-    onlineAdmission.indexOf('launchBrowserWorkspaceReplacement('),
-  )
-  expect(
-    requiredAdmission.indexOf("runWorkspaceAction(\n        'workspace-replacement'"),
-  ).toBeLessThan(requiredAdmission.indexOf('preemptWorkspaceMaintenancePreparation(permit)'))
-  expect(requiredAdmission.indexOf('preemptWorkspaceMaintenancePreparation(permit)')).toBeLessThan(
-    requiredAdmission.indexOf('launchBrowserWorkspaceReplacement('),
-  )
-  expect(gatedAttempt.indexOf('awaitWorkspaceForegroundDemandIdle')).toBeLessThan(
-    gatedAttempt.indexOf('await preflight(session)'),
-  )
-  expect(
-    gatedAttempt.indexOf(
-      'awaitWorkspaceForegroundDemandIdle',
-      gatedAttempt.indexOf('await preflight(session)') + 1,
-    ),
-  ).toBeLessThan(gatedAttempt.indexOf('tryBeginBrowserWorkspaceDatabaseReplacement()'))
-  expect(gatedAttempt).toMatch(/const authority = launchReplacementAuthority\(policy\)/u)
-  expect(
-    slottedPrepared.indexOf('await waitForWorkspaceRuntimeReplacementBlockers('),
-  ).toBeGreaterThan(-1)
-  expect(slottedPrepared.indexOf('await waitForWorkspaceRuntimeReplacementBlockers(')).toBeLessThan(
-    slottedPrepared.indexOf('withExclusiveGenerationLifetime('),
-  )
-  expect(slottedPrepared).not.toContain('awaitReplacementAuthority')
-  expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
-    slottedPrepared.indexOf('launchReplacementAuthority(policy)'),
-  )
-  expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
-    slottedPrepared.indexOf('postBrowserWorkspaceSlotQuiesce(journal)'),
-  )
-  expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
-    slottedPrepared.indexOf('runSlottedBrowserWorkspaceReplacement('),
-  )
-  expect(slottedCommit).not.toContain('withExclusiveGenerationLifetime(')
-  expect(source).not.toContain('awaitOnlineReplacementAuthority')
-})
-
 it('starts the maintenance pump outside an ambient Dexie transaction without waiting for it', async () => {
   const db = createDbForTests(`natter-maintenance-zone-${crypto.randomUUID()}`)
   await db.open()
@@ -177,7 +114,8 @@ it('starts the maintenance pump outside an ambient Dexie transaction without wai
 
 it('keeps promoted replacement custody alive after the producer closes and drains it exactly once', async () => {
   const drain = createBrowserWorkspacePromotedReplacementDrain()
-  const completion = deferred<BrowserWorkspaceReplacementCommit<BrowserWorkspaceCompactionResult>>()
+  const completion =
+    deferred<BrowserWorkspaceReplacementTerminalOutcome<BrowserWorkspaceCompactionResult>>()
 
   drain.handoffs.transfer({ completion: completion.promise })
   drain.closeAdmissions()
@@ -192,9 +130,12 @@ it('keeps promoted replacement custody alive after the producer closes and drain
   expect(() => drain.assertClosed()).toThrow('BrowserWorkspacePromotedReplacementDrainNotClosed')
 
   completion.resolve({
-    workspace: { workspaceId: 'workspace', replacementEpoch: 2 },
-    storageBaseline: { kind: 'carry-source', liveBytes: 0 },
-    value: { copiedRows: 0, estimatedLiveBytes: 0 },
+    kind: 'committed-ready',
+    commit: {
+      workspace: { workspaceId: 'workspace', replacementEpoch: 2 },
+      storageBaseline: { kind: 'carry-source', liveBytes: 0 },
+      value: { copiedRows: 0, estimatedLiveBytes: 0 },
+    },
   })
   await idle
 

@@ -52,6 +52,36 @@ test('focus composer keeps auto-growing until the user resizes it', async ({ pag
   expect(metrics.overflowY).toBe('hidden')
 })
 
+test('notice actions and the floating reading control remain independently clickable', async ({
+  page,
+}) => {
+  await startChat(page)
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]')
+  const text = await assistant.locator('[data-ui="message-body"]').innerText()
+  const focus = page.locator('[data-ui="focus-mode-toggle"]')
+  const shell = page.locator('[data-ui="app-shell"]')
+  const deletedToast = page.locator('[data-ui="toast"]:has([data-ui="toast-undo"])')
+  const deleteAssistant = async () => {
+    await assistant.getByRole('button', { name: 'Delete message', exact: true }).click()
+    await page.getByRole('dialog').getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(deletedToast).toBeVisible()
+  }
+
+  await deleteAssistant()
+  await deletedToast.locator('[data-ui="toast-undo"]').click()
+  await expect(assistant.locator('[data-ui="message-body"]')).toHaveText(text)
+
+  await deleteAssistant()
+  await focus.click()
+  await expect(shell).toHaveAttribute('data-focus-mode', 'on')
+  await expect(deletedToast).toBeVisible()
+  await deletedToast.getByRole('button', { name: 'Dismiss notification' }).click()
+  await expect(deletedToast).toHaveCount(0)
+  await expect(shell).toHaveAttribute('data-focus-mode', 'on')
+  await focus.click()
+  await expect(shell).toHaveAttribute('data-focus-mode', 'off')
+})
+
 async function startChat(page: Page): Promise<void> {
   await seedFirstRun(page)
   const chatId = await seedLinearChat(page, {

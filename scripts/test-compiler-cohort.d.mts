@@ -1,3 +1,5 @@
+import type { VerificationExecution, VerificationStage } from './run-verification.mjs'
+import type { MaterializedVerificationCandidate } from './verification-candidate-workspace.mjs'
 import type { VerificationSnapshot } from './verification-impact-plan.mjs'
 
 export interface TestCompilerEncodedOutput {
@@ -55,6 +57,7 @@ export interface TestCompilerCohortDescriptor {
   }
   readonly compiler: {
     readonly packageSpecifier: string
+    readonly cliRelativePath: string
     readonly rootArgs: readonly string[]
     readonly diagnosticArgs: readonly string[]
     readonly environment: Readonly<Record<string, string>>
@@ -109,3 +112,6 @@ export function validateTestCompilerCohort(
   cohort: TestCompilerCohort,
   snapshot: VerificationSnapshot,
 ): readonly string[]
+
+export const TEST_COMPILER_DIAGNOSTIC_ARGV: readonly string[]
+export function capturedTestCompilerExecution(stage: VerificationStage, candidate: Pick<MaterializedVerificationCandidate, 'id' | 'digest' | 'snapshot' | 'compilerCohort'>): VerificationExecution

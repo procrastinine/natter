@@ -37,7 +37,11 @@ export default tseslint.config(
       '@typescript-eslint/no-unsafe-return': 'error',
       '@typescript-eslint/no-unused-vars': 'off',
       '@typescript-eslint/only-throw-error': 'error',
-      '@typescript-eslint/prefer-promise-reject-errors': 'error',
+      // Forwarding a rejection or AbortSignal.reason must preserve its identity.
+      '@typescript-eslint/prefer-promise-reject-errors': [
+        'error',
+        { allowThrowingAny: true, allowThrowingUnknown: true },
+      ],
       '@typescript-eslint/require-await': 'error',
       '@typescript-eslint/restrict-template-expressions': 'error',
       '@typescript-eslint/switch-exhaustiveness-check': 'error',

@@ -942,6 +942,7 @@ function prepareCommandInput(
     configuration.kind === 'chat'
       ? {
           configurationIntent: {
+            ...(configuration.discovery ? { discovery: configuration.discovery } : {}),
             preferredDispatchKeyId: configuration.preferredDispatchKeyId,
             ...(configuration.requestSettings.kind === 'captured'
               ? {
@@ -964,6 +965,7 @@ function prepareCommandInput(
         promptPath,
         chat: required(chat),
         configurationIntent: {
+          ...(configuration.discovery ? { discovery: configuration.discovery } : {}),
           kind: 'captured',
           settings: configuration.settings,
           expectedConfigurationVersion: 0,

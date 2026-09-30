@@ -118,12 +118,25 @@ describe('production workspace protocol audit', () => {
         variants: 16,
         exclusiveVariants: 2,
         admissionFunctions: 6,
-        finiteAdmissions: 113,
+        finiteAdmissions: 115,
         unboundedAdmissions: 0,
         capabilityEscapes: 0,
       },
       problems: [],
     })
+    expect(
+      report.roots.admissions
+        .filter(
+          (site) =>
+            site.path === 'src/store/browser-workspace-replacement-runner.ts' &&
+            site.owner === 'runGatedBrowserWorkspaceReplacementAttempt',
+        )
+        .map(({ admission, kinds }) => ({ admission, kinds }))
+        .sort((left, right) => left.admission.localeCompare(right.admission)),
+    ).toEqual([
+      { admission: 'runWorkspaceRead', kinds: ['maintenance'] },
+      { admission: 'tryRunWorkspaceActionIfIdle', kinds: ['maintenance'] },
+    ])
     expect(report.protocols.WorkspaceQuery).toMatchObject({
       ingressSites: 101,
       dependencyProbeSites: 5,

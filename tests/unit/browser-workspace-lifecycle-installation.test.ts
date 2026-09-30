@@ -32,6 +32,8 @@ function deferred() {
 
 it('installs the browser workspace lifecycle atomically and rolls back exact owners', async () => {
   const incumbent = installBrowserWorkspaceSlotCoordinator({
+    foregroundDemandSignal: () => new AbortController().signal,
+    preemptMaintenance: () => undefined,
     validateQuiesce: async () => true,
     reconcile: async () => {},
   })

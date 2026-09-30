@@ -703,6 +703,38 @@ export const productionRuntimeEffectReviews = Object.freeze([
     'The root permit record is the controller owner.',
   ),
   proof(
+    'src/store/workspace-runtime.ts#claimWorkspaceReplacementContinuation|abort-controller|acquire|new AbortController|fnv1a32:dcbfa1e8|1',
+    'const controller = new AbortController()',
+    [
+      at(
+        'src/store/workspace-runtime.ts',
+        528,
+        'continuationRecords.set(continuation, record)',
+        'identity-retained',
+      ),
+      at(
+        'src/store/workspace-runtime.ts',
+        562,
+        'record.controller.abort(cancellation)',
+        'cancellation-release',
+      ),
+      at(
+        'src/store/workspace-runtime.ts',
+        583,
+        'activeContinuations.delete(record)',
+        'terminal-release',
+      ),
+      at(
+        'src/store/browser-workspace-replacement-runner.ts',
+        327,
+        'releaseWorkspaceReplacementContinuation(work.continuation)',
+        'release-implementation',
+      ),
+    ],
+    'controller -> ReplacementContinuationRecord -> activeContinuations; exact continuation cancellation aborts that controller, while the runner finally unlinks producer, caller and authority and removes the same active record',
+    'Custody survives round epochs without becoming a drainable root; every terminal replacement path releases the retained continuation.',
+  ),
+  proof(
     'src/store/workspace-runtime.ts#beginReconciliation|abort-controller|acquire|new AbortController|fnv1a32:dcbfa1e8|1',
     'const controller = new AbortController()',
     [

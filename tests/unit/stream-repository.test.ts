@@ -18,6 +18,10 @@ import {
   shutdownBrowserWorkspace,
 } from '../../src/store/browser-workspace-lifecycle'
 import { configurationApplication } from '../../src/store/configuration-application'
+import {
+  configurationRequestRevisionFor,
+  configurationRequestRevisionKey,
+} from '../../src/store/configuration-domain-contract'
 import { importMessagesOp } from '../../src/store/conversation-command-client'
 import { __resetDbForTests, childListKey, getDb } from '../../src/store/db'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
@@ -626,6 +630,80 @@ describe('browser stream repository protocol', () => {
     expect(committedChat?.lastUpdatedLeafId).toBe(preparedInput.assistantMessageId)
     expect(committedChat?.previewText).toBe('question-0')
   })
+
+  it.each(['current', 'other-profile', 'other-model', 'old-key-revision'] as const)(
+    'uses carried discovery only for the current request identity: %s',
+    async (identity) => {
+      const selectedProfile = {
+        ...profile(),
+        id: 'selected-discovery-profile',
+        kind: 'openrouter' as const,
+      }
+      await installGenerationProfile(selectedProfile)
+      const seeded = await seedTargets(1)
+      await updateChatForTest(seeded.chatId, {
+        settings: { ...settings(), profileId: selectedProfile.id },
+      })
+      const preparedInput = await warmSendPrepareInput(seeded.chatId, requiredTarget(seeded, 0))
+      const profileRevision = configurationRequestRevisionKey(
+        configurationRequestRevisionFor(selectedProfile, undefined),
+      )
+      const row = {
+        profileId: identity === 'other-profile' ? 'other-profile' : selectedProfile.id,
+        modelId: identity === 'other-model' ? 'other/model' : MODEL,
+        profileRevision:
+          identity === 'old-key-revision' ? 'obsolete-key-revision' : profileRevision,
+        fetchedAt: STARTED_AT,
+        payload: {
+          data: {
+            id: MODEL,
+            endpoints: [
+              {
+                provider_name: 'Selected',
+                data_policy: {
+                  training: false,
+                  trainingOpenRouter: false,
+                  retainsPrompts: false,
+                  canPublish: false,
+                  requiresUserIDs: false,
+                },
+              },
+            ],
+          },
+        },
+      }
+      const privacy = { ...row, payload: { policies: { Selected: { training: false } } } }
+      expect(await getDb().endpoints.count()).toBe(0)
+      const endpointsTable = getDb().endpoints
+      const tablePrototype = Object.getPrototypeOf(endpointsTable) as typeof endpointsTable
+      const originalGet = tablePrototype.get
+      const discoveryReads: string[] = []
+      vi.spyOn(tablePrototype, 'get').mockImplementation(function (
+        this: typeof tablePrototype,
+        key,
+        thenShortcut,
+      ) {
+        if (this.name === 'endpoints' || this.name === 'privacyPolicies') {
+          discoveryReads.push(this.name)
+        }
+        return originalGet.call(this, key, thenShortcut)
+      })
+      const prepared = await execute({
+        kind: 'attempt.prepare',
+        input: {
+          ...preparedInput.input,
+          configurationIntent: {
+            ...preparedInput.input.configurationIntent,
+            discovery: { endpoints: row, privacy },
+          },
+        },
+      })
+      expect(prepared.planning.discovery.endpoints).toEqual(identity === 'current' ? row : null)
+      expect(prepared.planning.discovery.privacy).toEqual(identity === 'current' ? privacy : null)
+      expect(discoveryReads).toEqual(identity === 'current' ? [] : ['endpoints', 'privacyPolicies'])
+      expect(await getDb().endpoints.count()).toBe(0)
+    },
+  )
 
   it('plans from the admitted settings when the durable chat changes before prepare', async () => {
     const seeded = await seedTargets(1)

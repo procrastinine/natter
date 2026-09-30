@@ -1,9 +1,10 @@
 import type { WorkspaceFence } from './repository'
 import type {
   WorkspaceReconcileAuthority,
+  WorkspaceReplacementAuthorityOptions,
+  WorkspaceReplacementLaunchArguments,
   WorkspaceReplacementRootKind,
   WorkspaceRootAdmissionCapability,
-  WorkspaceRuntimeActionOptions,
   WorkspaceRuntimeKernel,
   WorkspaceRuntimeOpenedEvent,
   WorkspaceRuntimeState,
@@ -410,13 +411,16 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
     assertResourceManifestInstalled()
     const snapshot = runtime.snapshot()
     if (
+      snapshot.state === 'STARTING' ||
+      snapshot.state === 'RECONCILING' ||
       snapshot.state === 'SEALED' ||
       snapshot.state === 'QUIESCED' ||
-      snapshot.state === 'FAILED_CLOSED'
+      snapshot.state === 'FAILED_CLOSED' ||
+      snapshot.state === 'QUIESCING'
     ) {
+      if (mode === 'abortive') runtime.cancelReplacementContinuations('shutdown')
       return
     }
-    if (snapshot.state === 'QUIESCING') return
     prepareWorkspaceRuntimeQuiesce(mode)
     if (mode === 'graceful') runtime.beginGracefulQuiesce()
     else runtime.beginQuiesce()
@@ -465,11 +469,10 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
   }
 
   function launchWorkspaceRuntimeReplacementNowImpl(
-    kind: WorkspaceReplacementRootKind,
-    options: WorkspaceRuntimeActionOptions & { readonly requireIdle: boolean },
+    ...request: WorkspaceReplacementLaunchArguments
   ): WorkspaceReconcileAuthority | null {
     assertResourceManifestInstalled()
-    return runtime.launchReplacementNow(kind, options, prepareReplacementQuiesce)
+    return runtime.launchReplacementNow(...request, prepareReplacementQuiesce)
   }
 
   function prepareReplacementQuiesce(): void {
@@ -964,28 +967,34 @@ export type WorkspaceRuntimeControlKernel = ReturnType<typeof createWorkspaceRun
 const productionWorkspaceRuntimeControl: WorkspaceRuntimeControlKernel =
   createWorkspaceRuntimeControlKernel(workspaceRuntimeInternal)
 
-type WorkspaceReplacementAdmissionRequiresIdle<Kind extends WorkspaceReplacementRootKind> =
-  Kind extends 'maintenance' ? true : false
+type RequiredReplacementAdmission = WorkspaceRootAdmissionCapability<
+  (options: WorkspaceReplacementAuthorityOptions) => WorkspaceReconcileAuthority | null,
+  { readonly fixedKind: 'workspace-replacement' }
+>
 
-export type WorkspaceReplacementAuthorityOptions<Kind extends WorkspaceReplacementRootKind> =
-  Kind extends 'maintenance'
-    ? Pick<WorkspaceRuntimeActionOptions, 'lineageId'>
-    : WorkspaceRuntimeActionOptions
+type MaintenanceReplacementAdmission = WorkspaceRootAdmissionCapability<
+  (options: WorkspaceReplacementAuthorityOptions) => WorkspaceReconcileAuthority | null,
+  { readonly fixedKind: 'maintenance' }
+>
 
-function createWorkspaceReplacementAdmission<const Kind extends WorkspaceReplacementRootKind>(
-  kind: Kind,
-  requireIdle: WorkspaceReplacementAdmissionRequiresIdle<Kind>,
+function createWorkspaceReplacementAdmission(
+  kind: 'workspace-replacement',
+  requireIdle: false,
   admission: WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementNow'],
-): WorkspaceRootAdmissionCapability<
-  (options?: WorkspaceReplacementAuthorityOptions<Kind>) => WorkspaceReconcileAuthority | null,
-  { readonly fixedKind: Kind }
-> {
-  const fixedAdmission = (options?: WorkspaceRuntimeActionOptions) =>
+): RequiredReplacementAdmission
+function createWorkspaceReplacementAdmission(
+  kind: 'maintenance',
+  requireIdle: true,
+  admission: WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementNow'],
+): MaintenanceReplacementAdmission
+function createWorkspaceReplacementAdmission(
+  kind: WorkspaceReplacementRootKind,
+  requireIdle: boolean,
+  admission: WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementNow'],
+): RequiredReplacementAdmission | MaintenanceReplacementAdmission {
+  const fixedAdmission = (options: WorkspaceReplacementAuthorityOptions) =>
     admission(kind, { ...options, requireIdle })
-  return fixedAdmission as WorkspaceRootAdmissionCapability<
-    typeof fixedAdmission,
-    { readonly fixedKind: Kind }
-  >
+  return fixedAdmission as RequiredReplacementAdmission | MaintenanceReplacementAdmission
 }
 
 export function installWorkspaceRuntimeResources(

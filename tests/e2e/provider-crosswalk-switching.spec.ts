@@ -193,7 +193,7 @@ test('a failed OpenRouter reload retains stale rows, stays settled across remoun
   const recoveredModelId = 'test/recovered-catalog-model'
   let response: 'initial' | 'failed' | 'recovered' = 'initial'
   let modelRequestCount = 0
-  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     const url = new URL(route.request().url())
     if (url.pathname !== '/api/v1/models') {
       await route.fallback()
@@ -327,7 +327,7 @@ test('a failed OpenRouter reload retains stale rows, stays settled across remoun
 })
 
 async function mockModelLists(page: Page): Promise<void> {
-  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -340,16 +340,16 @@ async function mockModelLists(page: Page): Promise<void> {
       }),
     })
   })
-  await page.route('https://api.anthropic.com/v1/models**', async (route) => {
+  await page.context().route('https://api.anthropic.com/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({ data: [] }),
     })
   })
-  await page.route(
-    'https://generativelanguage.googleapis.com/v1beta/openai/models**',
-    async (route) => {
+  await page
+    .context()
+    .route('https://generativelanguage.googleapis.com/v1beta/openai/models*', async (route) => {
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -360,9 +360,8 @@ async function mockModelLists(page: Page): Promise<void> {
           ],
         }),
       })
-    },
-  )
-  await page.route('https://api.openai.com/v1/models**', async (route) => {
+    })
+  await page.context().route('https://api.openai.com/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -388,7 +387,7 @@ async function mockOpenRouterRouting(
   const failed = new Promise<void>((resolve) => {
     releaseFailure = resolve
   })
-  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     const path = new URL(route.request().url()).pathname
     const modelId = decodeURIComponent(
       path.slice('/api/v1/models/'.length, path.length - '/endpoints'.length),
@@ -422,7 +421,7 @@ async function mockOpenRouterRouting(
       }),
     })
   })
-  await page.route('**/_or_scrape/**', async (route) => {
+  await page.context().route('**/_or_scrape/**', async (route) => {
     if (new URL(route.request().url()).pathname.endsWith(`/${delayedPrivacyModelId}/providers`)) {
       markRequested()
       await failed

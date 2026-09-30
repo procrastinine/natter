@@ -93,8 +93,8 @@ export const productionAsyncOwnershipReviews = Object.freeze([
     'Closing a conversation-read scope never creates a second rejected leg or leaves the awaited frame unobserved.',
   ),
   proof(
-    'src/store/locks.ts#<anonymous>|detached-promise|fnv1a32:9c359d1b|1',
-    'void wake.then(() => finish())',
+    'src/store/locks.ts#<anonymous>|detached-promise|fnv1a32:db29f769|1',
+    'void wake.then(() => finish(resolve))',
     [
       at(
         'src/store/locks.ts',
@@ -144,8 +144,8 @@ export const productionAsyncOwnershipReviews = Object.freeze([
     'Queue admission has no detached failure channel.',
   ),
   proof(
-    'src/store/locks.ts#<anonymous>|detached-promise|fnv1a32:1e014b5f|1',
-    "void this.disposedSignal.then(() => finish(() => reject(new Error('LockBackendDisposed'))))",
+    'src/store/locks.ts#<anonymous>|detached-promise|fnv1a32:1921f751|1',
+    'void this.disposedSignal.then(() => finish(() => reject(this.disposalReason)))',
     [
       at(
         'src/store/locks.ts',

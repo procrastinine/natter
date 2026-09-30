@@ -83,7 +83,7 @@ export const STARTUP_ENTRY_PATHS = Object.freeze([
   pathBranch(
     'terminally-sealed',
     'src/store/browser-workspace-lifecycle.ts',
-    "if (snapshot.state === 'SEALED') {\n    return Promise.reject(new Error('BrowserWorkspaceTerminalShutdown'))",
+    "if (snapshot.state === 'SEALED' || shutdownTransition?.terminal) {\n    return Promise.reject(new Error('BrowserWorkspaceTerminalShutdown'))",
     'Reject future opens after terminal disposal.',
   ),
   pathBranch(
@@ -107,8 +107,8 @@ export const STARTUP_ENTRY_PATHS = Object.freeze([
   pathBranch(
     'cancelled-open-followup',
     'src/store/browser-workspace-lifecycle.ts',
-    'return awaitExpectedBrowserWorkspaceOpenCancellation(existing).then(() =>\n      openBrowserWorkspace(options),',
-    'A cancelled attempt closes before a new authority is created.',
+    'return awaitExpectedBrowserWorkspaceOpenCancellation(existing).then(() =>\n      openBrowserWorkspaceAtTarget(target, options),',
+    'A cancelled attempt closes before a new authority is created, preserving the active or retained-source target.',
   ),
   pathBranch(
     'new-open-authority',
@@ -119,8 +119,8 @@ export const STARTUP_ENTRY_PATHS = Object.freeze([
   pathBranch(
     'quiescing-drain',
     'src/store/browser-workspace-lifecycle.ts',
-    "if (snapshot.state === 'QUIESCING') {\n      await (shutdownTransition?.promise ?? awaitWorkspaceRuntimeQuiesced())",
-    'An open waits for the owned close transition rather than racing it.',
+    "if (snapshot.state === 'QUIESCING') {\n      await awaitWorkspaceRuntimeQuiesced()\n      assertBrowserWorkspaceBootstrapAuthority(attempt.authority)",
+    'An open waits for resource quiescence and revalidates its bootstrap authority; it cannot await a terminal handoff drain that depends on this open.',
   ),
   pathBranch(
     'unified-stable-open',
@@ -131,8 +131,8 @@ export const STARTUP_ENTRY_PATHS = Object.freeze([
   pathBranch(
     'fatal-open-terminal-cleanup',
     'src/store/browser-workspace-lifecycle.ts',
-    "if (getWorkspaceRuntimeControlSnapshot().state === 'SEALED') {\n      await finalizeTerminalBrowserWorkspaceLifecycle().catch((cleanupError) => {",
-    'A failed open that sealed the runtime enters the same presentation-first terminal finalizer as an explicit terminal shutdown.',
+    "if (getWorkspaceRuntimeControlSnapshot().state === 'SEALED') {\n      void finalizeTerminalBrowserWorkspaceLifecycle().catch(scheduleFatalWorkspaceReload)",
+    'A failed open that sealed the runtime starts the same presentation-first terminal finalizer; its rejection has a fatal-reload owner without making the open await its own terminal drain.',
   ),
 ])
 
@@ -140,7 +140,7 @@ export const UNIFIED_REOPEN_SEQUENCE = Object.freeze([
   stage(
     'reopen-inflight-quiesce-drain',
     'src/store/browser-workspace-lifecycle.ts',
-    "if (snapshot.state === 'QUIESCING') {\n      await (shutdownTransition?.promise ?? awaitWorkspaceRuntimeQuiesced())",
+    "if (snapshot.state === 'QUIESCING') {\n      await awaitWorkspaceRuntimeQuiesced()\n      assertBrowserWorkspaceBootstrapAuthority(attempt.authority)",
     'workspace-core-readiness',
   ),
   stage(

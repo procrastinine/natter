@@ -174,6 +174,38 @@ function chatTokenCalibrationGeneration(chat: Pick<Chat, 'tokenCalibrationGenera
     : 0
 }
 
+async function captureGenerationConnectionEvidence(
+  tx: Transaction,
+  profile: ConnectionProfile,
+  modelId: string,
+  keyRefs: readonly KeyId[],
+  intent: PrepareAttemptConfigurationIntent,
+) {
+  const keyRecords = await tx.table<KeyRecord, KeyId>('keys').bulkGet([...keyRefs])
+  const revision = configurationRequestRevisionFor(
+    profile,
+    profile.apiKeyRef ? keyRecords.find((record) => record?.id === profile.apiKeyRef) : undefined,
+  )
+  const revisionKey = connectionDiscoveryRevisionKey(revision)
+  const matchesIdentity = (
+    row: { profileId: ProfileId; modelId: string; profileRevision: string } | undefined,
+  ) =>
+    row?.profileId === profile.id && row.modelId === modelId && row.profileRevision === revisionKey
+  const [endpoints, privacy] = await Dexie.Promise.all([
+    profile.kind !== 'openrouter'
+      ? Dexie.Promise.resolve(undefined)
+      : matchesIdentity(intent.discovery?.endpoints)
+        ? Dexie.Promise.resolve(intent.discovery?.endpoints)
+        : readDiscoveryCacheRow(tx, 'endpoints', [profile.id, modelId]),
+    profile.kind !== 'openrouter'
+      ? Dexie.Promise.resolve(undefined)
+      : matchesIdentity(intent.discovery?.privacy)
+        ? Dexie.Promise.resolve(intent.discovery?.privacy)
+        : readDiscoveryCacheRow(tx, 'privacyPolicies', [profile.id, modelId]),
+  ])
+  return { keyRecords, revision, revisionKey, endpoints, privacy }
+}
+
 async function captureGenerationPlanningSnapshot(
   tx: Transaction,
   chatId: ChatId,
@@ -196,35 +228,24 @@ async function captureGenerationPlanningSnapshot(
     CORS_PROXY_SECRET_KEY,
   ]
   const textTemplateId = planningChat.settings.textTemplate
-  const [keyRecords, modelsRow, endpointsRow, privacyRow, settingRows, savedTextTemplate] =
-    await Dexie.Promise.all([
-      tx.table<KeyRecord, KeyId>('keys').bulkGet(keyRefs),
-      profile.kind === 'openrouter'
-        ? Dexie.Promise.resolve(undefined)
-        : readDiscoveryCacheRow(tx, 'models', [
-            profile.id,
-            modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind)),
-          ]),
-      profile.kind === 'openrouter'
-        ? readDiscoveryCacheRow(tx, 'endpoints', [profile.id, modelId])
-        : Dexie.Promise.resolve(undefined),
-      profile.kind === 'openrouter'
-        ? readDiscoveryCacheRow(tx, 'privacyPolicies', [profile.id, modelId])
-        : Dexie.Promise.resolve(undefined),
-      tx.table<SettingsRow, string>('settings').bulkGet(settingKeys),
-      textTemplateId && !isStaticTextTemplateId(textTemplateId)
-        ? tx.table<SavedTextTemplate, string>('textTemplates').get(textTemplateId)
-        : Dexie.Promise.resolve(undefined),
-    ])
+  const [connection, modelsRow, settingRows, savedTextTemplate] = await Dexie.Promise.all([
+    captureGenerationConnectionEvidence(tx, profile, modelId, keyRefs, intent),
+    profile.kind === 'openrouter'
+      ? Dexie.Promise.resolve(undefined)
+      : readDiscoveryCacheRow(tx, 'models', [
+          profile.id,
+          modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind)),
+        ]),
+    tx.table<SettingsRow, string>('settings').bulkGet(settingKeys),
+    textTemplateId && !isStaticTextTemplateId(textTemplateId)
+      ? tx.table<SavedTextTemplate, string>('textTemplates').get(textTemplateId)
+      : Dexie.Promise.resolve(undefined),
+  ])
   const preferredDispatchKeyId =
     intent.preferredDispatchKeyId !== null && keyRefs.includes(intent.preferredDispatchKeyId)
       ? intent.preferredDispatchKeyId
       : null
-  const discoveryRevision = configurationRequestRevisionFor(
-    profile,
-    profile.apiKeyRef ? keyRecords.find((record) => record?.id === profile.apiKeyRef) : undefined,
-  )
-  const discoveryRevisionKey = connectionDiscoveryRevisionKey(discoveryRevision)
+  const { keyRecords, revision: discoveryRevision, revisionKey: discoveryRevisionKey } = connection
   const modelsQueryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
   const modelRows =
     modelsRow?.profileRevision === discoveryRevisionKey
@@ -244,9 +265,13 @@ async function captureGenerationPlanningSnapshot(
           }
         : null,
     endpoints:
-      endpointsRow?.profileRevision === discoveryRevisionKey ? structuredClone(endpointsRow) : null,
+      connection.endpoints?.profileRevision === discoveryRevisionKey
+        ? structuredClone(connection.endpoints)
+        : null,
     privacy:
-      privacyRow?.profileRevision === discoveryRevisionKey ? structuredClone(privacyRow) : null,
+      connection.privacy?.profileRevision === discoveryRevisionKey
+        ? structuredClone(connection.privacy)
+        : null,
   }
   const settingsByKey = new Map(
     settingKeys.map((key, index) => [key, settingRows[index]?.value] as const),

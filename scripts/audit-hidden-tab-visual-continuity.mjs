@@ -3,6 +3,8 @@ import { isAbsolute, relative, resolve } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 import { staticAuditState } from './audit-result-state.mjs'
+import { VERIFICATION_STAGES } from './run-verification.mjs'
+import { verificationStageReferenceProblems } from './verification-stage-contract.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
 const DEFAULT_INVENTORY = resolve(ROOT, 'scripts/hidden-tab-visual-continuity-inventory.mjs')
@@ -195,6 +197,18 @@ function validateSourceLocators(entries, label, root, problems) {
     const relativePath = relative(root, absolute)
     if (relativePath.startsWith('..') || isAbsolute(relativePath) || !existsSync(absolute)) {
       problems.push(`${prefix}: source path does not exist: ${entry.path}`)
+      continue
+    }
+    if (entry.stage !== undefined) {
+      if (label !== 'proofs') {
+        problems.push(`${prefix}: stage reference is only valid for proofs`)
+        continue
+      }
+      problems.push(
+        ...verificationStageReferenceProblems(entry, VERIFICATION_STAGES).map(
+          (problem) => `${prefix}: ${problem}`,
+        ),
+      )
       continue
     }
     if (!isNonEmptyString(entry.locator)) {

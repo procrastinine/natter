@@ -1,3 +1,5 @@
+import { verificationStageReference } from './verification-stage-contract.mjs'
+
 export const HIDDEN_TAB_PAINTED_SURFACES = Object.freeze([
   surface(
     'profile-glyph-svg',
@@ -126,11 +128,11 @@ export const HIDDEN_TAB_EXISTING_PROOFS = Object.freeze([
   ),
   proof(
     'headed-native-visibility-project',
-    'playwright.config.ts',
+    'scripts/playwright-projects.mjs',
     "name: 'chromium-headed-visibility'",
     'browser',
     'Runs the existing visibility journey in a real headed Chromium page with one worker and native background-renderer behavior.',
-    ['headless: false', 'testMatch: /reactive-storage-stress\\.spec\\.ts$/u'],
+    ['headed: true', 'testMatch: [/reactive-storage-stress\\.spec\\.ts$/u]'],
   ),
   proof(
     'headed-native-visibility-xvfb',
@@ -140,14 +142,16 @@ export const HIDDEN_TAB_EXISTING_PROOFS = Object.freeze([
     'Provides a deterministic display server while a real window manager owns native activation.',
     ['node scripts/run-headed-visibility.mjs', '-screen 0 1440x1000x24'],
   ),
-  proof(
-    'headed-native-visibility-checkpoint-stage',
-    'scripts/run-verification.mjs',
-    "stage(\n    'headed-hidden-tab-visual-continuity',",
-    'browser',
-    'Makes the native visibility journey a blocking immutable-candidate capability.',
-    ["['pnpm', 'run', 'e2e:headed-visibility']"],
-  ),
+  Object.freeze({
+    id: 'headed-native-visibility-checkpoint-stage',
+    ...verificationStageReference('headed-hidden-tab-visual-continuity', {
+      policy: 'blocking',
+      kind: 'playwright',
+      browserProjects: ['chromium-headed-visibility'],
+    }),
+    kind: 'browser',
+    limit: 'Makes the native visibility journey a blocking immutable-candidate capability.',
+  }),
   proof(
     'first-foreground-paint-fingerprints',
     'tests/e2e/reactive-storage-stress.spec.ts',

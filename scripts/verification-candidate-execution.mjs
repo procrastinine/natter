@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, resolve } from 'node:path'
 import process from 'node:process'
+import { capturedTestCompilerExecution } from './test-compiler-cohort.mjs'
 import {
   assertMaterializedVerificationCandidateExecutionReady,
   installMaterializedVerificationCandidateRuntime,
@@ -36,7 +37,14 @@ export async function executeMaterializedVerificationCandidate(options, operatio
       options.baseEnv ?? process.env,
       runtime,
     )
-    return await operation(Object.freeze({ candidate, runtime, environment }))
+    return await operation(
+      Object.freeze({
+        candidate,
+        runtime,
+        environment,
+        testCompilerProof: (stage) => capturedTestCompilerExecution(stage, candidate),
+      }),
+    )
   } finally {
     releaseVerificationProcessLease(lease)
   }

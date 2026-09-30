@@ -1,6 +1,12 @@
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
+import { VERIFICATION_STAGES } from '../../scripts/run-verification.mjs'
+import {
+  type VerificationStageReference,
+  verificationStageReference,
+  verificationStageReferenceProblems,
+} from '../../scripts/verification-stage-contract.mjs'
 
 const ROOT = resolve(__dirname, '../..')
 const AUDIT_URL = pathToFileURL(
@@ -18,6 +24,7 @@ interface PaintedSurface {
 
 interface HiddenTabProof {
   readonly id: string
+  readonly stage?: VerificationStageReference['stage']
   readonly requiredLocators?: readonly string[]
   readonly [field: string]: unknown
 }
@@ -74,6 +81,56 @@ beforeAll(async () => {
 })
 
 describe('hidden-tab visual continuity architecture audit', () => {
+  it('links proof to one canonical stage identity even when another invocation uses the same command', () => {
+    const reference = verificationStageReference('headed-hidden-tab-visual-continuity', {
+      policy: 'blocking',
+      kind: 'playwright',
+      browserProjects: ['chromium-headed-visibility'],
+    })
+    const owner = VERIFICATION_STAGES.find((stage) => stage.id === reference.stage.id)
+    if (!owner) throw new Error('HeadedStageMissing')
+    expect(
+      verificationStageReferenceProblems(reference, [
+        owner,
+        { ...owner, id: 'grouped-headed-invocation' },
+      ]),
+    ).toEqual([])
+    expect(verificationStageReferenceProblems(reference, [])).toEqual([
+      'VerificationStageReferenceCardinality:headed-hidden-tab-visual-continuity:0',
+    ])
+    expect(verificationStageReferenceProblems(reference, [owner, owner])).toEqual([
+      'VerificationStageReferenceCardinality:headed-hidden-tab-visual-continuity:2',
+    ])
+    expect(
+      verificationStageReferenceProblems(reference, [{ ...owner, policy: 'advisory' }]),
+    ).toContain(
+      'VerificationStageReferencePolicy:headed-hidden-tab-visual-continuity:blocking:advisory',
+    )
+    expect(verificationStageReferenceProblems(reference, [{ ...owner, kind: 'node' }])).toContain(
+      'VerificationStageReferenceKind:headed-hidden-tab-visual-continuity:playwright:node',
+    )
+    expect(
+      verificationStageReferenceProblems(reference, [{ ...owner, browserProjects: ['chromium'] }]),
+    ).toContain('VerificationStageReferenceBrowserProjects:headed-hidden-tab-visual-continuity')
+  })
+
+  it('rejects a hidden-tab proof reference whose stage no longer exists', () => {
+    const changed = {
+      ...inventory,
+      HIDDEN_TAB_EXISTING_PROOFS: inventory.HIDDEN_TAB_EXISTING_PROOFS.map((proof) =>
+        proof.stage
+          ? {
+              ...proof,
+              stage: { ...proof.stage, id: 'removed-headed-stage' },
+            }
+          : proof,
+      ),
+    }
+    expect(evaluateHiddenTabVisualContinuity(changed, 'inventory', ROOT).problems).toContain(
+      'proofs:headed-native-visibility-checkpoint-stage: VerificationStageReferenceCardinality:removed-headed-stage:0',
+    )
+  })
+
   it('keeps every painted surface, transition, proof, gap, and acceptance invariant explicit', () => {
     const result = evaluateHiddenTabVisualContinuity(inventory, 'inventory', ROOT)
 

@@ -1,6 +1,5 @@
 import { raceWithAbortSignal } from '../lib/abort'
 import { browserLocalStorage } from '../lib/browser-storage'
-import { errorFromUnknown } from '../lib/error'
 import {
   BROWSER_WORKSPACE_DATABASE_NAMES,
   type BrowserWorkspaceDatabaseName,
@@ -11,8 +10,9 @@ const SLOT_CHANNEL_NAME = 'natter-workspace-slot-control:v1'
 const SLOT_SIGNAL_KEY = 'natter:workspace-slot-control:v1'
 const SLOT_LOCK_PREFIX = 'natter:workspace-slot:'
 const SLOT_SELECTION_GATE_LOCK = 'natter:workspace-slot-selection:v1'
+const SLOT_ROUND_LOCK_PREFIX = 'natter:workspace-slot-round:'
 
-interface WorkspaceSlotQuiesceMessage {
+interface WorkspaceSlotQuiesceMessage extends BrowserWorkspaceSlotTransition {
   readonly kind: 'quiesce'
   readonly senderId: string
   readonly nonce: string
@@ -20,17 +20,34 @@ interface WorkspaceSlotQuiesceMessage {
   readonly destinationDatabaseName: BrowserWorkspaceDatabaseName
 }
 
-type WorkspaceSlotMessage = WorkspaceSlotQuiesceMessage
+interface WorkspaceSlotForegroundDemandMessage extends BrowserWorkspaceSlotTransition {
+  readonly kind: 'foreground-demand'
+  readonly senderId: string
+}
+
+type WorkspaceSlotMessage = WorkspaceSlotQuiesceMessage | WorkspaceSlotForegroundDemandMessage
 
 export interface BrowserWorkspaceSlotTransition {
+  readonly roundId: string
   readonly nonce: string
   readonly sourceDatabaseName: BrowserWorkspaceDatabaseName
   readonly destinationDatabaseName: BrowserWorkspaceDatabaseName
 }
 
+export interface BrowserWorkspaceSlotRoundObservation {
+  readonly signal: AbortSignal
+  readonly finished: Promise<void>
+}
+
 interface WorkspaceSlotLifecycle {
+  foregroundDemandSignal(): AbortSignal
+  preemptMaintenance(): void
   validateQuiesce(transition: BrowserWorkspaceSlotTransition, signal: AbortSignal): Promise<boolean>
-  reconcile(transition: BrowserWorkspaceSlotTransition, signal: AbortSignal): Promise<void>
+  reconcile(
+    transition: BrowserWorkspaceSlotTransition,
+    signal: AbortSignal,
+    round: BrowserWorkspaceSlotRoundObservation,
+  ): Promise<void>
 }
 
 declare const browserWorkspaceSlotCoordinatorOwnerBrand: unique symbol
@@ -44,6 +61,7 @@ interface BrowserWorkspaceSlotCoordinatorOwnerRecord {
   readonly controller: AbortController
   readonly disposalReason: Error
   inbound: Promise<void>
+  outboundTransition: BrowserWorkspaceSlotTransition | null
   channel: BroadcastChannel | null
   channelUnavailable: boolean
   storageListener: ((event: StorageEvent) => void) | null
@@ -100,6 +118,7 @@ export function installBrowserWorkspaceSlotCoordinator(
     controller: new AbortController(),
     disposalReason: new Error('BrowserWorkspaceSlotCoordinatorDisposed'),
     inbound: Promise.resolve(),
+    outboundTransition: null,
     channel: null,
     channelUnavailable: false,
     storageListener: null,
@@ -117,6 +136,7 @@ export function disposeBrowserWorkspaceSlotCoordinator(
   if (!owner.active) return
   if (coordinatorOwner !== owner) throw new Error('BrowserWorkspaceSlotCoordinatorOwnerMismatch')
   owner.active = false
+  owner.outboundTransition = null
   coordinatorOwner = null
   owner.controller.abort(owner.disposalReason)
   const failures: unknown[] = []
@@ -157,7 +177,7 @@ export function withBrowserWorkspaceSelectionGate<T>(
   operation: (grant: BrowserWorkspaceSelectionGrant) => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
-  if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
+  if (signal?.aborted) return Promise.reject(signal.reason)
   const manager = slotLockManager()
   if (!manager) return operation({ mode: 'exclusive' } as BrowserWorkspaceSelectionGrant)
   return manager.request(
@@ -165,7 +185,7 @@ export function withBrowserWorkspaceSelectionGate<T>(
     { mode: 'exclusive', ...(signal ? { signal } : {}) },
     (lock) => {
       if (!lock) throw new Error('BrowserWorkspaceSelectionGateUnavailable')
-      if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+      if (signal?.aborted) throw signal.reason
       return operation({ mode: 'exclusive' } as BrowserWorkspaceSelectionGrant)
     },
   )
@@ -176,7 +196,7 @@ export function withBrowserWorkspaceSlotOperation<T>(
   operation: BrowserWorkspaceSlotOperation<T>,
   signal?: AbortSignal,
 ): Promise<T> {
-  if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
+  if (signal?.aborted) return Promise.reject(signal.reason)
   if (operation.kind === 'transient-probe') {
     return withBrowserWorkspacePhysicalSlotProbe(databaseName, operation.run, signal)
   }
@@ -187,7 +207,7 @@ export function withBrowserWorkspaceSlotOperation<T>(
     { mode: 'shared', ...(signal ? { signal } : {}) },
     (lock) => {
       if (!lock) throw new Error('BrowserWorkspaceSlotProbeAdmissionUnavailable')
-      if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+      if (signal?.aborted) throw signal.reason
       return withBrowserWorkspacePhysicalSlotProbe(databaseName, operation.run, signal)
     },
   )
@@ -198,7 +218,7 @@ function withBrowserWorkspacePhysicalSlotProbe<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
-  if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
+  if (signal?.aborted) return Promise.reject(signal.reason)
   const manager = slotLockManager()
   if (!manager) return operation()
   return manager.request(
@@ -206,7 +226,7 @@ function withBrowserWorkspacePhysicalSlotProbe<T>(
     { mode: 'shared', ...(signal ? { signal } : {}) },
     (lock) => {
       if (!lock) throw new Error('BrowserWorkspaceSlotProbeUnavailable')
-      if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+      if (signal?.aborted) throw signal.reason
       return operation()
     },
   )
@@ -216,7 +236,7 @@ export async function tryWithBrowserWorkspaceSelectionGate<T>(
   operation: (grant: BrowserWorkspaceSelectionGrant) => Promise<T>,
   signal?: AbortSignal,
 ): Promise<{ acquired: false } | { acquired: true; value: T }> {
-  if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+  if (signal?.aborted) throw signal.reason
   const manager = slotLockManager()
   if (!manager) return { acquired: false }
   return new Promise((resolve, reject) => {
@@ -230,7 +250,7 @@ export async function tryWithBrowserWorkspaceSelectionGate<T>(
     }
     const abort = () => {
       if (callbackStarted) return
-      finish(() => reject(workspaceSlotAbortError(signal?.reason)))
+      finish(() => reject(signal?.reason))
     }
     signal?.addEventListener('abort', abort, { once: true })
     let request: Promise<{ acquired: false } | { acquired: true; value: T }>
@@ -242,7 +262,7 @@ export async function tryWithBrowserWorkspaceSelectionGate<T>(
           callbackStarted = true
           signal?.removeEventListener('abort', abort)
           if (!lock) return { acquired: false }
-          if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+          if (signal?.aborted) throw signal.reason
           return {
             acquired: true,
             value: await operation({ mode: 'exclusive' } as BrowserWorkspaceSelectionGrant),
@@ -250,12 +270,12 @@ export async function tryWithBrowserWorkspaceSelectionGate<T>(
         },
       )
     } catch (error) {
-      finish(() => reject(errorFromUnknown(error)))
+      finish(() => reject(error))
       return
     }
     void request.then(
       (value) => finish(() => resolve(value)),
-      (error: unknown) => finish(() => reject(errorFromUnknown(error))),
+      (error: unknown) => finish(() => reject(error)),
     )
   })
 }
@@ -264,7 +284,7 @@ export async function acquireBrowserWorkspaceSlotLease(
   databaseName: BrowserWorkspaceDatabaseName,
   signal?: AbortSignal,
 ): Promise<BrowserWorkspaceSlotLeaseHandle> {
-  if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+  if (signal?.aborted) throw signal.reason
   if (activeLease?.databaseName === databaseName) {
     return activeLease as unknown as BrowserWorkspaceSlotLeaseHandle
   }
@@ -296,7 +316,7 @@ export async function acquireBrowserWorkspaceSlotLease(
       { mode: 'shared', ...(signal ? { signal } : {}) },
       async (lock) => {
         if (!lock) throw new Error('BrowserWorkspaceSlotSharedLockUnavailable')
-        if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+        if (signal?.aborted) throw signal.reason
         resolveReady()
         await hold
       },
@@ -330,12 +350,74 @@ export async function releaseBrowserWorkspaceSlotLease(
   await lease.done
 }
 
-export function postBrowserWorkspaceSlotQuiesce(message: {
-  nonce: string
-  sourceDatabaseName: BrowserWorkspaceDatabaseName
-  destinationDatabaseName: BrowserWorkspaceDatabaseName
-}): void {
-  postSlotMessage({ kind: 'quiesce', senderId, ...message })
+export async function withBrowserWorkspaceSlotRound<T>(
+  message: Omit<BrowserWorkspaceSlotTransition, 'roundId'>,
+  operation: (quiesce: () => void) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) throw signal.reason
+  const owner = coordinatorOwner
+  if (!owner?.active) throw new Error('BrowserWorkspaceSlotCoordinatorUnavailable')
+  const manager = slotLockManager()
+  if (!manager) throw new Error('BrowserWorkspaceSlotLocksUnavailable')
+  const transition = { ...message, roundId: newId() }
+  return manager.request(
+    `${SLOT_ROUND_LOCK_PREFIX}${transition.roundId}`,
+    { mode: 'exclusive', ...(signal ? { signal } : {}) },
+    async (lock) => {
+      if (!lock) throw new Error('BrowserWorkspaceSlotRoundUnavailable')
+      if (signal?.aborted) throw signal.reason
+      assertSlotCoordinatorOwnerActive(owner)
+      const quiesce = () => {
+        if (owner.outboundTransition) throw new Error('BrowserWorkspaceSlotTransitionAlreadyOwned')
+        owner.outboundTransition = transition
+        postSlotMessage({ kind: 'quiesce', senderId, ...transition })
+      }
+      try {
+        return await operation(quiesce)
+      } finally {
+        if (owner.outboundTransition === transition) owner.outboundTransition = null
+      }
+    },
+  )
+}
+
+async function observeBrowserWorkspaceSlotRound<T>(
+  transition: BrowserWorkspaceSlotTransition,
+  signal: AbortSignal,
+  operation: (round: BrowserWorkspaceSlotRoundObservation) => Promise<T>,
+): Promise<void> {
+  const manager = slotLockManager()
+  if (!manager) throw new Error('BrowserWorkspaceSlotLocksUnavailable')
+  const name = `${SLOT_ROUND_LOCK_PREFIX}${transition.roundId}`
+  const ended = await manager.request(name, { mode: 'shared', ifAvailable: true }, (lock) => !!lock)
+  if (signal.aborted) throw signal.reason
+  if (ended) return
+  const lifetime = new AbortController()
+  const pendingRound = new AbortController()
+  const onAbort = () => {
+    lifetime.abort(signal.reason)
+    pendingRound.abort(signal.reason)
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  const finished = manager
+    .request(name, { mode: 'shared', signal: lifetime.signal }, () => {
+      pendingRound.abort(new DOMException('Workspace slot round ended', 'AbortError'))
+    })
+    .catch((error: unknown) => {
+      pendingRound.abort(error)
+      throw error
+    })
+  void finished.catch(() => undefined)
+  try {
+    await operation({ signal: pendingRound.signal, finished })
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+    lifetime.abort(new DOMException('Workspace slot round observation ended', 'AbortError'))
+    await finished.catch((error: unknown) => {
+      if (error !== lifetime.signal.reason) throw error
+    })
+  }
 }
 
 export async function withExclusiveBrowserWorkspaceSlots<T>(
@@ -344,7 +426,7 @@ export async function withExclusiveBrowserWorkspaceSlots<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
-  if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+  if (signal?.aborted) throw signal.reason
   const manager = slotLockManager()
   if (!manager) throw new Error('BrowserWorkspaceSlotLocksUnavailable')
   const names = [...new Set(databaseNames)].sort((left, right) => left.localeCompare(right))
@@ -356,7 +438,7 @@ export async function withExclusiveBrowserWorkspaceSlots<T>(
       { mode: 'exclusive', ...(signal ? { signal } : {}) },
       (lock) => {
         if (!lock) throw new Error('BrowserWorkspaceSlotExclusiveLockUnavailable')
-        if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+        if (signal?.aborted) throw signal.reason
         return acquire(index + 1)
       },
     )
@@ -488,6 +570,18 @@ function receiveSlotMessage(
 ): void {
   if (!isSlotMessage(value) || value.senderId === senderId) return
   if (!owner.active || coordinatorOwner !== owner) return
+  if (value.kind === 'foreground-demand') {
+    const owned = owner.outboundTransition
+    if (
+      owned?.roundId === value.roundId &&
+      owned.nonce === value.nonce &&
+      owned.sourceDatabaseName === value.sourceDatabaseName &&
+      owned.destinationDatabaseName === value.destinationDatabaseName
+    ) {
+      owner.lifecycle.preemptMaintenance()
+    }
+    return
+  }
   owner.inbound = owner.inbound
     .then(async () => {
       assertSlotCoordinatorOwnerActive(owner)
@@ -500,20 +594,42 @@ function receiveSlotMessage(
       )
       assertSlotCoordinatorOwnerActive(owner)
       if (!valid) return
-      await raceWithAbortSignal(
-        () => target.reconcile(transition, owner.controller.signal),
-        owner.controller.signal,
-      )
-      assertSlotCoordinatorOwnerActive(owner)
-    })
-    .catch((error: unknown) => {
-      if (!owner.active || coordinatorOwner !== owner) return
-      console.error('Browser workspace slot transition failed', error)
-      queueMicrotask(() => {
-        const location = (globalThis as unknown as { readonly location?: Location }).location
-        location?.reload()
+      await observeBrowserWorkspaceSlotRound(transition, owner.controller.signal, async (round) => {
+        const foregroundDemand = target.foregroundDemandSignal()
+        const onForegroundDemand = () => {
+          if (!owner.active || coordinatorOwner !== owner) return
+          try {
+            postSlotMessage({ kind: 'foreground-demand', senderId, ...transition })
+          } catch (error) {
+            failSlotTransition(owner, error)
+          }
+        }
+        if (foregroundDemand.aborted) onForegroundDemand()
+        else foregroundDemand.addEventListener('abort', onForegroundDemand, { once: true })
+        try {
+          await raceWithAbortSignal(
+            () => target.reconcile(transition, owner.controller.signal, round),
+            owner.controller.signal,
+          )
+          assertSlotCoordinatorOwnerActive(owner)
+        } finally {
+          foregroundDemand.removeEventListener('abort', onForegroundDemand)
+        }
       })
     })
+    .catch((error: unknown) => failSlotTransition(owner, error))
+}
+
+function failSlotTransition(
+  owner: BrowserWorkspaceSlotCoordinatorOwnerRecord,
+  error: unknown,
+): void {
+  if (!owner.active || coordinatorOwner !== owner) return
+  console.error('Browser workspace slot transition failed', error)
+  queueMicrotask(() => {
+    const location = (globalThis as unknown as { readonly location?: Location }).location
+    location?.reload()
+  })
 }
 
 function assertSlotCoordinatorOwnerActive(owner: BrowserWorkspaceSlotCoordinatorOwnerRecord): void {
@@ -527,8 +643,10 @@ function isSlotMessage(value: unknown): value is WorkspaceSlotMessage {
   if (!value || typeof value !== 'object') return false
   const candidate = value as Partial<WorkspaceSlotMessage>
   return (
-    candidate.kind === 'quiesce' &&
+    (candidate.kind === 'quiesce' || candidate.kind === 'foreground-demand') &&
     typeof candidate.senderId === 'string' &&
+    typeof candidate.roundId === 'string' &&
+    candidate.roundId.length > 0 &&
     typeof candidate.nonce === 'string' &&
     candidate.nonce.length > 0 &&
     BROWSER_WORKSPACE_DATABASE_NAMES.includes(
@@ -543,6 +661,7 @@ function isSlotMessage(value: unknown): value is WorkspaceSlotMessage {
 
 function transitionFromMessage(message: WorkspaceSlotMessage): BrowserWorkspaceSlotTransition {
   return {
+    roundId: message.roundId,
     nonce: message.nonce,
     sourceDatabaseName: message.sourceDatabaseName,
     destinationDatabaseName: message.destinationDatabaseName,
@@ -553,12 +672,6 @@ function slotLockManager(): WorkspaceSlotLockManager | null {
   if (typeof navigator === 'undefined') return null
   const manager = (navigator as unknown as { readonly locks?: WorkspaceSlotLockManager }).locks
   return manager && typeof manager.request === 'function' ? manager : null
-}
-
-function workspaceSlotAbortError(reason: unknown): Error {
-  return reason instanceof Error
-    ? reason
-    : new Error('BrowserWorkspaceSlotOperationAborted', { cause: reason })
 }
 
 function slotLockName(databaseName: BrowserWorkspaceDatabaseName): string {

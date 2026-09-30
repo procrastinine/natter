@@ -147,6 +147,12 @@ export function auditStartupReadiness(root, inventoryModule, initialProblems = [
   validateSourceOrder(reopenStages, 'reopen-stages', root, problems)
   validateSourceOrder(hiddenLifecycleStages, 'hidden-lifecycle-stages', root, problems)
 
+  problems.push(
+    ...inspectStartupOpenLifecycle(
+      readFileSync(resolve(root, 'src/store/browser-workspace-lifecycle.ts'), 'utf8'),
+    ),
+  )
+
   const discovered = discoverRuntimeResources(root, problems)
   validateResources(resources, discovered.resources, problems)
   validateReconciliationParticipants(
@@ -210,6 +216,44 @@ function parseArgs(argv) {
     index += 1
   }
   return parsed
+}
+
+export function inspectStartupOpenLifecycle(source) {
+  const problems = []
+  const opening = source.slice(
+    source.indexOf('async function performBrowserWorkspaceOpen('),
+    source.indexOf('async function runBrowserWorkspaceOpenStage'),
+  )
+  const normalized = source.replace(/\s+/g, ' ')
+  const normalizedOpening = opening.replace(/\s+/g, ' ')
+  for (const [text, token, label] of [
+    [
+      normalized,
+      'return awaitExpectedBrowserWorkspaceOpenCancellation(existing).then(() => openBrowserWorkspaceAtTarget(target, options), )',
+      'cancelled followup preserves target',
+    ],
+    [
+      normalizedOpening,
+      "if (snapshot.state === 'QUIESCING') { await awaitWorkspaceRuntimeQuiesced() assertBrowserWorkspaceBootstrapAuthority(attempt.authority) snapshot = getWorkspaceRuntimeControlSnapshot() }",
+      'resource quiescence revalidates bootstrap authority',
+    ],
+    [
+      normalizedOpening,
+      'void finalizeTerminalBrowserWorkspaceLifecycle().catch(scheduleFatalWorkspaceReload)',
+      'terminal cleanup has an independent failure owner',
+    ],
+  ]) {
+    if (countOccurrences(text, token) !== 1)
+      problems.push(`startup-open-lifecycle: missing exact ${label}`)
+  }
+  for (const token of [
+    'shutdownTransition?.promise',
+    'await finalizeTerminalBrowserWorkspaceLifecycle(',
+  ]) {
+    if (opening.includes(token))
+      problems.push(`startup-open-lifecycle: opening waits on its terminal drain: ${token}`)
+  }
+  return problems
 }
 
 function validateExactIds(entries, expected, label, problems) {

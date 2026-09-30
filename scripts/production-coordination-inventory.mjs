@@ -75,7 +75,7 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/configuration-model-resolution-capability.ts#activeCycle',
   'src/store/configuration-model-resolution-capability.ts#attachedFence',
   'src/store/configuration-model-resolution-capability.ts#unsubscribeEffects',
-  'src/store/browser-workspace-replacement-runner.ts#reopenBrowserWorkspace',
+  'src/store/browser-workspace-replacement-runner.ts#settleBrowserWorkspace',
   'src/store/browser-workspace-slot-coordination.ts#activeLease',
   'src/store/browser-workspace-slot-coordination.ts#coordinatorOwner',
   'src/store/configuration-workspace.ts#adapter',
@@ -1160,7 +1160,9 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
   'src/store/workspace-runtime.ts#createWorkspaceRuntimeKernel': {
     fields: [
       'activeChildren',
+      'activeContinuations',
       'activeRoots',
+      'continuationRecords',
       'foregroundDemandIdleListeners',
       'foregroundDemandOwners',
       'idleListeners',
@@ -1170,9 +1172,9 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
       'stateListeners',
     ],
     bound:
-      'active permits, foreground demand leases, and live subscribers for one exact runtime kernel',
+      'active permits, one replacement continuation per admitted producer, foreground demand leases, and live subscribers for one exact runtime kernel',
     cleanup:
-      'operation completion, foreground intent settlement, and paired unsubscribe remove entries; terminal kernel release drops the owner',
+      'operation/continuation terminal settlement, foreground intent settlement, and paired unsubscribe remove entries; shutdown cancels continuations and their settlement releases custody',
     scope: 'workspace-authority-kernel',
   },
   'src/store/workspace-session-owner.ts#LoadedWorkspaceSessionOwnerRegistry': {
@@ -1899,6 +1901,16 @@ const LIFECYCLE_EXTERNAL_INGRESS_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
+      'src/ui/chat/ScrollRegion.tsx|installNativeControlActivation|visibilitychange|onVisibility|1',
+    ],
+    scope: 'active-scroll-region-native-activation',
+    bound: 'one visibility listener and at most one weak control claim per primary input type',
+    installation: 'the active scroll-region layout effect installs the native activation owner',
+    removalOwner: 'the same layout effect disposes on view deactivation or unmount',
+    cleanup: 'dispose releases native capture, clears claims and removes every owned listener',
+  },
+  {
+    ids: [
       'src/ui/chat/composer-draft-state.ts|<module>|pagehide|flushPendingComposerDrafts|1',
       'src/ui/chat/composer-draft-state.ts|<module>|visibilitychange|<inline>|1',
     ],
@@ -2062,7 +2074,6 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   {
     ids: [
       'src/store/browser-workspace-lifecycle.ts|then<callback>|getWorkspaceRuntimeControlSnapshot|1',
-      'src/store/browser-workspace-lifecycle.ts|then<callback>|openBrowserWorkspace|1',
     ],
     scope: 'workspace-orchestrator-call-edge',
     stage: 'tracked-transition-continuation',
@@ -2073,12 +2084,16 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
-      'src/store/browser-workspace-lifecycle.ts|awaitExpectedBrowserWorkspaceOpenCancellation|getWorkspaceRuntimeControlSnapshot|1',
+      'src/store/browser-workspace-lifecycle.ts|browserWorkspaceClosureVerified|getWorkspaceRuntimeControlSnapshot|1',
+      'src/store/browser-workspace-lifecycle.ts|observeCancelledBrowserWorkspaceReplacement|getWorkspaceRuntimeControlSnapshot|1',
+      'src/store/browser-workspace-lifecycle.ts|observeCancelledBrowserWorkspaceReplacement|getWorkspaceRuntimeControlSnapshot|2',
+      'src/store/browser-workspace-lifecycle.ts|settleBrowserWorkspaceForReplacement|getWorkspaceRuntimeControlSnapshot|1',
     ],
     scope: 'workspace-orchestrator-call-edge',
     stage: 'cancelled-open-closure-verification',
     ownership: 'synchronous-after-awaited-attempt',
-    bound: 'one closure snapshot after an expected opening cancellation rejects',
+    bound:
+      'bounded current-state observations during exact replacement cancellation and reopen settlement',
     cleanup: 'the immutable snapshot is stack-local and owns no asynchronous work',
   },
   {
@@ -2097,6 +2112,7 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   {
     ids: [
       'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|awaitWorkspaceRuntimeQuiesced|1',
+      'src/store/browser-workspace-lifecycle.ts|observeCancelledBrowserWorkspaceReplacement|awaitWorkspaceRuntimeQuiesced|1',
       'src/store/browser-workspace-lifecycle.ts|runBrowserWorkspaceOpenStage<callback>|finishWorkspaceRuntimeReconciliation|1',
       'src/store/browser-workspace-lifecycle.ts|runBrowserWorkspaceOpenStage<callback>|prepareBrowserWorkspaceDatabaseSelection|1',
       'src/store/browser-workspace-lifecycle.ts|runBrowserWorkspaceOpenStage<callback>|resumeWorkspaceRuntimeResources|1',
@@ -2125,12 +2141,11 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
       'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|getWorkspaceRuntimeControlSnapshot|3',
       'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|getWorkspaceRuntimeControlSnapshot|4',
       'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|getWorkspaceRuntimeControlSnapshot|5',
-      'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|getWorkspaceRuntimeControlSnapshot|6',
     ],
     scope: 'workspace-orchestrator-call-edge',
     stage: 'workspace-open-state-read',
     ownership: 'synchronous',
-    bound: 'six bounded state reads across open admission, failure cleanup, and terminal handoff',
+    bound: 'five bounded state reads across open admission, failure cleanup, and terminal handoff',
     cleanup: 'each immutable snapshot remains local to performBrowserWorkspaceOpen',
   },
   {
@@ -2148,8 +2163,8 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
-      'src/store/browser-workspace-lifecycle.ts|openBrowserWorkspace|getWorkspaceRuntimeControlSnapshot|1',
-      'src/store/browser-workspace-lifecycle.ts|openBrowserWorkspace|installBrowserWorkspaceLifecycle|1',
+      'src/store/browser-workspace-lifecycle.ts|openBrowserWorkspaceAtTarget|getWorkspaceRuntimeControlSnapshot|1',
+      'src/store/browser-workspace-lifecycle.ts|openBrowserWorkspaceAtTarget|installBrowserWorkspaceLifecycle|1',
       'src/store/browser-workspace-lifecycle.ts|shutdownBrowserWorkspace|installBrowserWorkspaceLifecycle|1',
     ],
     scope: 'workspace-orchestrator-call-edge',
@@ -2312,25 +2327,12 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
       'src/store/browser-workspace-replacement-runner.ts|performBrowserWorkspaceReplacementLaunch|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|2',
-      'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|3',
     ],
     scope: 'workspace-replacement-call-edge',
     stage: 'replacement-admission-and-prepromotion-cleanup-state-read',
     ownership: 'synchronous',
     bound: 'one admission read per launch loop and two bounded reads around a gated attempt',
     cleanup: 'each immutable snapshot remains local to the active replacement attempt',
-  },
-  {
-    ids: [
-      'src/store/browser-workspace-replacement-runner.ts|reopenCurrentBrowserWorkspace|getWorkspaceRuntimeControlSnapshot|1',
-      'src/store/browser-workspace-lifecycle.ts|installBrowserWorkspaceLifecycle|openBrowserWorkspace:reference|1',
-    ],
-    scope: 'workspace-replacement-call-edge',
-    stage: 'replacement-reopen-port-and-current-slot-verification',
-    ownership: 'synchronous-port-install-then-awaited-reopen',
-    bound: 'one installed reopen capability and one state verification per replacement recovery',
-    cleanup:
-      'the page-lifetime port retains no database handle; each invoked open settles before stack-local verification',
   },
   {
     ids: ['src/store/catalog-session-workspace.ts|<module>|workspaceUsableSurfaceSettlementPort|1'],
@@ -2391,6 +2393,7 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
     ids: [
       'src/store/workspace-runtime-control.ts|beginWorkspaceRuntimeQuiesceWithMode|workspaceRuntimeKernel.beginGracefulQuiesce|1',
       'src/store/workspace-runtime-control.ts|beginWorkspaceRuntimeQuiesceWithMode|workspaceRuntimeKernel.beginQuiesce|1',
+      'src/store/workspace-runtime-control.ts|beginWorkspaceRuntimeQuiesceWithMode|workspaceRuntimeKernel.cancelReplacementContinuations|1',
       'src/store/workspace-runtime-control.ts|beginWorkspaceRuntimeQuiesceWithMode|workspaceRuntimeKernel.snapshot|1',
     ],
     scope: 'runtime-control-internal-call-edge',

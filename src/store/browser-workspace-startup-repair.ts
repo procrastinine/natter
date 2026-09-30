@@ -1,25 +1,22 @@
 import Dexie from 'dexie'
-import { errorFromUnknown, errorHasName } from '../lib/error'
+import { errorHasName } from '../lib/error'
 import type { BrowserWorkspaceDatabaseName } from '../lib/origin-storage-names'
 import { probeBrowserWorkspaceCurrent } from './browser-workspace-current-probe'
+import { cleanPendingBrowserWorkspaceDatabase } from './browser-workspace-database-cleanup'
 import {
-  cleanPendingBrowserWorkspaceDatabase,
-  cleanPendingBrowserWorkspaceDatabaseWithinSelection,
-} from './browser-workspace-database-cleanup'
-import {
+  abandonPreparedBrowserWorkspaceDatabase,
   activatePreparedBrowserWorkspaceDatabase,
+  BrowserWorkspaceActivationOutcomeUncertainError,
   type BrowserWorkspaceReplacementPreparing,
-  completeBrowserWorkspaceDatabaseCleanup,
   readBrowserWorkspaceDatabaseManifest,
   tryBeginBrowserWorkspaceDatabaseReplacement,
 } from './browser-workspace-database-control'
 import type { BrowserWorkspaceOpenProgress } from './browser-workspace-open-contract'
 import {
-  type BrowserWorkspaceSelectionGrant,
   browserWorkspaceSlotSwitchingSupported,
-  postBrowserWorkspaceSlotQuiesce,
   withBrowserWorkspaceSelectionGate,
   withBrowserWorkspaceSlotOperation,
+  withBrowserWorkspaceSlotRound,
   withExclusiveBrowserWorkspaceSlots,
 } from './browser-workspace-slot-coordination'
 import { CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH } from './browser-workspace-upgrade-strategy'
@@ -173,55 +170,69 @@ export async function ensureBrowserWorkspaceCurrentForSelection(
     )
     if (begin.kind === 'occupied') throw new Error('BrowserWorkspaceStartupRepairJournalOccupied')
     const journal = begin.journal
-    postBrowserWorkspaceSlotQuiesce(journal)
     const activation = { completed: false }
+    let disposition: Promise<unknown> | null = null
+    const rejectRepair = async (error: unknown): Promise<never> => {
+      if (activation.completed || error instanceof BrowserWorkspaceActivationOutcomeUncertainError)
+        throw error
+      disposition ??= discardFailedStartupRepair(journal, error)
+      throw await disposition
+    }
     try {
-      await runStartupRepairStage('exclusive-slot-repair', () =>
-        withExclusiveBrowserWorkspaceSlots(
-          selection,
-          [journal.sourceDatabaseName, journal.destinationDatabaseName],
-          async () => {
-            const copied = await prepareInactiveBrowserWorkspaceRepair(
-              journal,
-              probe.physicalVersion,
-              signal,
-              onProgress,
+      return await withBrowserWorkspaceSlotRound(
+        journal,
+        async (quiesce) => {
+          try {
+            quiesce()
+            await runStartupRepairStage('exclusive-slot-repair', () =>
+              withExclusiveBrowserWorkspaceSlots(
+                selection,
+                [journal.sourceDatabaseName, journal.destinationDatabaseName],
+                async () => {
+                  const copied = await prepareInactiveBrowserWorkspaceRepair(
+                    journal,
+                    probe.physicalVersion,
+                    signal,
+                    onProgress,
+                  )
+                  if (signal.aborted) throw signal.reason
+                  onProgress?.({
+                    kind: 'database-upgrade',
+                    databaseName: journal.destinationDatabaseName,
+                    fromVersion: probe.physicalVersion / 10,
+                    targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
+                    phase: 'inactive-activation',
+                    operation: 'activate-repaired-destination',
+                    processedRows: copied.copiedRows,
+                    processedBytes: copied.estimatedLiveBytes,
+                  })
+                  await activatePreparedBrowserWorkspaceDatabase(journal, {
+                    kind: 'carry-source',
+                    liveBytes: copied.estimatedLiveBytes,
+                  })
+                  activation.completed = true
+                },
+                signal,
+              ),
             )
-            if (signal.aborted) throw signal.reason
-            onProgress?.({
-              kind: 'database-upgrade',
-              databaseName: journal.destinationDatabaseName,
-              fromVersion: probe.physicalVersion / 10,
-              targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
-              phase: 'inactive-activation',
-              operation: 'activate-repaired-destination',
-              processedRows: copied.copiedRows,
-              processedBytes: copied.estimatedLiveBytes,
-            })
-            await activatePreparedBrowserWorkspaceDatabase(journal, {
-              kind: 'carry-source',
-              liveBytes: copied.estimatedLiveBytes,
-            })
-            activation.completed = true
-            await Dexie.delete(journal.sourceDatabaseName)
-            await completeBrowserWorkspaceDatabaseCleanup({ ...journal, phase: 'cleanup' })
-          },
-          signal,
-        ),
+            const repairedManifest = await readBrowserWorkspaceDatabaseManifest()
+            const repaired = await probeBrowserWorkspaceCurrent(repairedManifest.activeDatabaseName)
+            if (repaired.kind !== 'current') {
+              throw new Error(`BrowserWorkspaceStartupRepairSelectionIncomplete:${repaired.kind}`)
+            }
+            return {
+              databaseName: repairedManifest.activeDatabaseName,
+              activationSequence: repairedManifest.activationSequence,
+              physicalVersion: repaired.physicalVersion,
+            }
+          } catch (error) {
+            return rejectRepair(error)
+          }
+        },
+        signal,
       )
     } catch (error) {
-      if (activation.completed) throw error
-      throw await discardFailedStartupRepair(selection, journal, error, signal)
-    }
-    const repairedManifest = await readBrowserWorkspaceDatabaseManifest()
-    const repaired = await probeBrowserWorkspaceCurrent(repairedManifest.activeDatabaseName)
-    if (repaired.kind !== 'current') {
-      throw new Error(`BrowserWorkspaceStartupRepairSelectionIncomplete:${repaired.kind}`)
-    }
-    return {
-      databaseName: repairedManifest.activeDatabaseName,
-      activationSequence: repairedManifest.activationSequence,
-      physicalVersion: repaired.physicalVersion,
+      return rejectRepair(error)
     }
   }, signal)
 }
@@ -238,22 +249,21 @@ async function settlePendingBrowserWorkspaceReplacement(signal: AbortSignal): Pr
 }
 
 async function discardFailedStartupRepair(
-  selection: BrowserWorkspaceSelectionGrant,
   journal: BrowserWorkspaceReplacementPreparing,
   failure: unknown,
-  signal: AbortSignal,
-): Promise<Error> {
-  const errors: unknown[] = [failure]
+): Promise<unknown> {
   try {
-    await cleanPendingBrowserWorkspaceDatabaseWithinSelection(selection, journal, signal)
+    await abandonPreparedBrowserWorkspaceDatabase(journal)
   } catch (cleanupError) {
-    errors.push(cleanupError)
-  }
-  return errors.length === 1
-    ? errorFromUnknown(failure)
-    : new AggregateError(errors, 'BrowserWorkspaceStartupRepairFailedAndCleanupFailed', {
+    return new AggregateError(
+      [failure, cleanupError],
+      'BrowserWorkspaceStartupRepairFailedAndCleanupFailed',
+      {
         cause: failure,
-      })
+      },
+    )
+  }
+  return failure
 }
 
 async function prepareInactiveBrowserWorkspaceRepair(
@@ -262,12 +272,15 @@ async function prepareInactiveBrowserWorkspaceRepair(
   signal: AbortSignal,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
 ): Promise<{ readonly copiedRows: number; readonly estimatedLiveBytes: number }> {
+  signal.throwIfAborted()
   await runStartupRepairStage('recreate-destination-delete', () =>
     Dexie.delete(journal.destinationDatabaseName),
   )
+  signal.throwIfAborted()
   await runStartupRepairStage('recreate-destination-open', () =>
     recreateAndVerifyBrowserWorkspaceDatabase(journal.destinationDatabaseName),
   )
+  signal.throwIfAborted()
   const copied = await runStartupRepairStage('copy-canonical-rows', () =>
     copyCanonicalBrowserWorkspaceRows(
       journal.sourceDatabaseName,
@@ -277,12 +290,14 @@ async function prepareInactiveBrowserWorkspaceRepair(
       onProgress,
     ),
   )
+  signal.throwIfAborted()
   await runStartupRepairStage('normalize-destination', () =>
     normalizeInactiveBrowserWorkspaceDatabase(journal.destinationDatabaseName, {
       fromVersion: sourcePhysicalVersion,
       ...(onProgress ? { onProgress } : {}),
     }),
   )
+  signal.throwIfAborted()
   const repaired = await runStartupRepairStage('verify-destination', () =>
     probeBrowserWorkspaceCurrent(journal.destinationDatabaseName),
   )
@@ -320,46 +335,53 @@ async function copyCanonicalBrowserWorkspaceRows(
   signal: AbortSignal,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
 ): Promise<{ readonly copiedRows: number; readonly estimatedLiveBytes: number }> {
+  signal.throwIfAborted()
   const source = await openRawDatabase(sourceDatabaseName)
-  const destination = await openRawDatabase(destinationDatabaseName)
-  let copiedRows = 0
-  let estimatedLiveBytes = 0
   try {
-    const sourceNames = new Set([...source.objectStoreNames])
-    const destinationNames = [...destination.objectStoreNames]
-    await clearRawDatabase(destination, destinationNames)
-    for (const tableName of CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES) {
-      if (signal.aborted) throw signal.reason
-      if (!sourceNames.has(tableName) || !destination.objectStoreNames.contains(tableName)) continue
-      let after: IDBValidKey | undefined
-      for (;;) {
-        signal.throwIfAborted()
-        const page = await readRawPage(source, tableName, after)
-        if (page.entries.length > 0) {
-          await writeRawPage(destination, tableName, page.entries)
-          copiedRows = saturatingAdd(copiedRows, page.entries.length)
-          estimatedLiveBytes = saturatingAdd(estimatedLiveBytes, page.estimatedBytes)
-          after = page.entries.at(-1)?.key
-          onProgress?.({
-            kind: 'database-upgrade',
-            databaseName: destinationDatabaseName,
-            fromVersion: sourcePhysicalVersion / 10,
-            targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
-            phase: 'inactive-copy',
-            operation: `copy-${tableName}`,
-            processedRows: copiedRows,
-            processedBytes: estimatedLiveBytes,
-          })
+    signal.throwIfAborted()
+    const destination = await openRawDatabase(destinationDatabaseName)
+    try {
+      signal.throwIfAborted()
+      let copiedRows = 0
+      let estimatedLiveBytes = 0
+      const sourceNames = new Set([...source.objectStoreNames])
+      const destinationNames = [...destination.objectStoreNames]
+      await clearRawDatabase(destination, destinationNames)
+      for (const tableName of CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES) {
+        if (signal.aborted) throw signal.reason
+        if (!sourceNames.has(tableName) || !destination.objectStoreNames.contains(tableName))
+          continue
+        let after: IDBValidKey | undefined
+        for (;;) {
+          signal.throwIfAborted()
+          const page = await readRawPage(source, tableName, after)
+          if (page.entries.length > 0) {
+            await writeRawPage(destination, tableName, page.entries)
+            copiedRows = saturatingAdd(copiedRows, page.entries.length)
+            estimatedLiveBytes = saturatingAdd(estimatedLiveBytes, page.estimatedBytes)
+            after = page.entries.at(-1)?.key
+            onProgress?.({
+              kind: 'database-upgrade',
+              databaseName: destinationDatabaseName,
+              fromVersion: sourcePhysicalVersion / 10,
+              targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
+              phase: 'inactive-copy',
+              operation: `copy-${tableName}`,
+              processedRows: copiedRows,
+              processedBytes: estimatedLiveBytes,
+            })
+          }
+          if (page.complete) break
+          if (after === undefined)
+            throw new Error(`BrowserWorkspaceStartupCopyCursorMissing:${tableName}`)
         }
-        if (page.complete) break
-        if (after === undefined)
-          throw new Error(`BrowserWorkspaceStartupCopyCursorMissing:${tableName}`)
       }
+      return { copiedRows, estimatedLiveBytes }
+    } finally {
+      destination.close()
     }
-    return { copiedRows, estimatedLiveBytes }
   } finally {
     source.close()
-    destination.close()
   }
 }
 

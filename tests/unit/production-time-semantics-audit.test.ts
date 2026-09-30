@@ -108,12 +108,12 @@ describe('production temporal semantics meta-audit', () => {
         schedulers: 56,
         durations: 47,
         asyncRaces: 7,
-        retryLoops: 97,
+        retryLoops: 98,
         maintenanceCommands: 6,
       },
-      semanticSiteCount: 213,
+      semanticSiteCount: 214,
       groupCount: 42,
-      statusCounts: { covered: 213, gap: 0 },
+      statusCounts: { covered: 214, gap: 0 },
       readinessProofCount: 1,
       readinessGapCount: 0,
       criticalGapCount: 0,
@@ -140,7 +140,7 @@ describe('production temporal semantics meta-audit', () => {
     ])
     expect(report.readinessGaps).toEqual([])
     expect(report.limitations).toHaveLength(4)
-    expect(report.sites).toHaveLength(213)
+    expect(report.sites).toHaveLength(214)
     expect(
       report.sites.every(
         (site) =>

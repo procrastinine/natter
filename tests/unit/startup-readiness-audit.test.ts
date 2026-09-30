@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
@@ -30,6 +31,8 @@ let evaluateStartupReadiness: (
   mode: 'inventory' | 'enforce',
 ) => StartupReadinessReport
 let defaultInventory: unknown
+let inspectStartupOpenLifecycle: (source: string) => string[]
+let lifecycleSource: string
 
 beforeAll(async () => {
   evaluateStartupReadiness = (
@@ -37,6 +40,10 @@ beforeAll(async () => {
       evaluateStartupReadiness: typeof evaluateStartupReadiness
     }
   ).evaluateStartupReadiness
+  inspectStartupOpenLifecycle = (
+    (await import(AUDIT_URL)) as { inspectStartupOpenLifecycle: typeof inspectStartupOpenLifecycle }
+  ).inspectStartupOpenLifecycle
+  lifecycleSource = readFileSync(resolve(ROOT, 'src/store/browser-workspace-lifecycle.ts'), 'utf8')
   defaultInventory = await import(INVENTORY_URL)
 })
 
@@ -88,6 +95,31 @@ describe('startup readiness architecture audit', () => {
       gapCount: 0,
       problems: [],
     })
+  })
+
+  it('rejects terminal-drain self-waits and retargeted cancelled opens', () => {
+    expect(inspectStartupOpenLifecycle(lifecycleSource)).toEqual([])
+    const selfWait = lifecycleSource.replace(
+      'await awaitWorkspaceRuntimeQuiesced()\n      assertBrowserWorkspaceBootstrapAuthority(attempt.authority)',
+      'await (shutdownTransition?.promise ?? awaitWorkspaceRuntimeQuiesced())\n      assertBrowserWorkspaceBootstrapAuthority(attempt.authority)',
+    )
+    expect(inspectStartupOpenLifecycle(selfWait)).toContain(
+      'startup-open-lifecycle: opening waits on its terminal drain: shutdownTransition?.promise',
+    )
+    const retargeted = lifecycleSource.replace(
+      'openBrowserWorkspaceAtTarget(target, options),',
+      'openBrowserWorkspace(options),',
+    )
+    expect(inspectStartupOpenLifecycle(retargeted)).toContain(
+      'startup-open-lifecycle: missing exact cancelled followup preserves target',
+    )
+    const unownedCleanup = lifecycleSource.replace(
+      'void finalizeTerminalBrowserWorkspaceLifecycle().catch(scheduleFatalWorkspaceReload)',
+      'void finalizeTerminalBrowserWorkspaceLifecycle()',
+    )
+    expect(inspectStartupOpenLifecycle(unownedCleanup)).toContain(
+      'startup-open-lifecycle: missing exact terminal cleanup has an independent failure owner',
+    )
   })
 
   it('rejects a missing or reordered opening stage', async () => {

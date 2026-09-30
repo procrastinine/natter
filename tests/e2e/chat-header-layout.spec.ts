@@ -16,9 +16,11 @@ test('non-OpenRouter actions stay adjacent when the privacy badge is absent', as
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'gen-header-layout', content: 'ready', finish: 'stop' }]),
   })
-  await page.route('https://api.openai.com/v1/models', (route) =>
-    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ data: [] }) }),
-  )
+  await page
+    .context()
+    .route('https://api.openai.com/v1/models', (route) =>
+      route.fulfill({ contentType: 'application/json', body: JSON.stringify({ data: [] }) }),
+    )
   await seedFirstRun(page)
   await createChatAndOpen(page)
   await sendMessage(page, 'Create a chat for the header layout check')

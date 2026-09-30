@@ -68,11 +68,17 @@ export function recoverQuiescedBrowserWorkspaceReplacement(
   transition: BrowserWorkspaceSlotTransition,
   signal?: AbortSignal,
 ): Promise<QuiescedBrowserWorkspaceReplacementRecovery> {
-  return withBrowserWorkspaceSelectionGate(async () => {
+  const recover = async (
+    mayAbandon: boolean,
+  ): Promise<QuiescedBrowserWorkspaceReplacementRecovery> => {
     if (signal?.aborted) throw signal.reason
     let manifest = await readBrowserWorkspaceDatabaseManifest()
     let journal = manifest.pending
-    if (journal?.phase === 'preparing' && sameBrowserWorkspaceSlotTransition(journal, transition)) {
+    if (
+      mayAbandon &&
+      journal?.phase === 'preparing' &&
+      sameBrowserWorkspaceSlotTransition(journal, transition)
+    ) {
       await abandonPreparedBrowserWorkspaceDatabase(journal)
       manifest = await readBrowserWorkspaceDatabaseManifest()
       journal = manifest.pending
@@ -83,16 +89,12 @@ export function recoverQuiescedBrowserWorkspaceReplacement(
         throw new Error('BrowserWorkspaceQuiescedRecoveryJournalChanged')
       }
     }
-    if (journal && !sameBrowserWorkspaceSlotTransition(journal, transition)) {
-      return {
-        kind: 'advanced',
-        databaseName: manifest.activeDatabaseName,
-        activationSequence: manifest.activationSequence,
-      }
-    }
     const recovery = {
       databaseName: manifest.activeDatabaseName,
       activationSequence: manifest.activationSequence,
+    }
+    if (journal && !sameBrowserWorkspaceSlotTransition(journal, transition)) {
+      return { kind: 'advanced', ...recovery }
     }
     if (manifest.activeDatabaseName === transition.destinationDatabaseName) {
       return { kind: 'committed', ...recovery }
@@ -101,7 +103,10 @@ export function recoverQuiescedBrowserWorkspaceReplacement(
       return { kind: 'uncommitted', ...recovery }
     }
     return { kind: 'advanced', ...recovery }
-  }, signal)
+  }
+  return tryWithBrowserWorkspaceSelectionGate(() => recover(true), signal).then((claimed) =>
+    claimed.acquired ? claimed.value : recover(false),
+  )
 }
 
 function sameBrowserWorkspaceSlotTransition(

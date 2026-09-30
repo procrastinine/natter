@@ -1,6 +1,6 @@
 import Dexie from 'dexie'
 import { ownBrowserWorkspaceSuite } from '../helpers/browser-workspace-suite'
-import { putCachedPrivacyPolicy } from '../helpers/discovery-cache'
+import { clearPrivacyPoliciesForProfile, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
 import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -127,6 +127,24 @@ describe('unified privacy discovery single-flight', () => {
     await resolve(selected, 'openai/gpt-5.4')
 
     expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('force refresh does not treat a missing privacy row as a completed refresh', async () => {
+    const selected = await seedProfile()
+    const model = 'openai/gpt-5.4'
+    fetchPrivacyScrapeMock.mockResolvedValue(scrapeResult(model, { azure: policy() }))
+    const baseline = await resolve(selected, model)
+    await clearPrivacyPoliciesForProfile(selected.id)
+
+    const refreshed = await resolvePrivacyDiscovery(selected, model, {
+      proxy: { url: DEV_CORS_PROXY_URL, secret: '' },
+      force: true,
+      forceBaselineFetchedAt: baseline.fetchedAt,
+    })
+
+    expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(2)
+    expect(refreshed).toBeDefined()
+    expect(await getCachedPrivacyPolicy(selected.id, model)).toEqual(refreshed)
   })
 
   it('keeps different profile and model tuples independent', async () => {

@@ -57,7 +57,9 @@ import {
   getWorkspaceRepository,
 } from '../../src/store/workspace-repository'
 import {
+  claimWorkspaceReplacementContinuation,
   isWorkspaceRuntimeClosedError,
+  releaseWorkspaceReplacementContinuation,
   runWorkspaceAction,
   runWorkspaceRead,
   type WorkspaceReadPermit,
@@ -941,14 +943,22 @@ describe('browser WorkspaceRepository protocol contract', () => {
     const replacementGate = new Promise<void>((resolve) => {
       releaseReplacement = resolve
     })
-    const replacement = (async () => {
-      const authority = launchRequiredWorkspaceRuntimeReplacementNow()
-      if (!authority) throw new Error('Expected replacement authority')
-      await awaitWorkspaceRuntimeQuiesced()
-      markQuiesced()
-      await replacementGate
-      await openBrowserWorkspace()
-    })()
+    const replacement = runWorkspaceAction('workspace-replacement', async (permit) => {
+      const continuation = claimWorkspaceReplacementContinuation(permit)
+      try {
+        const authority = launchRequiredWorkspaceRuntimeReplacementNow({
+          continuation,
+          lineageId: permit.lineageId,
+        })
+        if (!authority) throw new Error('Expected replacement authority')
+        await awaitWorkspaceRuntimeQuiesced()
+        markQuiesced()
+        await replacementGate
+        await openBrowserWorkspace()
+      } finally {
+        releaseWorkspaceReplacementContinuation(continuation)
+      }
+    })
     await quiesced
     expect(getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCED')
     let calls = 0
@@ -978,14 +988,22 @@ describe('browser WorkspaceRepository protocol contract', () => {
     const replacementGate = new Promise<void>((resolve) => {
       releaseReplacement = resolve
     })
-    const owner = (async () => {
-      const authority = launchRequiredWorkspaceRuntimeReplacementNow()
-      if (!authority) throw new Error('Expected replacement authority')
-      await awaitWorkspaceRuntimeQuiesced()
-      markQuiesced()
-      await replacementGate
-      await openBrowserWorkspace()
-    })()
+    const owner = runWorkspaceAction('workspace-replacement', async (permit) => {
+      const continuation = claimWorkspaceReplacementContinuation(permit)
+      try {
+        const authority = launchRequiredWorkspaceRuntimeReplacementNow({
+          continuation,
+          lineageId: permit.lineageId,
+        })
+        if (!authority) throw new Error('Expected replacement authority')
+        await awaitWorkspaceRuntimeQuiesced()
+        markQuiesced()
+        await replacementGate
+        await openBrowserWorkspace()
+      } finally {
+        releaseWorkspaceReplacementContinuation(continuation)
+      }
+    })
     await quiesced
     expect(getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCED')
 
@@ -1059,49 +1077,58 @@ describe('browser WorkspaceRepository protocol contract', () => {
     }
   })
 
-  it('carries caller cancellation through a replacement handoff', async () => {
-    const chat = sessionChat('replacement-cancellation-chat')
-    await putTestChat(chat)
-    const before = getWorkspaceRuntimeControlSnapshot()
-    const controller = new AbortController()
-    const reason = new Error('idle-replacement-caller-cancelled')
-    const continuedWithoutCancellation = new Error('replacement-signal-detached')
-    let markEntered!: () => void
-    const entered = new Promise<void>((resolve) => {
-      markEntered = resolve
-    })
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
+  it.each(['cancelled', 'faulted'] as const)(
+    'preserves the exact %s outcome when caller cancellation crosses a replacement handoff',
+    async (outcome) => {
+      const chat = sessionChat('replacement-cancellation-chat')
+      await putTestChat(chat)
+      const before = getWorkspaceRuntimeControlSnapshot()
+      const controller = new AbortController()
+      const reason = new DOMException('idle-replacement-caller-cancelled', 'AbortError')
+      const continuedWithoutCancellation = new Error('replacement-signal-detached')
+      let markEntered!: () => void
+      const entered = new Promise<void>((resolve) => {
+        markEntered = resolve
+      })
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
 
-    const replacement = runBrowserWorkspaceReplacement(
-      () => true,
-      async (_database, context) => {
-        markEntered()
-        await gate
-        if (!context.signal.aborted) throw new Error('replacement-signal-not-aborted')
-        throw continuedWithoutCancellation
-      },
-      { signal: controller.signal },
-    )
-    await entered
+      const replacement = runBrowserWorkspaceReplacement(
+        () => true,
+        async (_database, context) => {
+          markEntered()
+          await gate
+          if (!context.signal.aborted) throw new Error('replacement-signal-not-aborted')
+          if (outcome === 'cancelled') context.signal.throwIfAborted()
+          throw continuedWithoutCancellation
+        },
+        { signal: controller.signal },
+      )
+      await entered
 
-    controller.abort(reason)
-    release()
+      controller.abort(reason)
+      release()
 
-    await expect(replacement).rejects.toBe(reason)
-    expect(getWorkspaceRuntimeControlSnapshot()).toMatchObject({
-      state: 'RUNNING',
-      workspaceId: before.workspaceId,
-      replacementEpoch: before.replacementEpoch,
-    })
-    await expect(
-      read(getBrowserRepository(), { kind: 'chat.get', chatId: chat.id }),
-    ).resolves.toMatchObject({
-      value: { id: chat.id },
-    })
-  })
+      if (outcome === 'cancelled') await expect(replacement).rejects.toBe(reason)
+      else
+        await expect(replacement).rejects.toMatchObject({
+          name: 'AggregateError',
+          errors: [continuedWithoutCancellation, reason],
+        })
+      expect(getWorkspaceRuntimeControlSnapshot()).toMatchObject({
+        state: 'RUNNING',
+        workspaceId: before.workspaceId,
+        replacementEpoch: before.replacementEpoch,
+      })
+      await expect(
+        read(getBrowserRepository(), { kind: 'chat.get', chatId: chat.id }),
+      ).resolves.toMatchObject({
+        value: { id: chat.id },
+      })
+    },
+  )
 
   it('cancels a required replacement while it waits for the selection gate', async () => {
     const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')

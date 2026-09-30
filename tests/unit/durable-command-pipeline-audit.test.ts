@@ -1,7 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { beforeAll, describe, expect, it } from 'vitest'
+import ts from 'typescript'
+import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { loadProtocolContractFactBundle } from '../helpers/protocol-contract-facts'
 
 const ROOT = resolve(__dirname, '../..')
@@ -118,6 +119,246 @@ beforeAll(async () => {
 }, 30_000)
 
 describe('durable command commit pipeline audit', () => {
+  it('reuses syntax only for the same node while preserving nested-function call boundaries', async () => {
+    const { executableCalls, callsInNode } = (await import(AUDIT_URL)) as {
+      executableCalls(node: ts.Node): readonly ts.CallExpression[]
+      callsInNode(node: ts.Node): readonly ts.CallExpression[]
+    }
+    const source = ts.createSourceFile(
+      'fixture.ts',
+      'function entry() { first(); function nested() { second() } third() }',
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    const owner = source.statements[0]
+    if (!owner) throw new Error('FixtureOwnerMissing')
+    const executable = executableCalls(owner)
+    const all = callsInNode(owner)
+    expect(executable.map((call) => call.expression.getText(source))).toEqual(['first', 'third'])
+    expect(all.map((call) => call.expression.getText(source))).toEqual(['first', 'second', 'third'])
+    expect(executableCalls(owner)).toBe(executable)
+    expect(callsInNode(owner)).toBe(all)
+    expect(Object.isFrozen(executable)).toBe(true)
+    expect(Object.isFrozen(all)).toBe(true)
+
+    const changed = ts.createSourceFile(
+      source.fileName,
+      source.text.replace('first()', 'changed()'),
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    const changedOwner = changed.statements[0]
+    if (!changedOwner) throw new Error('FixtureChangedOwnerMissing')
+    expect(executableCalls(changedOwner).map((call) => call.expression.getText(changed))).toEqual([
+      'changed',
+      'third',
+    ])
+    expect(callsInNode(changedOwner)).not.toBe(all)
+  })
+
+  it('caches complete syntax by source identity and rescans a mutation at the same path', async () => {
+    const { durableCommandSourceSyntaxFacts } = (await import(AUDIT_URL)) as {
+      durableCommandSourceSyntaxFacts(source: ts.SourceFile): {
+        readonly semanticOperationDescriptors: readonly ts.CallExpression[]
+        readonly sealTerminalCalls: readonly string[]
+        readonly manualWriteMarkers: readonly (readonly [string, number])[]
+        readonly directGrantTransactions: readonly (readonly [string, number])[]
+        readonly wholeCollectionReadSites: readonly string[]
+      }
+    }
+    const path = 'src/store/syntax-fixture.ts'
+    const source = ts.createSourceFile(
+      resolve(ROOT, path),
+      `const descriptor = semanticOperationDescriptor({ operationKind: 'fixture' });
+       class Owner {
+         run() {
+           commandMeta.markWrite();
+           const nested = { execute: () => {
+             commit.markWrite(); commit.markWrite(); grant.runTransaction();
+             db.rows.toCollection(); db.rows.where('id').equals(id).toArray();
+             db.rows.keys(); db.rows.orderBy('id').keys();
+           } };
+           stream.sealTerminal(); markWorkspaceWrite();
+         }
+       }`,
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    const sourceVisits = vi.spyOn(source, 'forEachChild')
+    const first = durableCommandSourceSyntaxFacts(source)
+    expect(first.semanticOperationDescriptors).toHaveLength(1)
+    expect(first.sealTerminalCalls).toEqual([path])
+    expect(first.manualWriteMarkers).toEqual([
+      [`${path}#Owner.run#commandMeta.markWrite`, 1],
+      [`${path}#Owner.run.execute#commit.markWrite`, 2],
+      [`${path}#Owner.run#markWorkspaceWrite`, 1],
+    ])
+    expect(first.directGrantTransactions).toEqual([
+      [`${path}#Owner.run.execute#grant.runTransaction`, 1],
+    ])
+    expect(first.wholeCollectionReadSites).toEqual([`${path}#run:toCollection`, `${path}#run:keys`])
+    expect(durableCommandSourceSyntaxFacts(source)).toBe(first)
+    expect(sourceVisits).toHaveBeenCalledTimes(1)
+    sourceVisits.mockRestore()
+    expect(Object.isFrozen(first)).toBe(true)
+    for (const collection of Object.values(first)) expect(Object.isFrozen(collection)).toBe(true)
+    expect(Object.isFrozen(first.manualWriteMarkers[0])).toBe(true)
+    expect(Object.isFrozen(first.directGrantTransactions[0])).toBe(true)
+
+    const changed = ts.createSourceFile(
+      source.fileName,
+      source.text.replace('stream.sealTerminal();', 'stream.renew();') +
+        '\nfunction added() { db.rows.toArray(); }',
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    const changedVisits = vi.spyOn(changed, 'forEachChild')
+    const next = durableCommandSourceSyntaxFacts(changed)
+    expect(changedVisits).toHaveBeenCalledTimes(1)
+    changedVisits.mockRestore()
+    expect(next).not.toBe(first)
+    expect(next.sealTerminalCalls).toEqual([])
+    expect(next.wholeCollectionReadSites).toEqual([
+      ...first.wholeCollectionReadSites,
+      `${path}#added:toArray`,
+    ])
+    expect(durableCommandSourceSyntaxFacts(source)).toBe(first)
+    expect(first.sealTerminalCalls).toEqual([path])
+  })
+
+  it('rechecks cross-file descriptor duplicates and source membership after warming syntax', async () => {
+    const { semanticOperationCapabilityFacts } = (await import(AUDIT_URL)) as {
+      semanticOperationCapabilityFacts(
+        program: { getSourceFiles(): readonly ts.SourceFile[] },
+        problems: string[],
+      ): ReadonlyMap<string, { readonly path: string }>
+    }
+    const createSource = (file: string) =>
+      ts.createSourceFile(
+        resolve(ROOT, `src/store/${file}.ts`),
+        `const descriptor = semanticOperationDescriptor({
+           operationKind: 'fixture', transaction: tx, resources: select,
+           permittedWrites: ['messages'], requiredWritesWhenMutated: ['messages'],
+           effects: { kind: 'exact-invalidations', expected: [] }
+         });
+         owner.executeSemanticOperation(descriptor);`,
+        ts.ScriptTarget.Latest,
+        true,
+      )
+    const first = createSource('first')
+    const second = createSource('second')
+    const collect = (sources: readonly ts.SourceFile[]) => {
+      const problems: string[] = []
+      const facts = semanticOperationCapabilityFacts({ getSourceFiles: () => sources }, problems)
+      return { facts, problems }
+    }
+    expect(collect([first]).problems).toEqual([])
+    expect(collect([second]).problems).toEqual([])
+    expect(collect([first, second]).problems).toEqual([
+      'semantic operation descriptor duplicated fixture',
+    ])
+    expect(collect([second, first]).facts.get('fixture')?.path).toBe('src/store/second.ts')
+    const removed = collect([first])
+    expect(removed.problems).toEqual([])
+    expect(removed.facts.get('fixture')?.path).toBe('src/store/first.ts')
+    const changed = ts.createSourceFile(
+      second.fileName,
+      second.text.replace("operationKind: 'fixture'", "operationKind: 'changed'"),
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    const replaced = collect([first, changed])
+    expect(replaced.problems).toEqual([])
+    expect([...replaced.facts.keys()]).toEqual(['fixture', 'changed'])
+  })
+
+  it('keeps call-target and handler results inside their checker when only an imported alias changes', async () => {
+    const { executableCalls, callResolvesTo, configurationHandlerRoots } = (await import(
+      AUDIT_URL
+    )) as {
+      executableCalls(node: ts.Node): readonly ts.CallExpression[]
+      callResolvesTo(
+        checker: ts.TypeChecker,
+        call: ts.CallExpression,
+        declaration: ts.Declaration,
+      ): boolean
+      configurationHandlerRoots(
+        checker: ts.TypeChecker,
+        source: ts.SourceFile,
+      ): ReadonlyMap<string, ts.Declaration>
+    }
+    const entry = ts.createSourceFile(
+      '/entry.ts',
+      'import { selected } from "./target"; export const configurationDomainHandlers = { test: selected }; export function entry() { selected() }',
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    const definitions = ts.createSourceFile(
+      '/definitions.ts',
+      'export function one() {} export function two() {}',
+      ts.ScriptTarget.Latest,
+      true,
+    )
+    const one = definitions.statements[0]
+    const two = definitions.statements[1]
+    const owner = entry.statements[2]
+    if (!one || !two || !owner || !ts.isFunctionDeclaration(one) || !ts.isFunctionDeclaration(two))
+      throw new Error('FixtureDeclarationsMissing')
+    const call = executableCalls(owner)[0]
+    if (!call) throw new Error('FixtureCallMissing')
+    const compiler = (selected: 'one' | 'two') => {
+      const target = ts.createSourceFile(
+        '/target.ts',
+        `export { ${selected} as selected } from "./definitions"`,
+        ts.ScriptTarget.Latest,
+        true,
+      )
+      const sources = new Map(
+        [entry, definitions, target].map((source) => [source.fileName, source]),
+      )
+      const options: ts.CompilerOptions = {
+        noLib: true,
+        target: ts.ScriptTarget.Latest,
+        module: ts.ModuleKind.ESNext,
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+      }
+      const host = ts.createCompilerHost(options)
+      host.getSourceFile = (path) => sources.get(path)
+      host.fileExists = (path) => sources.has(path)
+      host.readFile = (path) => sources.get(path)?.text
+      host.resolveModuleNames = (names) =>
+        names.map((name) => ({
+          resolvedFileName: name === './target' ? '/target.ts' : '/definitions.ts',
+          extension: ts.Extension.Ts,
+        }))
+      const program = ts.createProgram({ rootNames: [...sources.keys()], options, host })
+      const checker = program.getTypeChecker()
+      let resolutions = 0
+      const observed: ts.TypeChecker = {
+        ...checker,
+        getResolvedSignature(...args) {
+          resolutions += 1
+          return checker.getResolvedSignature(...args)
+        },
+      }
+      return { checker: observed, resolutions: () => resolutions }
+    }
+    const first = compiler('one')
+    expect(callResolvesTo(first.checker, call, one)).toBe(true)
+    expect(callResolvesTo(first.checker, call, two)).toBe(false)
+    expect(configurationHandlerRoots(first.checker, entry).get('test')).toBe(one)
+    const resolved = first.resolutions()
+    expect(callResolvesTo(first.checker, call, one)).toBe(true)
+    expect(callResolvesTo(first.checker, call, two)).toBe(false)
+    expect(first.resolutions()).toBe(resolved)
+
+    const second = compiler('two')
+    expect(callResolvesTo(second.checker, call, one)).toBe(false)
+    expect(callResolvesTo(second.checker, call, two)).toBe(true)
+    expect(configurationHandlerRoots(second.checker, entry).get('test')).toBe(two)
+    expect(configurationHandlerRoots(first.checker, entry).get('test')).toBe(one)
+  })
+
   it('inventories every command and every required pipeline stage without hiding gaps', () => {
     const result = runAudit('inventory')
 

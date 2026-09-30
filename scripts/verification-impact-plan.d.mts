@@ -1,3 +1,5 @@
+import type { VitestProjectFiles } from './vitest-projects.mjs'
+import type { VerificationStage } from './run-verification.mjs'
 import type {
   LocalModuleGraphDiagnostic,
   LocalModuleFileSource,
@@ -7,6 +9,12 @@ import type {
   VerificationProof,
 } from './verification-obligation-manifest.mjs'
 
+export function verificationSnapshotInputPaths(options: {
+  readonly source: LocalModuleFileSource
+  readonly globalInputs?: readonly string[]
+  readonly stages?: readonly VerificationStage[]
+}): string[]
+
 export interface VerificationSymbolSnapshot {
   readonly id: string
   readonly kind: string
@@ -14,8 +22,21 @@ export interface VerificationSymbolSnapshot {
   readonly sha256: string
 }
 
+export type VerificationUnitExecution =
+  | {
+      readonly status: 'owned'
+      readonly providerInputs: Readonly<Record<string, string>>
+      readonly projects: readonly VitestProjectFiles[]
+    }
+  | {
+      readonly status: 'unavailable'
+      readonly providerInputs: Readonly<Record<string, string>>
+      readonly mismatchedPaths: readonly string[]
+    }
+
 export interface VerificationSnapshot {
-  readonly schemaVersion: 2
+  readonly schemaVersion: 4
+  readonly unitExecution: VerificationUnitExecution
   readonly obligationSchemaVersion: number
   readonly files: Readonly<
     Record<
@@ -46,7 +67,9 @@ export interface VerificationImpact {
 }
 
 export interface SliceVerificationPlan {
-  readonly schemaVersion: 1
+  readonly stages: readonly VerificationStage[]
+  readonly impactedStageIds: readonly string[]
+  readonly schemaVersion: 2
   readonly baseDigest: string
   readonly currentDigest: string
   readonly impact: VerificationImpact
@@ -83,6 +106,7 @@ export function diffVerificationSnapshots(
 ): VerificationImpact
 export function planSliceVerification(options: {
   root?: string
+  stages?: readonly VerificationStage[]
   base: VerificationSnapshot
   current: VerificationSnapshot
   obligations?: readonly VerificationObligation[]
@@ -103,3 +127,9 @@ export function validateVerificationManifest(options?: {
   proofs?: readonly VerificationProof[]
 }): readonly string[]
 export function assertSafeProofExecution(proof: VerificationProof): void
+
+export function validateOpaqueModuleDispositions(
+  diagnostics: readonly LocalModuleGraphDiagnostic[],
+  dispositions: readonly { path: string; code: string; expectedCount: number; rationale: string }[],
+  files: Readonly<Record<string, unknown>>,
+): string[]

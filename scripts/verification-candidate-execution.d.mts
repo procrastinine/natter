@@ -1,3 +1,4 @@
+import type { TestCompilerProof } from './run-verification.mjs'
 import type {
   MaterializedVerificationCandidate,
   VerificationCandidateRuntime,
@@ -7,6 +8,7 @@ export interface VerificationCandidateExecutionContext {
   readonly candidate: MaterializedVerificationCandidate
   readonly runtime: VerificationCandidateRuntime
   readonly environment: Readonly<NodeJS.ProcessEnv>
+  readonly testCompilerProof: TestCompilerProof
 }
 
 export function executeMaterializedVerificationCandidate<T>(

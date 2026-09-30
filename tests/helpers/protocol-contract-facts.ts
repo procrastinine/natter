@@ -1,13 +1,13 @@
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { productionTypeScriptFileDigest } from '../../scripts/production-typescript-source.mjs'
+import { PROTOCOL_CONTRACT_STAGE } from '../../scripts/protocol-contract-descriptor.mjs'
 import { protocolContractGeneratorDigest } from '../../scripts/protocol-contract-fingerprint.mjs'
 
 const ROOT = resolve(__dirname, '../..')
 const FACTS_PATH = resolve(ROOT, 'test-results/protocol-contract-facts.json')
 const MUTATION_PATH = resolve(ROOT, 'test-results/protocol-contract-mutation-proof.json')
-const PREREQUISITE =
-  'node scripts/audit-protocol-contracts.mjs --mode inventory --facts-output test-results/protocol-contract-facts.json --mutation-output test-results/protocol-contract-mutation-proof.json'
+const PREREQUISITE = PROTOCOL_CONTRACT_STAGE.argv.join(' ')
 let cachedBundle: Promise<unknown> | undefined
 let cachedMutationProof: Promise<unknown> | undefined
 

@@ -58,3 +58,6 @@ export function auditE2eBrowserStorage(
   rootDirectory?: string,
   inventoryPath?: string,
 ): E2eBrowserStorageAuditResult
+
+export function discoverBrowserFixtureSources(rootDirectory?: string): string[]
+export function validateNativeFixtureOwnership(sites: E2eBrowserStorageSite[]): Array<{ code: string; siteId: string; detail: string }>

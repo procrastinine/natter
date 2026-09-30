@@ -82,6 +82,9 @@ interface ProtocolContractBundle {
       readonly variants: readonly string[]
       readonly constructorSites: readonly { readonly id: string }[]
     }
+    readonly rootAdmissions: readonly unknown[]
+    readonly childReservations: readonly unknown[]
+    readonly typedDeltaSites: readonly unknown[]
   }
   readonly auditCapabilities: readonly {
     readonly ownerId: string
@@ -119,12 +122,20 @@ interface ProtocolContractReport {
     readonly 'production-discriminated-unions': {
       readonly ok: boolean
       readonly discoveredCount: number
+      readonly classifiedCount: number
+      readonly sourceFiles: number
       readonly controlProtocolCount: number
       readonly gapCount: number
       readonly constructionGapCount: number
+      readonly gaps: readonly { readonly id: string }[]
+      readonly constructionGaps: readonly { readonly id: string }[]
       readonly entries: readonly {
         readonly id: string
         readonly variants: readonly (string | number | boolean)[]
+        readonly constructorSites: readonly { readonly id: string }[]
+        readonly controlProtocol: boolean
+        readonly coverage: { readonly status: string; readonly auditOwners: readonly string[] }
+        readonly construction: { readonly status: string }
       }[]
       readonly violations: readonly string[]
     }
@@ -146,6 +157,7 @@ interface ProtocolContractReport {
       readonly ok: boolean
       readonly surfaces: number
       readonly records: number
+      readonly surfaceCounts: Readonly<Record<string, number>>
       readonly constructorSites: number
       readonly architectureGaps: number
       readonly recordGaps: number
@@ -336,12 +348,14 @@ describe('production protocol fact bundle', () => {
           .auditedUnionSubjects,
       )
     }
-    expect(bundle.auditCapabilities.flatMap((capability) => capability.roots)).toHaveLength(24)
-    expect(
-      new Set(
-        bundle.auditCapabilities.flatMap((capability) => capability.roots.map((root) => root.id)),
-      ).size,
-    ).toBe(17)
+    const consumedRoots = Object.values(sourceFactsByOwner).flatMap(
+      (facts) => facts.auditedUnionSubjects,
+    )
+    expect(bundle.auditCapabilities.flatMap((capability) => capability.roots)).toEqual(
+      consumedRoots,
+    )
+    const discoveredRootIds = new Set(bundle.unionDiscovery.unions.map(({ id }) => id))
+    for (const root of consumedRoots) expect(discoveredRootIds.has(root.id), root.id).toBe(true)
     expect(bundle.production.protocols.WorkspaceCommand.variants).toEqual(
       bundle.stages.variants.command,
     )
@@ -417,24 +431,71 @@ describe('production protocol fact bundle', () => {
     expect(siteIds(bundle.locality.configurationUnion.constructorSites)).toEqual(
       siteIds(bundle.configuration.commandUnion.constructorSites),
     )
-    expect(bundle.snapshot.sourceFiles).toBe(487)
-    expect(report.reports['tab-cross-tab-locality']).toMatchObject({
+    expect(bundle.snapshot.sourceFiles).toBe(bundle.unionDiscovery.sourceFiles)
+    const locality = report.reports['tab-cross-tab-locality']
+    expect(locality).toMatchObject({
       ok: true,
-      surfaces: 20,
-      records: 345,
-      constructorSites: 773,
       architectureGaps: 3,
       recordGaps: 150,
       siteGaps: 4,
       problems: [],
     })
-    expect(report.reports['production-discriminated-unions']).toMatchObject({
-      ok: true,
-      discoveredCount: 475,
-      controlProtocolCount: 224,
-      gapCount: 182,
-      constructionGapCount: 10,
-      violations: [],
+    expect(locality.surfaces).toBe(Object.keys(locality.surfaceCounts).length)
+    expect(locality.records).toBe(
+      Object.values(locality.surfaceCounts).reduce((sum, count) => sum + count, 0),
+    )
+    expect(locality.constructorSites).toBe(
+      bundle.locality.surfaceFacts.reduce(
+        (sum, surface) => sum + surface.constructorSites.length,
+        0,
+      ) +
+        bundle.locality.rootAdmissions.length +
+        bundle.locality.childReservations.length +
+        bundle.locality.typedDeltaSites.length,
+    )
+    for (const surface of bundle.locality.surfaceFacts) {
+      expect(locality.surfaceCounts[surface.id], surface.id).toBe(surface.variants.length)
+    }
+    const unions = report.reports['production-discriminated-unions']
+    expect(unions).toMatchObject({ ok: true, violations: [] })
+    expect(unions.sourceFiles).toBe(bundle.unionDiscovery.sourceFiles)
+    expect(unions.discoveredCount).toBe(bundle.unionDiscovery.unions.length)
+    expect(unions.classifiedCount).toBe(bundle.unionDiscovery.unions.length)
+    expect(new Set(unions.entries.map(({ id }) => id)).size).toBe(
+      bundle.unionDiscovery.unions.length,
+    )
+    const projected = (entry: ProtocolContractBundle['unionDiscovery']['unions'][number]) => ({
+      id: entry.id,
+      variants: entry.variants,
+      constructorSites: siteIds(entry.constructorSites),
+    })
+    expect(unions.entries.map(projected)).toEqual(bundle.unionDiscovery.unions.map(projected))
+    expect(unions.controlProtocolCount).toBe(
+      unions.entries.filter((entry) => entry.controlProtocol).length,
+    )
+    expect(unions.gaps.map(({ id }) => id).sort()).toEqual(
+      unions.entries
+        .filter((entry) => entry.coverage.status === 'gap')
+        .map(({ id }) => id)
+        .sort(),
+    )
+    expect(unions.constructionGaps.map(({ id }) => id).sort()).toEqual(
+      unions.entries
+        .filter((entry) => entry.construction.status === 'gap')
+        .map(({ id }) => id)
+        .sort(),
+    )
+    expect(unions.gapCount).toBe(unions.gaps.length)
+    expect(unions.constructionGapCount).toBe(unions.constructionGaps.length)
+    const slotRootId = 'src/store/browser-workspace-slot-coordination.ts#WorkspaceSlotMessage|kind'
+    const slotMessages = discoveredUnion(bundle, slotRootId)
+    const slotLocality = localitySurface(bundle, 'workspace-slot-message')
+    expect(slotMessages.variants).toEqual(['foreground-demand', 'quiesce'])
+    expect(slotLocality.variants).toEqual(slotMessages.variants)
+    expect(siteIds(slotLocality.constructorSites)).toEqual(siteIds(slotMessages.constructorSites))
+    expect(unions.entries.find(({ id }) => id === slotRootId)).toMatchObject({
+      controlProtocol: true,
+      coverage: { status: 'dedicated', auditOwners: ['tab-cross-tab-locality'] },
     })
   })
 
@@ -641,6 +702,11 @@ describe('production protocol fact bundle', () => {
         expect.stringContaining('unregistered root admission capability invoked'),
       ]),
     )
+    expect(
+      mutationProof.changedReport.productionProblems.some((problem) =>
+        problem.includes('root admission capability has no kind source'),
+      ),
+    ).toBe(false)
   })
 })
 

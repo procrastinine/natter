@@ -198,25 +198,24 @@ async function retainObsoleteWorkspaceDatabase(
   page: Parameters<typeof clearIndexedDb>[0],
 ): Promise<void> {
   await page.evaluate(async () => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
+    const token = await globalThis.__natterNativeStorageFixture.holdNamed({
+      databaseName: 'natter',
+      purpose: 'physical-reclamation',
     })
-    database.onversionchange = () => undefined
     ;(
-      window as typeof window & { __natterObsoleteWorkspaceDatabase?: IDBDatabase }
-    ).__natterObsoleteWorkspaceDatabase = database
+      globalThis as typeof globalThis & { __obsoleteDatabaseHold?: string }
+    ).__obsoleteDatabaseHold = token.id
   })
 }
 
 async function releaseObsoleteWorkspaceDatabase(
   page: Parameters<typeof clearIndexedDb>[0],
 ): Promise<void> {
-  await page.evaluate(() => {
-    const owner = window as typeof window & { __natterObsoleteWorkspaceDatabase?: IDBDatabase }
-    owner.__natterObsoleteWorkspaceDatabase?.close()
-    delete owner.__natterObsoleteWorkspaceDatabase
+  await page.evaluate(async () => {
+    const scope = globalThis as typeof globalThis & { __obsoleteDatabaseHold?: string }
+    if (scope.__obsoleteDatabaseHold)
+      await globalThis.__natterNativeStorageFixture.release(scope.__obsoleteDatabaseHold)
+    delete scope.__obsoleteDatabaseHold
   })
 }
 
@@ -225,54 +224,38 @@ async function readWorkspaceSlotState(page: Parameters<typeof clearIndexedDb>[0]
     const names = (await indexedDB.databases()).flatMap((database) =>
       database.name === undefined ? [] : [database.name],
     )
-    const control = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter-control')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      const manifest = await new Promise<{
-        activeDatabaseName: string
-        pending?: { phase?: string }
-      }>((resolve, reject) => {
-        const request = control
-          .transaction('manifests', 'readonly')
-          .objectStore('manifests')
-          .get('workspace')
-        request.onsuccess = () => {
-          const result: unknown = request.result
-          if (
-            typeof result !== 'object' ||
-            result === null ||
-            !('activeDatabaseName' in result) ||
-            typeof result.activeDatabaseName !== 'string'
-          ) {
-            reject(new Error('WorkspaceManifestInvalid'))
-            return
-          }
-          const pendingPhase =
-            'pending' in result &&
-            typeof result.pending === 'object' &&
-            result.pending !== null &&
-            'phase' in result.pending &&
-            typeof result.pending.phase === 'string'
-              ? result.pending.phase
-              : undefined
-          resolve({
-            activeDatabaseName: result.activeDatabaseName,
-            ...(pendingPhase === undefined ? {} : { pending: { phase: pendingPhase } }),
-          })
+    return globalThis.__natterNativeStorageFixture.control(
+      { purpose: 'read-only-assertion' },
+      async (control, request) => {
+        const result: unknown = await request(
+          control.transaction('manifests', 'readonly').objectStore('manifests').get('workspace'),
+        )
+        if (
+          typeof result !== 'object' ||
+          result === null ||
+          !('activeDatabaseName' in result) ||
+          typeof result.activeDatabaseName !== 'string'
+        )
+          throw new Error('WorkspaceManifestInvalid')
+        const pendingPhase =
+          'pending' in result &&
+          typeof result.pending === 'object' &&
+          result.pending !== null &&
+          'phase' in result.pending &&
+          typeof result.pending.phase === 'string'
+            ? result.pending.phase
+            : undefined
+        const manifest = {
+          activeDatabaseName: result.activeDatabaseName,
+          ...(pendingPhase === undefined ? {} : { pending: { phase: pendingPhase } }),
         }
-        request.onerror = () => reject(request.error)
-      })
-      return {
-        names,
-        activeDatabaseName: manifest.activeDatabaseName,
-        pendingPhase: manifest.pending?.phase ?? null,
-      }
-    } finally {
-      control.close()
-    }
+        return {
+          names,
+          activeDatabaseName: manifest.activeDatabaseName,
+          pendingPhase: manifest.pending?.phase ?? null,
+        }
+      },
+    )
   })
 }
 
@@ -486,7 +469,7 @@ async function mockLegacyOpenRouterDiscovery(context: BrowserContext): Promise<v
     tokenizer: 'claude',
   }
   const supportedParameters = ['provider', 'max_tokens']
-  await context.route('https://openrouter.ai/api/v1/models**', async (route) => {
+  await context.route('https://openrouter.ai/api/v1/models*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',

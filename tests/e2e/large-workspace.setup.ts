@@ -9,7 +9,11 @@ import {
   generatedWorkspaceFixtureStats,
   generateWorkspaceFixture,
 } from '../../scripts/generated-workspace-fixture.mjs'
-import { transformWorkspaceThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
+import { installNativeWorkspaceStorageFixture } from '../../scripts/native-workspace-storage-fixture.mjs'
+import {
+  configureWorkspaceThroughUi,
+  transformWorkspaceThroughUi,
+} from '../../scripts/workspace-provider-fixture.mjs'
 import {
   commitGeneratedWorkspaceBrowserProfile,
   type GeneratedWorkspaceStateManifest,
@@ -23,7 +27,8 @@ import {
   removeObsoleteGeneratedWorkspaceStateFiles,
   writeGeneratedWorkspaceStateManifest,
 } from './generated-workspace-state'
-import { seedFirstRun } from './helpers'
+import { createChatAndOpen } from './helpers'
+import { addFirstRunConnection, DEFAULT_E2E_MODEL } from './workspace-seed'
 
 test.describe.configure({ timeout: 15 * 60_000 })
 
@@ -51,13 +56,16 @@ test('cache deterministic current-schema large-workspace browser states', async 
       viewport: { width: 1_280, height: 720 },
     })
     const browserLaunchMs = performance.now() - launchStartedAt
+    await context.addInitScript(installNativeWorkspaceStorageFixture)
     const page = context.pages()[0] ?? (await context.newPage())
     let generated: ReturnType<typeof generateWorkspaceFixture> | undefined
     let committed = false
     try {
       await installProviderCatalogFixture(context)
       await page.goto('/')
-      await seedFirstRun(page)
+      await addFirstRunConnection(page)
+      await configureWorkspaceThroughUi(page, { model: DEFAULT_E2E_MODEL, paretoFilter: false })
+      await createChatAndOpen(page)
       const importStartedAt = performance.now()
       await transformWorkspaceThroughUi(
         page,
@@ -157,63 +165,32 @@ async function installProviderCatalogFixture(context: BrowserContext) {
 
 async function waitForGeneratedWorkspaceStorageQuiescence(page: Page) {
   await page.waitForFunction(
-    async ({ controlDatabaseName, recoveryIntentPrefix }) => {
+    async ({ recoveryIntentPrefix }) => {
       const recoveryPending = Array.from({ length: localStorage.length }, (_value, index) =>
         localStorage.key(index),
       ).some((key) => key?.startsWith(recoveryIntentPrefix))
       if (recoveryPending) return false
-      const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(controlDatabaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        const state = await new Promise<
-          | {
-              readonly manifest: { activeDatabaseName?: unknown; pending?: unknown }
-              readonly compaction:
-                | { completedRevision?: unknown; requestRevision?: unknown }
-                | undefined
-            }
-          | undefined
-        >((resolve, reject) => {
+      return globalThis.__natterNativeStorageFixture.control(
+        { purpose: 'read-only-assertion' },
+        async (database, request) => {
           const transaction = database.transaction(['compactionStates', 'manifests'], 'readonly')
-          const manifestRequest = transaction.objectStore('manifests').get('workspace')
-          manifestRequest.onerror = () => reject(manifestRequest.error)
-          manifestRequest.onsuccess = () => {
-            const manifest = manifestRequest.result as
-              | { activeDatabaseName?: unknown; pending?: unknown }
-              | undefined
-            if (!manifest || typeof manifest.activeDatabaseName !== 'string') {
-              resolve(undefined)
-              return
-            }
-            const compactionRequest = transaction
-              .objectStore('compactionStates')
-              .get(manifest.activeDatabaseName)
-            compactionRequest.onerror = () => reject(compactionRequest.error)
-            compactionRequest.onsuccess = () =>
-              resolve({
-                manifest,
-                compaction: compactionRequest.result as
-                  | { completedRevision?: unknown; requestRevision?: unknown }
-                  | undefined,
-              })
-          }
-        })
-        return (
-          state !== undefined &&
-          state.manifest.pending === undefined &&
-          typeof state.compaction?.requestRevision === 'number' &&
-          typeof state.compaction.completedRevision === 'number' &&
-          state.compaction.requestRevision <= state.compaction.completedRevision
-        )
-      } finally {
-        database.close()
-      }
+          const manifest = (await request(transaction.objectStore('manifests').get('workspace'))) as
+            | { activeDatabaseName?: unknown; pending?: unknown }
+            | undefined
+          if (!manifest || typeof manifest.activeDatabaseName !== 'string') return false
+          const compaction = (await request(
+            transaction.objectStore('compactionStates').get(manifest.activeDatabaseName),
+          )) as { completedRevision?: unknown; requestRevision?: unknown } | undefined
+          return (
+            manifest.pending === undefined &&
+            typeof compaction?.requestRevision === 'number' &&
+            typeof compaction.completedRevision === 'number' &&
+            compaction.requestRevision <= compaction.completedRevision
+          )
+        },
+      )
     },
     {
-      controlDatabaseName: 'natter-control',
       recoveryIntentPrefix: 'natter:storage-compaction-intent:v1:',
     },
     { timeout: 60_000 },

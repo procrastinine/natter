@@ -1,8 +1,19 @@
 import { expect, test } from './fixtures'
-import { activeWorkspaceDatabaseName, clearIndexedDb } from './helpers'
+import { clearIndexedDb, seedFirstRun } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
+})
+
+test('a worker seed restores through the public UI without reloading the current document', async ({
+  page,
+}) => {
+  const documentBeforeSeed = await page.evaluateHandle(() => document)
+  await seedFirstRun(page)
+  expect(await documentBeforeSeed.evaluate((prior) => prior === document)).toBe(true)
+  await expect(page).toHaveURL(/#\/new$/u)
+  await expect(page.locator('[data-ui="connection-provider-button"]')).toBeVisible()
+  await documentBeforeSeed.dispose()
 })
 
 test('app boots without a connection — empty state visible, only Add connection CTA remains', async ({
@@ -48,28 +59,19 @@ test('submitting the connection-setup modal seeds a profile + preset and moves e
   await expect(
     page.locator('[data-ui="connection-header"][data-state="configured"][data-variant="popover"]'),
   ).toBeVisible()
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  const counts = await page.evaluate(async (databaseName) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(databaseName)
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      const out: Record<string, number> = {}
-      for (const store of ['keys', 'profiles', 'presets'] as const) {
-        out[store] = await new Promise<number>((resolve, reject) => {
-          const tx = db.transaction(store, 'readonly')
-          const req = tx.objectStore(store).count()
-          req.onsuccess = () => resolve(req.result)
-          req.onerror = () => reject(req.error)
-        })
-      }
-      return out
-    } finally {
-      db.close()
-    }
-  }, databaseName)
+
+  const counts = await page.evaluate(async () => {
+    return globalThis.__natterNativeStorageFixture.active(
+      { purpose: 'read-only-assertion' },
+      async (db, request) => {
+        const out: Record<string, number> = {}
+        for (const store of ['keys', 'profiles', 'presets'] as const) {
+          out[store] = await request(db.transaction(store, 'readonly').objectStore(store).count())
+        }
+        return out
+      },
+    )
+  })
   expect(counts).toEqual({ keys: 1, profiles: 1, presets: 1 })
 })
 
@@ -101,27 +103,18 @@ test('whitespace-only key keeps submit disabled; trim happens on save', async ({
   await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
   await expect(page.locator('[data-ui="connection-empty-action"]')).toHaveCount(0)
   await expect(page.locator('[data-ui="connection-header"]')).toHaveCount(0)
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  const previews = await page.evaluate(async (databaseName) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(databaseName)
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<string[]>((resolve, reject) => {
-        const tx = db.transaction('keys', 'readonly')
-        const req = tx.objectStore('keys').getAll()
-        req.onsuccess = () => {
-          const rows = req.result as Array<{ obscuredPreview: string }>
-          resolve(rows.map((r) => r.obscuredPreview))
-        }
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, databaseName)
+
+  const previews = await page.evaluate(async () => {
+    return globalThis.__natterNativeStorageFixture.active(
+      { purpose: 'read-only-assertion' },
+      async (db, request) => {
+        const rows = (await request(
+          db.transaction('keys', 'readonly').objectStore('keys').getAll(),
+        )) as Array<{ obscuredPreview: string }>
+        return rows.map((row) => row.obscuredPreview)
+      },
+    )
+  })
   expect(previews).toHaveLength(1)
   // obscurePreview keeps 10-char prefix + 4-char suffix. Trimmed prefix is
   // "sk-or-v1-t"; untrimmed would be "  sk-or-v1".

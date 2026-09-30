@@ -22,6 +22,7 @@ import {
   attemptController,
 } from './attempt-controller'
 import {
+  type ActiveGenerationConfigurationClaim,
   type ActiveGenerationConfigurationResolution,
   configurationController,
 } from './configuration-controller'
@@ -56,11 +57,14 @@ import type {
   PrepareAttemptPlacementIntent,
 } from './workspace-protocol'
 import {
+  claimWorkspaceForegroundDemand,
   getWorkspaceRuntimeFence,
   getWorkspaceRuntimeState,
   isWorkspaceRuntimeClosedError,
+  releaseWorkspaceForegroundDemand,
   runWorkspaceActionAtFence,
   subscribeWorkspaceRuntimeState,
+  type WorkspaceForegroundDemandOwner,
   type WorkspaceWritePermit,
 } from './workspace-runtime'
 
@@ -164,6 +168,7 @@ export interface GenerationAdmissionPayload {
         readonly settings: ChatSettings
         readonly presetId: PresetId | null
         readonly preferredDispatchKeyId: string | null
+        readonly discovery?: ActiveGenerationConfigurationClaim['discovery']
       }
     | {
         readonly kind: 'chat'
@@ -176,6 +181,7 @@ export interface GenerationAdmissionPayload {
             }
           | { readonly kind: 'transaction-current' }
         readonly preferredDispatchKeyId: string | null
+        readonly discovery?: ActiveGenerationConfigurationClaim['discovery']
         readonly settingsPatch?: ChatSettingsPatch
       }
   readonly promptPath: GenerationPromptPathProof
@@ -209,6 +215,7 @@ export class GenerationAdmissionError extends Error {
 }
 
 interface GenerationAdmissionState {
+  foregroundDemand: WorkspaceForegroundDemandOwner | null
   status: 'claimed' | 'accepted' | 'cancelled' | 'failed'
   payload: GenerationAdmissionPayload | null
   attemptTargetClaim: AttemptTargetAdmissionClaim | null
@@ -289,19 +296,20 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   private readonly states = new WeakMap<GenerationAdmissionClaim, GenerationAdmissionState>()
 
   claim(request: GenerationAdmissionRequest): GenerationAdmissionClaim {
+    const foregroundDemand = claimWorkspaceForegroundDemand()
+    let claimed = false
     try {
-      return this.claimCaptured(
+      const claim = this.claimCaptured(
         request,
         snapshotGenerationIntent(request.intent),
         activeTargetConfigurationOverride(request),
+        foregroundDemand,
       )
+      claimed = true
+      return claim
     } finally {
-      if (
-        'configurationAuthority' in request &&
-        typeof request.configurationAuthority !== 'string'
-      ) {
-        releaseActiveTargetGenerationConfiguration(request.configurationAuthority)
-      }
+      if (!claimed) releaseWorkspaceForegroundDemand(foregroundDemand)
+      releaseTransferredGenerationConfiguration(request)
     }
   }
 
@@ -314,14 +322,28 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     ) => GenerationAdmissionStart<T>,
     observer?: GenerationPreparationObserver,
   ): Promise<T> {
-    const captured = captureSettlingAdmissionRequest(request)
-    return this.settleCapturedAdmission(captured, signal, start, observer)
+    if (signal.aborted) {
+      releaseTransferredGenerationConfiguration(request)
+      throwIfGenerationAdmissionAborted(signal)
+    }
+    const foregroundDemand = claimWorkspaceForegroundDemand()
+    try {
+      const captured = captureSettlingAdmissionRequest(request)
+      return this.settleCapturedAdmission(captured, signal, start, observer).finally(() =>
+        releaseWorkspaceForegroundDemand(foregroundDemand),
+      )
+    } catch (error) {
+      releaseWorkspaceForegroundDemand(foregroundDemand)
+      releaseTransferredGenerationConfiguration(request)
+      throw error
+    }
   }
 
   private claimCaptured(
     request: GenerationAdmissionRequest,
     capturedIntent: GenerationIntent,
-    configurationOverride?: ActiveGenerationConfigurationResolution,
+    configurationOverride: ActiveGenerationConfigurationResolution | undefined,
+    foregroundDemand: WorkspaceForegroundDemandOwner | null,
   ): GenerationAdmissionClaim {
     const intent = capturedIntent
     const routeOwner = 'routeOwner' in request ? request.routeOwner : null
@@ -426,6 +448,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
                 }),
               })
       this.states.set(claim, {
+        foregroundDemand,
         status: 'claimed',
         attemptTargetClaim: attemptTargetClaim ?? null,
         payload: Object.freeze({
@@ -476,6 +499,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
               captured.request,
               captured.request.intent,
               configurationResolution,
+              null,
             )
             const workspaceAdmission = createGenerationWorkspaceAdmission()
             let started: GenerationAdmissionStart<T>
@@ -570,14 +594,19 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     operation: (permit: WorkspaceWritePermit) => T | PromiseLike<T>,
     options: { readonly signal?: AbortSignal } = {},
   ): Promise<T> {
-    this.assertClaimed(claim)
+    const state = this.assertClaimed(claim)
     try {
       return withSharedGenerationLifetime(
         () =>
-          runWorkspaceActionAtFence('conversation-generation', claim.workspace, operation, {
-            ...options,
-            lineageId: `generation:${claim.streamId}`,
-          }),
+          runWorkspaceActionAtFence(
+            'conversation-generation',
+            claim.workspace,
+            (permit) => {
+              this.releaseForegroundDemand(state)
+              return operation(permit)
+            },
+            { ...options, lineageId: `generation:${claim.streamId}` },
+          ),
         options,
       )
     } catch (error) {
@@ -632,6 +661,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     const state = this.states.get(claim)
     if (state?.status !== 'claimed') return
     state.payload?.promptMaterial.release()
+    this.releaseForegroundDemand(state)
     this.releaseAttemptTarget(state)
     state.status = 'failed'
     state.payload = null
@@ -642,6 +672,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     const state = this.states.get(claim)
     if (state?.status !== 'claimed') return
     state.payload?.promptMaterial.release()
+    this.releaseForegroundDemand(state)
     this.releaseAttemptTarget(state)
     state.status = 'cancelled'
     state.payload = null
@@ -657,6 +688,12 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
       )
     }
     return state
+  }
+
+  private releaseForegroundDemand(state: GenerationAdmissionState): void {
+    const foregroundDemand = state.foregroundDemand
+    state.foregroundDemand = null
+    if (foregroundDemand) releaseWorkspaceForegroundDemand(foregroundDemand)
   }
 
   private releaseAttemptTarget(state: GenerationAdmissionState): void {
@@ -690,6 +727,7 @@ function captureGenerationConfiguration(
     return Object.freeze({
       kind: 'new-chat' as const,
       settings: resolution.claim.settings,
+      ...(resolution.claim.discovery ? { discovery: resolution.claim.discovery } : {}),
       presetId: resolution.claim.presetId,
       preferredDispatchKeyId,
     })
@@ -704,6 +742,9 @@ function captureGenerationConfiguration(
     return Object.freeze({
       kind: 'chat' as const,
       chatId,
+      ...(resolution?.capability === 'ready' && resolution.claim.discovery
+        ? { discovery: resolution.claim.discovery }
+        : {}),
       requestSettings: Object.freeze({ kind: 'transaction-current' as const }),
       preferredDispatchKeyId,
       ...(intent.kind === 'regenerate' && intent.settingsPatch
@@ -730,6 +771,7 @@ function captureGenerationConfiguration(
   return Object.freeze({
     kind: 'chat' as const,
     chatId,
+    ...(resolution.claim.discovery ? { discovery: resolution.claim.discovery } : {}),
     requestSettings: Object.freeze({
       kind: 'captured' as const,
       settings: cloneFrozenGenerationPayload(settings),
@@ -1023,6 +1065,12 @@ function resolveSettlingConfiguration(
 
 function cancelSettlingConfiguration(captured: CapturedSettlingAdmissionRequest): void {
   if (captured.configuration) releaseActiveTargetGenerationConfiguration(captured.configuration)
+}
+
+function releaseTransferredGenerationConfiguration(request: GenerationAdmissionRequest): void {
+  if ('configurationAuthority' in request && typeof request.configurationAuthority !== 'string') {
+    releaseActiveTargetGenerationConfiguration(request.configurationAuthority)
+  }
 }
 
 function activeTargetConfigurationOverride(

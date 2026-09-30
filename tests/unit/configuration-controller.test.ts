@@ -36,7 +36,10 @@ import type {
   ConfigurationDomainPort,
   ConfigurationDomainResult,
 } from '../../src/store/configuration-domain-contract'
-import { buildConnectionProfile } from '../../src/store/configuration-domain-contract'
+import {
+  buildConnectionProfile,
+  configurationRequestRevisionKey,
+} from '../../src/store/configuration-domain-contract'
 import type { ConversationSnapshot } from '../../src/store/conversation-controller'
 import { prepareLocalWorkspaceChange } from '../../src/store/workspace-effect-hub'
 import type {
@@ -659,6 +662,83 @@ describe('sealed target-qualified generation configuration', () => {
     selectionB.resolve(emptySelection())
     await waitForSelectionStatus('ready')
     expect(resolveNewChat()).toEqual({ capability: 'connection-missing' })
+  })
+
+  it('keeps selected discovery through a cache/source gap but accepts empty catalogs and rejects obsolete revisions', async () => {
+    const profile = { ...profileFixture('profile-discovery'), kind: 'openrouter' as const }
+    const settings = settingsFixture(profile)
+    let revision = requestRevision(profile.id)
+    let missing = false
+    let payload = { data: { id: settings.model, endpoints: [{ provider_name: 'Selected' }] } }
+    let payloadId = 'selected-payload'
+    const row = () => ({
+      profileId: profile.id,
+      modelId: settings.model,
+      profileRevision: configurationRequestRevisionKey(revision),
+      fetchedAt: 1,
+      payload,
+    })
+    const source = projectionSource({
+      loadActiveSelection: async () => selectionFixture(profile, { requestRevision: revision }),
+      loadActiveModel: async (target) => ({
+        kind: 'ready',
+        projection: {
+          revision: target.requestRevision,
+          modelId: target.modelId,
+          models: { kind: 'not-requested' },
+          privacy: { kind: 'missing' },
+          endpoints: missing
+            ? { kind: 'missing' }
+            : {
+                kind: 'loaded',
+                row: row(),
+                token: {
+                  profileRevision: configurationRequestRevisionKey(revision),
+                  payloadId,
+                  payloadByteLength: 100,
+                  fetchedAt: 1,
+                },
+              },
+        },
+      }),
+    })
+    configurationController.rememberSeed({ profileId: profile.id, presetId: null, settings })
+    await configurationController.setProjectionSource(source)
+    await vi.waitFor(() =>
+      expect(resolveNewChat()).toMatchObject({
+        capability: 'ready',
+        claim: { discovery: { endpoints: row() } },
+      }),
+    )
+    const captured = resolveNewChat()
+    missing = true
+    await configurationController.setProjectionSource(null)
+    await configurationController.setProjectionSource(source)
+    await vi.waitFor(() =>
+      expect(configurationController.getSnapshot().frame.model.status).toBe('ready'),
+    )
+    expect(resolveNewChat()).toEqual(captured)
+    missing = false
+    payload = { data: { id: settings.model, endpoints: [] } }
+    payloadId = 'empty-payload'
+    publishWorkspaceEffect([
+      { kind: 'discovery-cache', profileIds: [profile.id], cacheKinds: ['endpoints'] },
+    ])
+    await vi.waitFor(() =>
+      expect(resolveNewChat()).toMatchObject({ claim: { discovery: { endpoints: { payload } } } }),
+    )
+    missing = true
+    revision = { ...revision, requestRevision: 1 }
+    publishWorkspaceEffect([{ kind: 'profile', profileIds: [profile.id] }])
+    await vi.waitFor(() =>
+      expect(resolveNewChat()).toMatchObject({ claim: { requestRevision: revision } }),
+    )
+    await vi.waitFor(() =>
+      expect(configurationController.getSnapshot().frame.model.status).toBe('ready'),
+    )
+    const changed = resolveNewChat()
+    if (changed.capability !== 'ready') throw new Error('ExpectedReadyConfigurationProof')
+    expect(changed.claim.discovery?.endpoints).toBeUndefined()
   })
 
   it('authorizes only the exact new-chat, chat-A, or chat-B target', async () => {

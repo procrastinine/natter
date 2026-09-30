@@ -155,7 +155,7 @@ const TEMPORAL_INVENTORY = {
       'src/store/branch-tree-search-runtime.ts|schedulePointDrain|queueMicrotask||1',
       'src/store/browser-workspace-lifecycle.ts|shutdownBrowserWorkspaceWhenIdle|queueMicrotask||1',
       'src/store/browser-workspace-lifecycle.ts|scheduleFatalWorkspaceReload|queueMicrotask||1',
-      'src/store/browser-workspace-slot-coordination.ts|receiveSlotMessage|queueMicrotask||1',
+      'src/store/browser-workspace-slot-coordination.ts|failSlotTransition|queueMicrotask||1',
       'src/store/configuration-controller.ts|releaseDemand|queueMicrotask||1',
       'src/store/conversation-controller.ts|publish|queueMicrotask||1',
       'src/store/db.ts|reportFatalInvalidation|queueMicrotask||1',
@@ -675,9 +675,16 @@ const RETRY_LOOP_INVENTORY = {
       'Coordination acquisition retries only after a durable lease check or an explicit infrastructure failure; fencing tokens and ownership-loss signals, not retry count, establish exclusivity.',
     ids: [
       'src/store/locks.ts|acquire|ForStatement|unbounded|1',
+      'src/store/storage-maintenance-runtime.ts|#runOwnershipLifecycle|WhileStatement|bounded|1',
+    ],
+  },
+  'replacement-readiness-revalidation': {
+    rationale:
+      'A round refreshes its retained preparation before synchronous admission under the generation gate. Failed admission releases the gate and waits for exact owner or runtime changes; budget deferral drains more journal entries online without recopy, and the continuation owns cancellation across fresh round authority.',
+    ids: [
       'src/store/locks.ts|withExclusiveGenerationLifetime|ForStatement|unbounded|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|ForStatement|unbounded|1',
-      'src/store/storage-maintenance-runtime.ts|#runOwnershipLifecycle|WhileStatement|bounded|1',
+      'src/store/browser-workspace-replacement-runner.ts|runReplacementRound|ForStatement|unbounded|1',
     ],
   },
 }

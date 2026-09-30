@@ -31,6 +31,10 @@ service or installed-font lookup. Inter is the default; Serif is available in Ap
 | `pnpm fake-provider` | standalone loopback LLM API server with bounded generated and scripted streaming scenarios |
 | `pnpm test` | Vitest in watch mode |
 | `pnpm test:run` | Vitest single run |
+| `pnpm verify:ci` | the same complete verification entrypoint as GitHub, using an immutable source snapshot |
+| `pnpm verify:slice:plan -- --begin --head` | capture the current commit as the comparison baseline before a change |
+| `pnpm verify:slice:plan -- --baseline <id>` | derive affected checks and seal a candidate after the change |
+| `pnpm verify:slice -- --baseline <id> --candidate <candidate-id>` | execute the planned candidate with all affected browser projects and one application build |
 | `pnpm e2e` | exhaustive Chromium gate against one freshly built artifact and the standalone fake provider |
 | `pnpm e2e:production` | alias for the same built-artifact Chromium gate |
 | `pnpm e2e:smoke` | focused Chromium production-artifact smoke, including the production-runtime boundary proof |
@@ -48,6 +52,33 @@ service or installed-font lookup. Inter is the default; Serif is available in Ap
 | `pnpm perf:report` | machine-readable distribution, named lazy-chunk, duplication, and dependency-cycle report; records delivery-ratchet overruns and fails on hard topology/cycle/stream boundaries |
 | `pnpm format` | Biome format (write) |
 | `pnpm check` | Biome lint + format + organize imports |
+
+Playwright and affected-test selection share project ownership in
+`scripts/playwright-projects.mjs`; unit project membership lives in `scripts/vitest-projects.mjs`.
+Verification checks unit and browser receipts for missing files, unexecuted tests and retries;
+a successful process alone is insufficient. Declared skips are separate from executed cases.
+Ordinary tooling edits follow their dependencies; shared runtime/configuration changes retain full coverage.
+The full and affected runners share stage commands, prerequisite ordering, environment and result
+checks. A selected consumer brings its required producer; a failed prerequisite prevents dependent
+work while independent checks continue. Unit and browser setup changes invalidate their own runners.
+Browser phases run sequentially against one build, so performance measurements stay isolated
+without an earlier independent failure suppressing later coverage. Only actual setup dependencies
+require predecessor success.
+Pure tooling tests use a Node project without loading the browser application. Tests with browser,
+application, or unresolved dependencies retain the jsdom setup; both projects share one test run.
+One sequencer prioritizes failures and expensive files across both projects, sharing two isolated workers.
+Logs and receipts remain under `test-results/`. Open architectural obligations are reported
+separately and keep a slice from claiming full closure even when its selected checks pass.
+
+Ordinary Send helpers wait for the enabled submit control. Tests of input during preparation
+or streaming issue raw gestures and assert their outcomes. Use the fake provider's explicit
+hold/release controls to exercise those transitions; visible reply text does not mean the
+stream has finished.
+
+Native storage fixtures in browser tests and profiles use one operation owner. It binds the active
+database and activation sequence under a physical slot lease, owns request failures and transaction completion,
+and closes handles before releasing ownership. Use indexed queries for chat-specific assertions;
+an observed database name alone does not authorize a later operation.
 
 # Technologies, which I am sure are going to suffer from supply chain attacks. Therefore I do all my development on a VPS and publish to GitHub pages so this crap doesn't touch my computer
 

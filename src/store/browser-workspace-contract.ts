@@ -1,5 +1,6 @@
 import type { Transaction } from 'dexie'
 import type { BrowserWorkspaceReplacementStorageBaseline } from './browser-workspace-database-control'
+import type { BrowserWorkspaceOpenTarget } from './browser-workspace-open-contract'
 import type { NatterDb } from './db'
 import type { LockGrant } from './locks'
 
@@ -7,6 +8,14 @@ export interface BrowserWorkspaceSnapshot {
   workspaceId: string
   replacementEpoch: number
 }
+
+export type BrowserWorkspaceReplacementRuntimeRequest =
+  | { readonly kind: 'reopen'; readonly target: BrowserWorkspaceOpenTarget }
+  | { readonly kind: 'observe-cancellation' }
+
+export type BrowserWorkspaceReplacementReopenOutcome =
+  | { readonly kind: 'ready'; readonly workspace: BrowserWorkspaceSnapshot }
+  | { readonly kind: 'cancelled-closed'; readonly reason: unknown }
 
 export interface BrowserWorkspacePreparedReplacement<T> {
   workspace: BrowserWorkspaceSnapshot
@@ -55,11 +64,23 @@ export interface BrowserWorkspaceOnlineReplacementContext {
 }
 
 export interface BrowserWorkspaceOnlineReplacementOperation<Prepared, T> {
-  prepare(db: NatterDb, context: BrowserWorkspaceOnlineReplacementContext): Promise<Prepared>
-  abandon?(sourceDatabaseName: string): Promise<void>
-  commit(
+  prepare(
+    this: void,
+    db: NatterDb,
+    context: BrowserWorkspaceOnlineReplacementContext,
+  ): Promise<Prepared>
+  refresh(
+    db: NatterDb,
+    context: BrowserWorkspaceOnlineReplacementContext,
+    prepared: Prepared,
+  ): Promise<void>
+  abandon(sourceDatabaseName: string): Promise<void>
+  tryCommit(
     db: NatterDb,
     context: BrowserWorkspaceReplacementContext,
     prepared: Prepared,
-  ): Promise<BrowserWorkspacePreparedReplacement<T>>
+  ): Promise<
+    | { readonly kind: 'resume-online' }
+    | { readonly kind: 'prepared'; readonly replacement: BrowserWorkspacePreparedReplacement<T> }
+  >
 }

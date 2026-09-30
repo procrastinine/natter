@@ -46,56 +46,44 @@ test('startup opens the committed source while a live replacement owns selection
     ).__startupRecoverySelectionGate = lock
     await selectionGateAcquired
 
-    const control = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter-control')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    let sourceDatabaseName: string
-    let destinationDatabaseName: string
-    try {
-      const manifest = await new Promise<{
-        activeDatabaseName: string
-        activationSequence: number
-      }>((resolve, reject) => {
-        const transaction = control.transaction('manifests', 'readonly')
-        const request = transaction.objectStore('manifests').get('workspace')
-        request.onsuccess = () => {
-          const result: unknown = request.result
-          resolve(result as { activeDatabaseName: string; activationSequence: number })
-        }
-        request.onerror = () => reject(request.error)
-      })
-      sourceDatabaseName = manifest.activeDatabaseName
-      const slots = ['natter', 'natter-workspace-a', 'natter-workspace-b']
-      destinationDatabaseName = slots[
-        (slots.indexOf(sourceDatabaseName) + 1) % slots.length
-      ] as string
-      await new Promise<void>((resolve, reject) => {
-        const transaction = control.transaction('manifests', 'readwrite')
-        transaction.objectStore('manifests').put({
-          ...manifest,
-          id: 'workspace',
-          pending: {
-            nonce: crypto.randomUUID(),
-            phase: 'preparing',
-            sourceDatabaseName,
-            destinationDatabaseName,
-          },
-        })
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error)
-      })
-    } finally {
-      control.close()
-    }
-    const destination = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(destinationDatabaseName)
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    destination.close()
+    const { sourceDatabaseName, destinationDatabaseName } =
+      await globalThis.__natterNativeStorageFixture.control(
+        { purpose: 'fault-injection' },
+        async (control, request) => {
+          const manifest = (await request(
+            control.transaction('manifests', 'readonly').objectStore('manifests').get('workspace'),
+          )) as {
+            activeDatabaseName: string
+            activationSequence: number
+          }
+          const sourceDatabaseName = manifest.activeDatabaseName
+          const slots = ['natter', 'natter-workspace-a', 'natter-workspace-b']
+          const destinationDatabaseName = slots[
+            (slots.indexOf(sourceDatabaseName) + 1) % slots.length
+          ] as string
+          const transaction = control.transaction('manifests', 'readwrite')
+          transaction.objectStore('manifests').put({
+            ...manifest,
+            id: 'workspace',
+            pending: {
+              nonce: crypto.randomUUID(),
+              phase: 'preparing',
+              sourceDatabaseName,
+              destinationDatabaseName,
+            },
+          })
+          return { sourceDatabaseName, destinationDatabaseName }
+        },
+      )
+    await globalThis.__natterNativeStorageFixture.offline(
+      {
+        purpose: 'fault-injection',
+        databaseName: destinationDatabaseName,
+        version: 1,
+        upgrade: () => undefined,
+      },
+      () => undefined,
+    )
     return { sourceDatabaseName, destinationDatabaseName }
   })
   const openingPage = await context.newPage()
@@ -132,26 +120,13 @@ test('startup opens the committed source while a live replacement owns selection
       .poll(
         () =>
           openingPage.evaluate(async ({ destinationDatabaseName }) => {
-            const manifest = await new Promise<{
-              pending?: unknown
-            }>((resolve, reject) => {
-              const request = indexedDB.open('natter-control')
-              request.onsuccess = () => {
-                const control = request.result
-                const transaction = control.transaction('manifests', 'readonly')
-                const read = transaction.objectStore('manifests').get('workspace')
-                read.onsuccess = () => {
-                  const result: unknown = read.result
-                  control.close()
-                  resolve(result as { pending?: unknown })
-                }
-                read.onerror = () => {
-                  control.close()
-                  reject(read.error)
-                }
-              }
-              request.onerror = () => reject(request.error)
-            })
+            const manifest = await globalThis.__natterNativeStorageFixture.control(
+              { purpose: 'read-only-assertion' },
+              (database, request) =>
+                request(
+                  database.transaction('manifests').objectStore('manifests').get('workspace'),
+                ) as Promise<{ pending?: unknown }>,
+            )
             return {
               pending: manifest.pending !== undefined,
               databases: (await indexedDB.databases()).flatMap((database) =>
@@ -183,49 +158,45 @@ test('many reloading tabs elect one bounded registered upgrade for a valid v97 w
   page,
 }) => {
   await waitForWorkspaceRunning(page)
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  const schema = await readDatabaseSchema(page, databaseName)
-  const rows = await readDatabaseRows(page, databaseName)
   const resetRoute = '**/__startup-v97-reset__'
   await page.route(resetRoute, (route) =>
     route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
   )
   await page.goto('/__startup-v97-reset__')
+  const { databaseName, schema, rows } = await readOfflineWorkspaceSnapshot(page, true)
   await page.evaluate(
     async ({ databaseName, rows, schema }) => {
-      await new Promise<void>((resolve, reject) => {
-        const request = indexedDB.deleteDatabase(databaseName)
-        request.onsuccess = () => resolve()
-        request.onerror = () => reject(request.error)
-        request.onblocked = () => reject(new Error('RegisteredV97DeleteBlocked'))
+      await globalThis.__natterNativeStorageFixture.deleteOffline({
+        databaseName: databaseName,
+        purpose: 'legacy-fixture',
       })
-      const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName, 970)
-        request.onupgradeneeded = () => {
-          for (const definition of schema) {
-            const store = request.result.createObjectStore(definition.name, {
-              keyPath: definition.keyPath,
-              autoIncrement: definition.autoIncrement,
-            })
-            const indexes =
-              definition.name === 'chatSidebarAggregates'
-                ? definition.indexes.filter((index) => index.name === 'kind')
-                : definition.name === 'presets'
-                  ? []
-                  : definition.indexes
-            for (const index of indexes) {
-              store.createIndex(index.name, index.keyPath, {
-                unique: index.unique,
-                multiEntry: index.multiEntry,
+      return globalThis.__natterNativeStorageFixture.offline(
+        {
+          purpose: 'legacy-fixture',
+          databaseName: databaseName,
+          version: 970,
+          upgrade: (upgradeDatabase) => {
+            for (const definition of schema) {
+              const store = upgradeDatabase.createObjectStore(definition.name, {
+                keyPath: definition.keyPath,
+                autoIncrement: definition.autoIncrement,
               })
+              const indexes =
+                definition.name === 'chatSidebarAggregates'
+                  ? definition.indexes.filter((index) => index.name === 'kind')
+                  : definition.name === 'presets'
+                    ? []
+                    : definition.indexes
+              for (const index of indexes) {
+                store.createIndex(index.name, index.keyPath, {
+                  unique: index.unique,
+                  multiEntry: index.multiEntry,
+                })
+              }
             }
-          }
-        }
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
+          },
+        },
+        async (database) => {
           const transaction = database.transaction(
             schema.map((definition) => definition.name),
             'readwrite',
@@ -285,13 +256,8 @@ test('many reloading tabs elect one bounded registered upgrade for a valid v97 w
               lastUsedAt: 1,
             })
           }
-          transaction.oncomplete = () => resolve()
-          transaction.onerror = () => reject(transaction.error)
-          transaction.onabort = () => reject(transaction.error)
-        })
-      } finally {
-        database.close()
-      }
+        },
+      )
     },
     { databaseName, rows, schema },
   )
@@ -394,34 +360,25 @@ test('many reloading tabs elect one bounded registered upgrade for a valid v97 w
     )
     const proof = await page.evaluate(
       async ({ databaseName }) => {
-        const database = await new Promise<IDBDatabase>((resolve, reject) => {
-          const request = indexedDB.open(databaseName)
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-        try {
-          const values = await new Promise<unknown[]>((resolve, reject) => {
+        return globalThis.__natterNativeStorageFixture.observeNamed(
+          { purpose: 'read-only-assertion', databaseName: databaseName },
+          async (database, request) => {
             const transaction = database.transaction('settings', 'readonly')
             const settings = transaction.objectStore('settings')
-            const requests: IDBRequest<unknown>[] = [
-              settings.get('backfill:browser-workspace-current-v97'),
-              settings.get('backfill:browser-workspace-current-v98'),
-              settings.get('registered-upgrade-browser-proof'),
-            ]
-            transaction.oncomplete = () => resolve(requests.map((request) => request.result))
-            transaction.onerror = () => reject(transaction.error)
-            transaction.onabort = () => reject(transaction.error)
-          })
-          return {
-            version: database.version,
-            values,
-            databases: (await indexedDB.databases()).flatMap((entry) =>
-              entry.name === undefined ? [] : [entry.name],
-            ),
-          }
-        } finally {
-          database.close()
-        }
+            const values = await Promise.all([
+              request(settings.get('backfill:browser-workspace-current-v97')),
+              request(settings.get('backfill:browser-workspace-current-v98')),
+              request(settings.get('registered-upgrade-browser-proof')),
+            ])
+            return {
+              version: database.version,
+              values,
+              databases: (await indexedDB.databases()).flatMap((entry) =>
+                entry.name === undefined ? [] : [entry.name],
+              ),
+            }
+          },
+        )
       },
       { databaseName },
     )
@@ -519,44 +476,41 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
   page,
 }) => {
   await waitForWorkspaceRunning(page)
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  const schema = await readDatabaseSchema(page, databaseName)
   const legacyRows = legacyRepairFixtureRows({})
-  expect(schema.length).toBeGreaterThan(0)
   const resetRoute = '**/__startup-v94-reset__'
   await page.route(resetRoute, (route) =>
     route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
   )
   await page.goto('/__startup-v94-reset__')
+  const { databaseName, schema } = await readOfflineWorkspaceSnapshot(page, false)
+  expect(schema.length).toBeGreaterThan(0)
   await page.evaluate(
     async ({ databaseName, legacyRows, schema }) => {
-      await new Promise<void>((resolve, reject) => {
-        const request = indexedDB.deleteDatabase(databaseName)
-        request.onsuccess = () => resolve()
-        request.onerror = () => reject(request.error)
-        request.onblocked = () => reject(new Error('IntermediateV94DeleteBlocked'))
+      await globalThis.__natterNativeStorageFixture.deleteOffline({
+        databaseName: databaseName,
+        purpose: 'legacy-fixture',
       })
-      const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName, 940)
-        request.onupgradeneeded = () => {
-          for (const definition of schema) {
-            const store = request.result.createObjectStore(definition.name, {
-              keyPath: definition.keyPath,
-              autoIncrement: definition.autoIncrement,
-            })
-            for (const index of definition.indexes) {
-              store.createIndex(index.name, index.keyPath, {
-                unique: index.unique,
-                multiEntry: index.multiEntry,
+      return globalThis.__natterNativeStorageFixture.offline(
+        {
+          purpose: 'legacy-fixture',
+          databaseName: databaseName,
+          version: 940,
+          upgrade: (upgradeDatabase) => {
+            for (const definition of schema) {
+              const store = upgradeDatabase.createObjectStore(definition.name, {
+                keyPath: definition.keyPath,
+                autoIncrement: definition.autoIncrement,
               })
+              for (const index of definition.indexes) {
+                store.createIndex(index.name, index.keyPath, {
+                  unique: index.unique,
+                  multiEntry: index.multiEntry,
+                })
+              }
             }
-          }
-        }
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
+          },
+        },
+        async (database) => {
           const transaction = database.transaction(
             ['settings', 'folders', 'chats', 'messages', 'messageBodies', 'messagePreviews'],
             'readwrite',
@@ -576,13 +530,8 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
           for (const preview of legacyRows.previews) {
             transaction.objectStore('messagePreviews').put(preview)
           }
-          transaction.oncomplete = () => resolve()
-          transaction.onerror = () => reject(transaction.error)
-          transaction.onabort = () => reject(transaction.error)
-        })
-      } finally {
-        database.close()
-      }
+        },
+      )
     },
     { databaseName, legacyRows, schema },
   )
@@ -603,40 +552,33 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
       .poll(() =>
         page.evaluate(
           async ({ databaseName, repairedDatabaseName }) => {
-            const database = await new Promise<IDBDatabase>((resolve, reject) => {
-              const request = indexedDB.open(repairedDatabaseName)
-              request.onsuccess = () => resolve(request.result)
-              request.onerror = () => reject(request.error)
-            })
-            try {
-              const repairedRows = await new Promise<unknown[]>((resolve, reject) => {
+            return globalThis.__natterNativeStorageFixture.observeNamed(
+              { purpose: 'read-only-assertion', databaseName: repairedDatabaseName },
+              async (database, request) => {
                 const transaction = database.transaction(
                   ['settings', 'chats', 'chatSidebarAggregates'],
                   'readonly',
                 )
-                const requests: IDBRequest<unknown>[] = [
-                  transaction.objectStore('settings').get('manifest-proof:chromium-v94'),
-                  transaction.objectStore('chats').get('legacy-repair-chat'),
-                  transaction.objectStore('chatSidebarAggregates').get('workspace'),
-                  transaction
-                    .objectStore('chatSidebarAggregates')
-                    .get('folder:legacy-repair-folder'),
-                ]
-                transaction.oncomplete = () => resolve(requests.map((request) => request.result))
-                transaction.onerror = () => reject(transaction.error)
-                transaction.onabort = () => reject(transaction.error)
-              })
-              return {
-                version: database.version,
-                repairedRows,
-                databases: (await indexedDB.databases()).flatMap((entry) =>
-                  entry.name === undefined ? [] : [entry.name],
-                ),
-                databaseName,
-              }
-            } finally {
-              database.close()
-            }
+                const repairedRows = await Promise.all([
+                  request(transaction.objectStore('settings').get('manifest-proof:chromium-v94')),
+                  request(transaction.objectStore('chats').get('legacy-repair-chat')),
+                  request(transaction.objectStore('chatSidebarAggregates').get('workspace')),
+                  request(
+                    transaction
+                      .objectStore('chatSidebarAggregates')
+                      .get('folder:legacy-repair-folder'),
+                  ),
+                ])
+                return {
+                  version: database.version,
+                  repairedRows,
+                  databases: (await indexedDB.databases()).flatMap((entry) =>
+                    entry.name === undefined ? [] : [entry.name],
+                  ),
+                  databaseName,
+                }
+              },
+            )
           },
           { databaseName, repairedDatabaseName },
         ),
@@ -758,78 +700,39 @@ function legacyRepairFixtureRows(settings: unknown) {
 
 test('a poisoned local database shows recovery instead of a blank root', async ({ page }) => {
   await waitForWorkspaceRunning(page)
-  const databaseName = await activeWorkspaceDatabaseName(page)
-  const schema = await page.evaluate(async (databaseName) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(databaseName)
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      const names = Array.from(db.objectStoreNames)
-      const transaction = db.transaction(names, 'readonly')
-      const definitions = names.map((name) => {
-        const store = transaction.objectStore(name)
-        return {
-          name,
-          keyPath: store.keyPath,
-          autoIncrement: store.autoIncrement,
-          indexes: Array.from(store.indexNames).map((indexName) => {
-            const index = store.index(indexName)
-            return {
-              name: index.name,
-              keyPath: index.keyPath,
-              unique: index.unique,
-              multiEntry: index.multiEntry,
-            }
-          }),
-        }
-      })
-      await new Promise<void>((resolve, reject) => {
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error)
-      })
-      return definitions
-    } finally {
-      db.close()
-    }
-  }, databaseName)
-
   const resetRoute = '**/__startup-recovery-reset__'
   await page.route(resetRoute, (route) =>
     route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
   )
   await page.goto('/__startup-recovery-reset__')
+  const { databaseName, schema } = await readOfflineWorkspaceSnapshot(page, false)
   await page.evaluate(
     async ({ databaseName, schema }) => {
-      await new Promise<void>((resolve, reject) => {
-        const request = indexedDB.deleteDatabase(databaseName)
-        request.onsuccess = () => resolve()
-        request.onerror = () => reject(request.error)
-        request.onblocked = () => reject(new Error('StartupRecoveryDeleteBlocked'))
+      await globalThis.__natterNativeStorageFixture.deleteOffline({
+        databaseName: databaseName,
+        purpose: 'legacy-fixture',
       })
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName, 250)
-        request.onupgradeneeded = () => {
-          for (const definition of schema) {
-            const store = request.result.createObjectStore(definition.name, {
-              keyPath: definition.keyPath,
-              autoIncrement: definition.autoIncrement,
-            })
-            for (const index of definition.indexes) {
-              store.createIndex(index.name, index.keyPath, {
-                unique: index.unique,
-                multiEntry: index.multiEntry,
+      return globalThis.__natterNativeStorageFixture.offline(
+        {
+          purpose: 'legacy-fixture',
+          databaseName: databaseName,
+          version: 250,
+          upgrade: (upgradeDatabase) => {
+            for (const definition of schema) {
+              const store = upgradeDatabase.createObjectStore(definition.name, {
+                keyPath: definition.keyPath,
+                autoIncrement: definition.autoIncrement,
               })
+              for (const index of definition.indexes) {
+                store.createIndex(index.name, index.keyPath, {
+                  unique: index.unique,
+                  multiEntry: index.multiEntry,
+                })
+              }
             }
-          }
-        }
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
+          },
+        },
+        async (db) => {
           const transaction = db.transaction('messages', 'readwrite')
           transaction.objectStore('messages').put({
             id: 'message-poison',
@@ -838,13 +741,8 @@ test('a poisoned local database shows recovery instead of a blank root', async (
             nodeVersion: 0,
             requestContextVersion: 0,
           })
-          transaction.oncomplete = () => resolve()
-          transaction.onerror = () => reject(transaction.error)
-          transaction.onabort = () => reject(transaction.error)
-        })
-      } finally {
-        db.close()
-      }
+        },
+      )
     },
     { databaseName, schema },
   )
@@ -861,60 +759,42 @@ test('a poisoned local database shows recovery instead of a blank root', async (
   await expect(page.getByRole('button', { name: 'Reset local data' })).toBeHidden()
 })
 
-function readDatabaseSchema(page: Page, databaseName: string) {
-  return page.evaluate(async (databaseName) => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(databaseName)
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      const names = Array.from(database.objectStoreNames)
-      const transaction = database.transaction(names, 'readonly')
-      return names.map((name) => {
-        const store = transaction.objectStore(name)
-        return {
-          name,
-          keyPath: store.keyPath,
-          autoIncrement: store.autoIncrement,
-          indexes: Array.from(store.indexNames).map((indexName) => {
-            const index = store.index(indexName)
+function readOfflineWorkspaceSnapshot(page: Page, includeRows: boolean) {
+  return page.evaluate(
+    (includeRows) =>
+      globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (database, request, binding) => {
+          const names = Array.from(database.objectStoreNames)
+          const transaction = database.transaction(names, 'readonly')
+          const schema = names.map((name) => {
+            const store = transaction.objectStore(name)
             return {
-              name: index.name,
-              keyPath: index.keyPath,
-              unique: index.unique,
-              multiEntry: index.multiEntry,
+              name,
+              keyPath: store.keyPath,
+              autoIncrement: store.autoIncrement,
+              indexes: Array.from(store.indexNames).map((name) => {
+                const index = store.index(name)
+                return {
+                  name,
+                  keyPath: index.keyPath,
+                  unique: index.unique,
+                  multiEntry: index.multiEntry,
+                }
+              }),
             }
-          }),
-        }
-      })
-    } finally {
-      database.close()
-    }
-  }, databaseName)
-}
-
-function readDatabaseRows(page: Page, databaseName: string) {
-  return page.evaluate(async (databaseName) => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(databaseName)
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      const names = Array.from(database.objectStoreNames)
-      const transaction = database.transaction(names, 'readonly')
-      const reads = names.map(
-        (name) =>
-          new Promise<{ name: string; rows: unknown[] }>((resolve, reject) => {
-            const request = transaction.objectStore(name).getAll()
-            request.onsuccess = () => resolve({ name, rows: request.result })
-            request.onerror = () => reject(request.error)
-          }),
-      )
-      return await Promise.all(reads)
-    } finally {
-      database.close()
-    }
-  }, databaseName)
+          })
+          const rows = includeRows
+            ? await Promise.all(
+                names.map(async (name) => ({
+                  name,
+                  rows: (await request(transaction.objectStore(name).getAll())) as unknown[],
+                })),
+              )
+            : []
+          return { databaseName: binding.databaseName, schema, rows }
+        },
+      ),
+    includeRows,
+  )
 }

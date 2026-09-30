@@ -231,7 +231,7 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
       schedulers: [
         'src/store/browser-workspace-lifecycle.ts|shutdownBrowserWorkspaceWhenIdle|queueMicrotask||1',
         'src/store/browser-workspace-lifecycle.ts|scheduleFatalWorkspaceReload|queueMicrotask||1',
-        'src/store/browser-workspace-slot-coordination.ts|receiveSlotMessage|queueMicrotask||1',
+        'src/store/browser-workspace-slot-coordination.ts|failSlotTransition|queueMicrotask||1',
         'src/store/db.ts|reportFatalInvalidation|queueMicrotask||1',
       ],
       retryLoops: [
@@ -358,15 +358,16 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
       'physical workspace replacement only',
       'origin-wide generation admission during actual replacement',
       'replacement runner and workspace runtime',
-      'Caller abort removes pending locks and readiness observers; replacement finalization releases admitted ownership.',
-      'One prepared copy and one readiness wait per replacement; no timer, replay or retained generation gate while blocked.',
-      'Generation owner release and local root or child release trigger readiness revalidation.',
+      'The kernel continuation owns caller cancellation, required-replacement preemption and shutdown across epochs; each round releases its own locks and authority before fresh admission, and terminal finalization releases staging and continuation custody.',
+      'One prepared copy and journal per attempt, at most one readiness wait at a time, and bounded useful catch-up pages; deferred rounds retain preparation but neither generation admission nor source-slot exclusion.',
+      'Generation owner, foreground-demand owner and local root or child release trigger synchronous readiness revalidation. Budget deferral consumes pending journal revisions online; peer demand and completion name the exact never-reused round, so stale messages cannot quiesce a resumed peer.',
       'none',
     ),
     {
       retryLoops: [
         'src/store/locks.ts|withExclusiveGenerationLifetime|ForStatement|unbounded|1',
         'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|ForStatement|unbounded|1',
+        'src/store/browser-workspace-replacement-runner.ts|runReplacementRound|ForStatement|unbounded|1',
       ],
     },
   ),
@@ -969,7 +970,7 @@ export const TEMPORAL_READINESS_PROOFS = Object.freeze([
       ),
       evidence(
         'src/store/browser-workspace-lifecycle.ts',
-        "attempt.selection = await runBrowserWorkspaceOpenStage('database-selection', () =>\n      prepareBrowserWorkspaceDatabaseSelection(\n        attempt.authority,\n        options.onProgress,\n        options.onBlocked,\n      ),\n    )",
+        "attempt.selection = await runBrowserWorkspaceOpenStage('database-selection', () =>\n      prepareBrowserWorkspaceDatabaseSelection(\n        attempt.authority,\n        options.onProgress,\n        options.onBlocked,\n        attempt.target,\n      ),\n    )",
       ),
       evidence(
         'src/store/browser-workspace-lifecycle.ts',

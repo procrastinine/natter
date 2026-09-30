@@ -42,6 +42,7 @@ import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
 } from '../../src/store/workspace-repository'
+import * as workspaceRuntime from '../../src/store/workspace-runtime'
 import {
   awaitWorkspaceRuntimeQuiesced,
   beginWorkspaceRuntimeQuiesce,
@@ -187,6 +188,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await shutdownBrowserWorkspace()
   await reset()
 })
@@ -833,6 +835,59 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     })
   })
 
+  it('owns foreground preparation synchronously and releases it on cancellation and admission', async () => {
+    const scenario = await buildScenario('send')
+    const intent = scenario.intent
+    if (intent.kind !== 'send') throw new Error('Expected Send scenario')
+    const releaseSurface = await prepareControlledGenerationSurface(intent, {
+      profile: profile(),
+    })
+    releaseSurface()
+    let releaseFlush!: () => void
+    const heldFlush = new Promise<void>((resolve) => {
+      releaseFlush = resolve
+    })
+    const flush = vi
+      .spyOn(configurationController, 'flushGenerationEdits')
+      .mockReturnValueOnce(heldFlush)
+    const openStream = vi.fn(() => completedStream('foreground ownership settled'))
+    const engine = createGenerationEngine({ openStream })
+    const cancellation = new AbortController()
+    const claim = vi.spyOn(workspaceRuntime, 'claimWorkspaceForegroundDemand')
+    const release = vi.spyOn(workspaceRuntime, 'releaseWorkspaceForegroundDemand')
+    let pending: ReturnType<typeof engine.startWhenCapabilitySettles> | undefined
+    try {
+      pending = engine.startWhenCapabilitySettles({ intent }, { signal: cancellation.signal })
+      expect(claim).toHaveBeenCalledOnce()
+      const owner: unknown = claim.mock.results[0]?.value
+      expect(owner).toBeDefined()
+      expect(release).not.toHaveBeenCalledWith(owner)
+      expect(openStream).not.toHaveBeenCalled()
+      cancellation.abort(new DOMException('Cancel preparation', 'AbortError'))
+      await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+      expect(release.mock.calls.filter(([released]) => released === owner)).toHaveLength(1)
+      expect(openStream).not.toHaveBeenCalled()
+    } finally {
+      cancellation.abort()
+      releaseFlush()
+      await pending?.catch(() => undefined)
+      flush.mockRestore()
+    }
+    claim.mockClear()
+    release.mockClear()
+    const admitted = engine.startWhenCapabilitySettles(
+      { intent },
+      { signal: new AbortController().signal },
+    )
+    expect(claim).toHaveBeenCalledOnce()
+    const admittedOwner: unknown = claim.mock.results[0]?.value
+    expect(admittedOwner).toBeDefined()
+    const handle = await admitted
+    expect(release.mock.calls.filter(([released]) => released === admittedOwner)).toHaveLength(1)
+    await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+    expect(openStream).toHaveBeenCalledOnce()
+  })
+
   it('does not retain admission ownership for a gesture cancelled before admission', async () => {
     const chat = await createChat({ settings: boundedSettings() })
     const path = await seedLinear(chat.id, [
@@ -871,8 +926,18 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     const engine = createGenerationEngine({ openStream })
     const cancelled = new AbortController()
     cancelled.abort(new DOMException('Gesture cancelled.', 'AbortError'))
+    const claim = vi.spyOn(workspaceRuntime, 'claimWorkspaceForegroundDemand')
+    const configuration = configurationController.claimSelectedGenerationConfiguration(chat.id)
+    expect(
+      configurationController.resolveSelectedGenerationConfiguration(configuration).capability,
+    ).not.toBe('failed')
     const firstGesture = engine.startWhenCapabilitySettles(
       {
+        configurationAuthority: {
+          kind: 'selected-active-target',
+          chatId: chat.id,
+          claim: configuration,
+        },
         intent: {
           kind: 'send',
           chatId: chat.id,
@@ -884,6 +949,10 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     )
 
     await expect(firstGesture).rejects.toMatchObject({ name: 'AbortError' })
+    expect(
+      configurationController.resolveSelectedGenerationConfiguration(configuration).capability,
+    ).toBe('failed')
+    expect(claim).not.toHaveBeenCalled()
     expect(openStream).not.toHaveBeenCalled()
 
     const next = new AbortController()

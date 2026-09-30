@@ -3,12 +3,20 @@ import {
   assertBrowserWorkspaceBootstrapAuthority,
   type BrowserWorkspaceBootstrapAuthority,
 } from './browser-workspace-bootstrap-authority'
-import { readBrowserWorkspaceDatabaseManifest } from './browser-workspace-database-control'
-import type { BrowserWorkspaceOpenProgress } from './browser-workspace-open-contract'
+import { probeBrowserWorkspaceCurrent } from './browser-workspace-current-probe'
+import {
+  readBrowserWorkspaceDatabaseManifest,
+  sameBrowserWorkspaceReplacementJournal,
+} from './browser-workspace-database-control'
+import type {
+  BrowserWorkspaceOpenProgress,
+  BrowserWorkspaceOpenTarget,
+} from './browser-workspace-open-contract'
 import {
   acquireBrowserWorkspaceSlotLease,
   type BrowserWorkspaceSlotLeaseHandle,
   releaseBrowserWorkspaceSlotLease,
+  withBrowserWorkspaceSlotOperation,
 } from './browser-workspace-slot-coordination'
 import { ensureBrowserWorkspaceCurrentForSelection } from './browser-workspace-startup-repair'
 import { configureBrowserWorkspaceDatabaseName } from './db'
@@ -43,13 +51,14 @@ export function prepareBrowserWorkspaceDatabaseSelection(
   authority: BrowserWorkspaceBootstrapAuthority,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
   onBlocked?: (event: IDBVersionChangeEvent) => void,
+  target: BrowserWorkspaceOpenTarget = { kind: 'active' },
 ): Promise<OpeningBrowserWorkspaceDatabaseSelection> {
   assertBrowserWorkspaceBootstrapAuthority(authority)
   if (currentSelection?.phase === 'active') {
     return Promise.reject(new Error('BrowserWorkspaceDatabaseSelectionAlreadyActive'))
   }
   if (selectionPromise) return selectionPromise
-  const pending = performBrowserWorkspaceDatabaseSelection(authority, onProgress, onBlocked)
+  const pending = performBrowserWorkspaceDatabaseSelection(authority, onProgress, onBlocked, target)
   selectionPromise = pending
   void pending.catch(() => {
     if (selectionPromise === pending) selectionPromise = null
@@ -93,23 +102,24 @@ async function performBrowserWorkspaceDatabaseSelection(
   authority: BrowserWorkspaceBootstrapAuthority,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
   onBlocked?: (event: IDBVersionChangeEvent) => void,
+  target: BrowserWorkspaceOpenTarget = { kind: 'active' },
 ): Promise<OpeningBrowserWorkspaceDatabaseSelection> {
-  return selectBrowserWorkspaceDatabase(authority, onProgress, onBlocked)
+  return selectBrowserWorkspaceDatabase(authority, onProgress, onBlocked, target)
 }
 
 async function selectBrowserWorkspaceDatabase(
   authority: BrowserWorkspaceBootstrapAuthority,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
   onBlocked?: (event: IDBVersionChangeEvent) => void,
+  target: BrowserWorkspaceOpenTarget = { kind: 'active' },
 ): Promise<OpeningBrowserWorkspaceDatabaseSelection> {
   for (;;) {
     assertBrowserWorkspaceBootstrapAuthority(authority)
     onProgress?.({ kind: 'database-selection', operation: 'read-active-slot' })
-    const current = await ensureBrowserWorkspaceCurrentForSelection(
-      authority.signal,
-      onProgress,
-      onBlocked,
-    )
+    const current =
+      target.kind === 'retained-source'
+        ? await readRetainedBrowserWorkspaceSource(target, authority.signal)
+        : await ensureBrowserWorkspaceCurrentForSelection(authority.signal, onProgress, onBlocked)
     assertBrowserWorkspaceBootstrapAuthority(authority)
     onProgress?.({
       kind: 'database-selection',
@@ -135,8 +145,16 @@ async function selectBrowserWorkspaceDatabase(
           operation: 'retry-changed-slot',
           databaseName: current.databaseName,
         })
+        if (target.kind === 'retained-source')
+          throw new Error('BrowserWorkspaceRetainedSourceChanged')
         await releaseBrowserWorkspaceSlotLease(slotLease)
         continue
+      }
+      if (
+        target.kind === 'retained-source' &&
+        !sameBrowserWorkspaceReplacementJournal(confirmed.pending, target.journal)
+      ) {
+        throw new Error('BrowserWorkspaceRetainedSourceChanged')
       }
       configureBrowserWorkspaceDatabaseName(confirmed.activeDatabaseName, current.physicalVersion)
       const record: BrowserWorkspaceDatabaseSelectionRecord = {
@@ -152,6 +170,33 @@ async function selectBrowserWorkspaceDatabase(
       await releaseBrowserWorkspaceSlotLease(slotLease)
       throw error
     }
+  }
+}
+
+async function readRetainedBrowserWorkspaceSource(
+  target: Extract<BrowserWorkspaceOpenTarget, { readonly kind: 'retained-source' }>,
+  signal: AbortSignal,
+) {
+  const manifest = await readBrowserWorkspaceDatabaseManifest()
+  if (
+    manifest.activeDatabaseName !== target.journal.sourceDatabaseName ||
+    !sameBrowserWorkspaceReplacementJournal(manifest.pending, target.journal)
+  )
+    throw new Error('BrowserWorkspaceRetainedSourceChanged')
+  const current = await withBrowserWorkspaceSlotOperation(
+    manifest.activeDatabaseName,
+    {
+      kind: 'transient-probe',
+      run: () => probeBrowserWorkspaceCurrent(manifest.activeDatabaseName),
+    },
+    signal,
+  )
+  if (current.kind !== 'current')
+    throw new Error(`BrowserWorkspaceRetainedSourceInvalid:${current.kind}`)
+  return {
+    databaseName: manifest.activeDatabaseName,
+    activationSequence: manifest.activationSequence,
+    physicalVersion: current.physicalVersion,
   }
 }
 

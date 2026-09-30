@@ -2,6 +2,7 @@ export const PROTOCOL_CONTRACT_STAGE: Readonly<{
   id: 'protocol-contracts'
   label: string
   policy: 'blocking'
+  consumerModules: readonly string[]
   argv: readonly [
     'node',
     'scripts/audit-protocol-contracts.mjs',

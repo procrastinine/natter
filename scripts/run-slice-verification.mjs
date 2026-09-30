@@ -3,6 +3,11 @@ import { relative, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 import { currentWaveManifest } from './current-wave-manifest.mjs'
+import {
+  collectVerificationMetadata,
+  executeVerificationStage,
+  prepareVerificationStageExecution,
+} from './run-verification.mjs'
 import { assertVerificationCandidateAdmissionReady } from './verification-candidate-admission.mjs'
 import {
   createVerificationCandidateEnvironment,
@@ -13,62 +18,31 @@ import {
   readMaterializedVerificationCandidate,
 } from './verification-candidate-workspace.mjs'
 import { buildVerificationSnapshot } from './verification-impact-plan.mjs'
-import {
-  createVerificationRuntimeInvocation,
-  executeFileBackedVerificationProcess,
-  verificationChildEnvironment,
-} from './verification-process-execution.mjs'
+import { createVerificationRuntimeInvocation } from './verification-process-execution.mjs'
 import { createVerificationSlicePlan } from './verification-slice-workspace.mjs'
+import {
+  verificationPrerequisiteDiagnostics,
+  verificationStageAssurance,
+  verificationStageBlocks,
+  verificationStageStatus,
+} from './verification-stage-contract.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
 
 export function createSliceTaskBatches(plan, runtime = null) {
-  const batches = []
-  for (const task of plan.tasks.node) {
-    const invocation = createVerificationRuntimeInvocation(['node', ...task.argv], runtime)
-    batches.push(
+  return Object.freeze(
+    plan.stages.map((stage) =>
       Object.freeze({
-        id: `node-${task.id}`,
-        kind: 'node',
-        ...invocation,
+        id: stage.kind === 'node' && stage.argv[0] === 'node' ? `node-${stage.id}` : stage.id,
+        kind: stage.kind ?? 'node',
+        stage,
+        ...(stage.browserTasks ? { browserTasks: stage.browserTasks } : {}),
+        ...(stage.argv[0] === 'internal'
+          ? { command: 'internal', args: Object.freeze(stage.argv.slice(1)) }
+          : createVerificationRuntimeInvocation(stage.argv, runtime)),
       }),
-    )
-  }
-  if (plan.tasks.vitest.length > 0) {
-    const invocation = createVerificationRuntimeInvocation(
-      ['pnpm', 'exec', 'vitest', 'run', ...plan.tasks.vitest],
-      runtime,
-    )
-    batches.push(
-      Object.freeze({
-        id: 'vitest',
-        kind: 'vitest',
-        ...invocation,
-      }),
-    )
-  }
-  for (const task of plan.tasks.playwright) {
-    const invocation = createVerificationRuntimeInvocation(
-      [
-        'pnpm',
-        'exec',
-        'playwright',
-        'test',
-        `--project=${task.project}`,
-        '--no-deps',
-        ...task.files,
-      ],
-      runtime,
-    )
-    batches.push(
-      Object.freeze({
-        id: `playwright-${task.project}`,
-        kind: 'playwright',
-        ...invocation,
-      }),
-    )
-  }
-  return Object.freeze(batches)
+    ),
+  )
 }
 
 export function assertSliceVerificationExecutionReady(manifest = currentWaveManifest) {
@@ -86,7 +60,7 @@ export async function runSliceVerification(options) {
       runId: `slice-${options.candidate.id}`,
       purpose: `candidate-execution:${options.candidate.id}`,
     },
-    async ({ candidate, runtime, environment }) => {
+    async ({ candidate, runtime, environment, testCompilerProof }) => {
       const planBundle = createVerificationSlicePlan({
         evidenceRoot,
         baselineId: options.baselineId,
@@ -100,6 +74,15 @@ export async function runSliceVerification(options) {
         planBundle,
         runtime,
         environment,
+        testCompilerProof,
+        metadata: planBundle.plan.stages.some((stage) => stage.argv[0] === 'internal')
+          ? await collectVerificationMetadata({
+              root: candidate.runtimeRoot,
+              pnpmVersion: candidate.dependencyImage.recipe.runtime.pnpmVersion,
+              nodeVersion: candidate.dependencyImage.recipe.runtime.nodeVersion.replace(/^v/u, ''),
+              environment,
+            })
+          : undefined,
         provenance: sliceProvenance(planBundle),
         runKey: candidate.id,
         forwardOutput: options.forwardOutput,
@@ -122,26 +105,36 @@ export async function executePreparedSliceVerification(options) {
     stdout: process.stdout,
     stderr: process.stderr,
   }
-  const executeBatch =
-    options.executeBatch ??
-    ((batch, batchOptions) =>
-      executeFileBackedVerificationProcess({
-        id: batch.id,
-        command: batch.command,
-        args: batch.args,
-        cwd: batchOptions.root,
-        environment: verificationChildEnvironment({
-          kind: batch.kind,
-          root: batchOptions.root,
-          runId,
-          baseEnv: batchOptions.environment,
-        }),
-        artifactRoot: batchOptions.artifactRoot,
-        runDirectory: batchOptions.runDirectory,
-        diagnosticPrefix: 'VerificationSlice',
-        forwardOutput: batchOptions.forwardOutput,
-        outputDestinations,
-      }))
+  let performanceEvidencePath = null
+  const executeBatch = (batch, batchOptions) =>
+    executeVerificationStage(batch.stage, options.metadata, {
+      root: batchOptions.root,
+      baseEnv: batchOptions.environment,
+      executionRuntime: options.runtime,
+      testCompilerProof: options.testCompilerProof,
+      performanceEvidencePath,
+      artifactRoot: batchOptions.artifactRoot,
+      runDirectory: batchOptions.runDirectory,
+      runId,
+      executionId: batch.id,
+      diagnosticPrefix: 'VerificationSlice',
+      forwardOutput: batchOptions.forwardOutput,
+      outputDestinations,
+      ...(options.executeBatch
+        ? {
+            executeProcess: (item, _metadata, context) =>
+              options.executeBatch(
+                {
+                  ...batch,
+                  stage: item,
+                  ...(item.browserTasks ? { browserTasks: item.browserTasks } : {}),
+                  ...createVerificationRuntimeInvocation(item.argv, options.runtime),
+                },
+                { ...batchOptions, environment: context.environment },
+              ),
+          }
+        : {}),
+    })
   const buildCurrentSnapshot =
     options.buildCurrentSnapshot ?? (() => buildVerificationSnapshot({ root: runtimeRoot }))
   const runId = sliceRunId(
@@ -200,20 +193,26 @@ export async function executePreparedSliceVerification(options) {
     printBatchHeader(index, batches.length, batch)
     let execution
     try {
-      const batchEnvironment =
-        batch.kind === 'playwright'
-          ? Object.freeze({
-              ...environment,
-              E2E_PLAYWRIGHT_OUTPUT_DIR: resolve(runDirectory, `${batch.id}.playwright`),
+      const diagnostics = verificationPrerequisiteDiagnostics(batch.stage, results.slice(0, index))
+      performanceEvidencePath = diagnostics.length
+        ? null
+        : await prepareVerificationStageExecution(batch.stage, {
+            artifactRoot: evidenceRoot,
+            runDirectory,
+            runId,
+            provenance: options.provenance ?? null,
+            stages: results,
+          })
+      execution =
+        diagnostics.length > 0
+          ? { exitCode: null, signal: null, diagnostics, stdoutPath: null, stderrPath: null }
+          : await executeBatch(batch, {
+              artifactRoot: evidenceRoot,
+              root: runtimeRoot,
+              runDirectory,
+              environment,
+              forwardOutput: options.forwardOutput !== false,
             })
-          : environment
-      execution = await executeBatch(batch, {
-        artifactRoot: evidenceRoot,
-        root: runtimeRoot,
-        runDirectory,
-        environment: batchEnvironment,
-        forwardOutput: options.forwardOutput !== false,
-      })
     } catch (error) {
       execution = {
         exitCode: null,
@@ -263,7 +262,7 @@ export async function executePreparedSliceVerification(options) {
   }
   const inputsChangedDuringRun =
     finalSnapshot === null || finalSnapshot.digest !== planBundle.current.digest
-  const batchFailed = results.some((result) => result.status === 'failed')
+  const batchFailed = results.some(verificationStageBlocks)
   const evidencePassed = !batchFailed && !inputsChangedDuringRun
   const outcome = !evidencePassed
     ? 'failed'
@@ -304,6 +303,9 @@ export async function executePreparedSliceVerification(options) {
 function plannedBatchResult(batch) {
   return Object.freeze({
     id: batch.id,
+    stageId: batch.stage.id,
+    policy: batch.stage.policy,
+    assurance: verificationStageAssurance(batch.stage),
     kind: batch.kind,
     command: batch.command,
     args: batch.args,
@@ -320,19 +322,20 @@ function plannedBatchResult(batch) {
 function completedBatchResult(batch, execution, wallMs) {
   return Object.freeze({
     id: batch.id,
+    stageId: batch.stage.id,
+    policy: batch.stage.policy,
+    assurance: verificationStageAssurance(batch.stage),
     kind: batch.kind,
     command: batch.command,
     args: batch.args,
-    status:
-      execution.exitCode === 0 && execution.signal === null && execution.diagnostics.length === 0
-        ? 'passed'
-        : 'failed',
+    status: verificationStageStatus(batch.stage, execution),
     exitCode: execution.exitCode,
     signal: execution.signal,
     diagnostics: Object.freeze([...execution.diagnostics]),
     wallMs,
     stdoutPath: execution.stdoutPath,
     stderrPath: execution.stderrPath,
+    evidence: execution.evidence ?? null,
   })
 }
 

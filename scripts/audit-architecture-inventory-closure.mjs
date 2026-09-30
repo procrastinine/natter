@@ -26,30 +26,18 @@ const SUPPORTING_ORIENTATIONS = new Set([
   'performance',
   'meta',
 ])
-const REQUIRED_INTEGRATION_SIGNATURES = Object.freeze({
-  'production-work-memory': Object.freeze({
-    label: 'Audit production work and memory ownership',
-    policy: 'blocking',
-    argv: Object.freeze([
-      'node',
-      'scripts/audit-production-work-memory.mjs',
-      '--mode',
-      'inventory',
-    ]),
-    orientation: 'both',
-  }),
-  'architecture-inventory-closure': Object.freeze({
-    label: 'Audit architecture inventory closure',
-    policy: 'blocking',
-    argv: Object.freeze([
-      'node',
-      'scripts/audit-architecture-inventory-closure.mjs',
-      '--mode',
-      'inventory',
-    ]),
-    orientation: 'meta',
-  }),
-})
+const REQUIRED_INTEGRATION_SIGNATURES = Object.freeze(
+  Object.fromEntries(
+    [
+      ['production-work-memory', 'both'],
+      ['architecture-inventory-closure', 'meta'],
+    ].map(([id, orientation]) => {
+      const command = VERIFICATION_STAGES.find((stage) => stage.id === id)
+      if (!command) throw new Error(`ArchitectureVerificationStageMissing:${id}`)
+      return [id, Object.freeze({ ...command, orientation })]
+    }),
+  ),
+)
 
 export async function auditArchitectureInventoryClosure(options = {}) {
   const root = options.root ?? ROOT

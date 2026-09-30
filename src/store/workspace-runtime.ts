@@ -1,4 +1,3 @@
-import { errorFromUnknown } from '../lib/error'
 import type { WorkspaceFence } from './repository'
 
 export type WorkspaceRuntimeState =
@@ -15,6 +14,17 @@ export type WorkspaceReplacementDisposition = 'block' | 'drain' | 'cancel'
 export class WorkspaceMaintenancePreemptedError extends DOMException {
   constructor() {
     super('Foreground intent preempted maintenance', 'AbortError')
+  }
+}
+
+export type WorkspaceReplacementContinuationCancellation = 'required-replacement' | 'shutdown'
+
+export class WorkspaceReplacementContinuationCancelledError extends DOMException {
+  readonly reason: WorkspaceReplacementContinuationCancellation
+
+  constructor(reason: WorkspaceReplacementContinuationCancellation) {
+    super(`Workspace replacement continuation cancelled: ${reason}`, 'AbortError')
+    this.reason = reason
   }
 }
 
@@ -152,6 +162,24 @@ export interface WorkspaceRuntimeActionOptions {
   readonly lineageId?: string
 }
 
+declare const workspaceReplacementContinuationBrand: unique symbol
+
+export interface WorkspaceReplacementContinuation {
+  readonly cancellationReason: WorkspaceReplacementContinuationCancelledError | null
+  readonly signal: AbortSignal
+  readonly [workspaceReplacementContinuationBrand]: true
+}
+
+export interface WorkspaceReplacementAuthorityOptions {
+  readonly continuation: WorkspaceReplacementContinuation
+  readonly lineageId: string
+}
+
+export type WorkspaceReplacementLaunchArguments = [
+  kind: WorkspaceReplacementRootKind,
+  options: WorkspaceReplacementAuthorityOptions & { readonly requireIdle: boolean },
+]
+
 declare const workspaceRootAdmissionCapabilityBrand: unique symbol
 
 export type WorkspaceRootAdmissionSource =
@@ -209,11 +237,24 @@ type PermitRecord = RootPermitRecord | ReservedPermitRecord | AuthorityPermitRec
 interface RootPermitRecord {
   readonly type: 'read-root' | 'write-root'
   readonly kind: WorkspaceRootKind
+  readonly requestedSignal: AbortSignal | undefined
   readonly permit: WorkspaceReadPermit | WorkspaceWritePermit
   readonly controller: AbortController
   readonly unlink: () => void
   repositoryAdmissionOpen: boolean
   active: boolean
+}
+
+interface ReplacementContinuationRecord {
+  readonly admission: WorkspaceReplacementRootKind
+  cancellationReason: WorkspaceReplacementContinuationCancelledError | null
+  readonly controller: AbortController
+  readonly workspace: WorkspaceFence
+  producer: RootPermitRecord | null
+  unlinkProducer: () => void
+  unlinkRequest: () => void
+  unlinkAuthority: (() => void) | null
+  released: boolean
 }
 
 interface ReservedPermitRecord {
@@ -313,6 +354,8 @@ export function createWorkspaceRuntimeKernel() {
   const permitRecords = new WeakMap<object, PermitRecord>()
   const activeRoots = new Set<RootPermitRecord>()
   const activeChildren = new Set<ReservedPermitRecord>()
+  const continuationRecords = new WeakMap<object, ReplacementContinuationRecord>()
+  const activeContinuations = new Set<ReplacementContinuationRecord>()
   const listeners = new Set<WorkspaceRuntimeListener>()
   const idleListeners = new Set<WorkspaceRuntimeIdleListener>()
   const stateListeners = new Set<WorkspaceRuntimeStateListener>()
@@ -409,6 +452,7 @@ export function createWorkspaceRuntimeKernel() {
     }
     const owner: WorkspaceForegroundDemandOwnerRecord = { released: false }
     foregroundDemandOwners.add(owner)
+    preemptMaintenanceReplacement()
     return owner as unknown as WorkspaceForegroundDemandOwner
   }
 
@@ -429,7 +473,7 @@ export function createWorkspaceRuntimeKernel() {
   }
 
   function awaitWorkspaceForegroundDemandIdle(signal?: AbortSignal): Promise<void> {
-    if (signal?.aborted) return Promise.reject(workspaceRuntimeError(signal.reason))
+    if (signal?.aborted) return Promise.reject(signal.reason)
     if (foregroundDemandOwners.size === 0) return Promise.resolve()
     return new Promise<void>((resolve, reject) => {
       let settled = false
@@ -441,11 +485,102 @@ export function createWorkspaceRuntimeKernel() {
         operation()
       }
       const onIdle = () => settle(resolve)
-      const onAbort = () => settle(() => reject(workspaceRuntimeError(signal?.reason)))
+      const onAbort = () => settle(() => reject(signal?.reason))
       foregroundDemandIdleListeners.add(onIdle)
       signal?.addEventListener('abort', onAbort, { once: true })
       if (foregroundDemandOwners.size === 0) onIdle()
     })
+  }
+
+  function claimWorkspaceReplacementContinuation(
+    permit: WorkspaceWritePermit,
+  ): WorkspaceReplacementContinuation {
+    const producer = permitRecord(permit)
+    assertCurrentEpoch(permit)
+    if (
+      producer.type !== 'write-root' ||
+      (producer.kind !== 'maintenance' && producer.kind !== 'workspace-replacement') ||
+      !producer.active ||
+      !producer.repositoryAdmissionOpen ||
+      [...activeContinuations].some((record) => record.producer === producer)
+    ) {
+      throw new Error('WorkspaceReplacementContinuationProducerInvalid')
+    }
+    if (permit.signal.aborted) throw permit.signal.reason
+    const controller = new AbortController()
+    const continuation = Object.freeze({
+      signal: controller.signal,
+      get cancellationReason() {
+        return record.cancellationReason
+      },
+    }) as WorkspaceReplacementContinuation
+    const record: ReplacementContinuationRecord = {
+      admission: producer.kind,
+      cancellationReason: null,
+      controller,
+      workspace: { workspaceId: permit.workspaceId, replacementEpoch: permit.replacementEpoch },
+      producer,
+      unlinkProducer: linkAbortSignal(permit.signal, controller),
+      unlinkRequest: () => undefined,
+      unlinkAuthority: null,
+      released: false,
+    }
+    continuationRecords.set(continuation, record)
+    activeContinuations.add(record)
+    return continuation
+  }
+
+  function replacementContinuationRecord(
+    continuation: WorkspaceReplacementContinuation,
+  ): ReplacementContinuationRecord {
+    const record = continuationRecords.get(continuation)
+    if (!record) throw new Error('WorkspaceReplacementContinuationOwnerInvalid')
+    return record
+  }
+
+  function cancelWorkspaceReplacementContinuation(
+    continuation: WorkspaceReplacementContinuation,
+    reason: WorkspaceReplacementContinuationCancellation,
+  ): void {
+    const record = replacementContinuationRecord(continuation)
+    if (record.released) return
+    cancelReplacementContinuation(record, reason)
+  }
+
+  function cancelReplacementContinuation(
+    record: ReplacementContinuationRecord,
+    reason: WorkspaceReplacementContinuationCancellation,
+  ): void {
+    if (reason === 'required-replacement' && record.admission !== 'maintenance') return
+    if (
+      record.cancellationReason?.reason === 'shutdown' ||
+      record.cancellationReason?.reason === reason
+    )
+      return
+    const cancellation = new WorkspaceReplacementContinuationCancelledError(reason)
+    record.cancellationReason = cancellation
+    record.controller.abort(cancellation)
+  }
+
+  function cancelReplacementContinuations(
+    reason: WorkspaceReplacementContinuationCancellation,
+  ): void {
+    for (const record of activeContinuations) cancelReplacementContinuation(record, reason)
+  }
+
+  function releaseWorkspaceReplacementContinuation(
+    continuation: WorkspaceReplacementContinuation,
+  ): void {
+    const record = replacementContinuationRecord(continuation)
+    if (record.released) return
+    record.released = true
+    record.unlinkAuthority?.()
+    record.unlinkProducer()
+    record.unlinkRequest()
+    record.unlinkProducer = () => undefined
+    record.unlinkRequest = () => undefined
+    record.producer = null
+    activeContinuations.delete(record)
   }
 
   function preemptWorkspaceMaintenancePreparation(permit: WorkspaceWritePermit): void {
@@ -458,6 +593,7 @@ export function createWorkspaceRuntimeKernel() {
     ) {
       throw new Error('WorkspaceReplacementProducerPermitInvalid')
     }
+    cancelReplacementContinuations('required-replacement')
     for (const candidate of activeRoots) {
       if (candidate === owner || candidate.kind !== 'maintenance' || !candidate.active) continue
       candidate.repositoryAdmissionOpen = false
@@ -546,7 +682,7 @@ export function createWorkspaceRuntimeKernel() {
     try {
       result = operation(permit)
     } catch (error) {
-      result = Promise.reject(errorFromUnknown(error))
+      result = Promise.reject(error)
     }
     return Promise.resolve(result).finally(() => releaseReservedRecord(record))
   }
@@ -615,6 +751,7 @@ export function createWorkspaceRuntimeKernel() {
   function replacementOtherwiseIdle(lineageId?: string): boolean {
     const promotedRoot = replacementPromotedRoot(lineageId)
     return (
+      foregroundDemandOwners.size === 0 &&
       activeChildren.size === 0 &&
       activeRoots.size === (promotedRoot === undefined ? 0 : 1) &&
       activeCount === (promotedRoot === undefined ? 0 : 1)
@@ -624,7 +761,7 @@ export function createWorkspaceRuntimeKernel() {
   function waitForWorkspaceRuntimeReplacementBlockers(
     options: WorkspaceRuntimeActionOptions & { readonly requireIdle?: boolean } = {},
   ): Promise<void> {
-    if (options.signal?.aborted) return Promise.reject(workspaceRuntimeError(options.signal.reason))
+    if (options.signal?.aborted) return Promise.reject(options.signal.reason)
     const available = () =>
       state !== 'RUNNING' ||
       (replacementBlockerIds(options.lineageId).length === 0 &&
@@ -634,6 +771,7 @@ export function createWorkspaceRuntimeKernel() {
       let settled = false
       const dispose = () => {
         rootReleaseListeners.delete(attempt)
+        foregroundDemandIdleListeners.delete(attempt)
         idleListeners.delete(attempt)
         stateListeners.delete(attempt)
         options.signal?.removeEventListener('abort', onAbort)
@@ -646,13 +784,14 @@ export function createWorkspaceRuntimeKernel() {
       }
       const attempt = () => {
         if (options.signal?.aborted) {
-          settle(() => reject(workspaceRuntimeError(options.signal?.reason)))
+          settle(() => reject(options.signal?.reason))
           return
         }
         if (available()) settle(resolve)
       }
-      const onAbort = () => settle(() => reject(workspaceRuntimeError(options.signal?.reason)))
+      const onAbort = () => settle(() => reject(options.signal?.reason))
       rootReleaseListeners.add(attempt)
+      foregroundDemandIdleListeners.add(attempt)
       idleListeners.add(attempt)
       stateListeners.add(attempt)
       options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -689,7 +828,7 @@ export function createWorkspaceRuntimeKernel() {
     options: WorkspaceRuntimeActionOptions,
   ): RootPermitRecord {
     if (state !== 'RUNNING') throw new WorkspaceRuntimeClosedError(kind, state)
-    if (options.signal?.aborted) throw workspaceRuntimeError(options.signal.reason)
+    if (options.signal?.aborted) throw options.signal.reason
     const controller = new AbortController()
     const unlink = linkAbortSignal(options.signal, controller)
     const record = {} as RootPermitRecord
@@ -702,6 +841,7 @@ export function createWorkspaceRuntimeKernel() {
     Object.assign(record, {
       type,
       kind,
+      requestedSignal: options.signal,
       permit,
       controller,
       repositoryAdmissionOpen: true,
@@ -731,6 +871,10 @@ export function createWorkspaceRuntimeKernel() {
 
   function preemptMaintenanceReplacementForDemand(kind: WorkspaceRootKind): boolean {
     if (WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS[kind] === 'cancel') return false
+    return preemptMaintenanceReplacement()
+  }
+
+  function preemptMaintenanceReplacement(): boolean {
     const current = authority
     if (
       current?.type !== 'replacement-authority' ||
@@ -778,7 +922,7 @@ export function createWorkspaceRuntimeKernel() {
 
   function waitForDemand(demand: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
     if (!signal) return demand
-    if (signal.aborted) return Promise.reject(workspaceRuntimeError(signal.reason))
+    if (signal.aborted) return Promise.reject(signal.reason)
     return new Promise<void>((resolve, reject) => {
       let settled = false
       const finish = (operation: () => void) => {
@@ -787,17 +931,13 @@ export function createWorkspaceRuntimeKernel() {
         signal.removeEventListener('abort', abort)
         operation()
       }
-      const abort = () => finish(() => reject(workspaceRuntimeError(signal.reason)))
+      const abort = () => finish(() => reject(signal.reason))
       signal.addEventListener('abort', abort, { once: true })
       void demand.then(
         () => finish(resolve),
-        (error: unknown) => finish(() => reject(workspaceRuntimeError(error))),
+        (error: unknown) => finish(() => reject(error)),
       )
     })
-  }
-
-  function workspaceRuntimeError(reason: unknown): Error {
-    return reason instanceof Error ? reason : new Error('WorkspaceRuntimeFailed', { cause: reason })
   }
 
   function runRoot<T, P extends WorkspaceReadPermit>(
@@ -808,7 +948,7 @@ export function createWorkspaceRuntimeKernel() {
     try {
       result = operation(record.permit as P)
     } catch (error) {
-      result = Promise.reject(errorFromUnknown(error))
+      result = Promise.reject(error)
     }
     return Promise.resolve(result).finally(() => releaseRootRecord(record))
   }
@@ -938,6 +1078,7 @@ export function createWorkspaceRuntimeKernel() {
     mode: WorkspaceRuntimeQuiesceMode = 'abortive',
     preservedRoot?: RootPermitRecord,
   ): void {
+    if (mode === 'abortive') cancelReplacementContinuations('shutdown')
     if (
       state === 'SEALED' ||
       state === 'QUIESCED' ||
@@ -1015,6 +1156,7 @@ export function createWorkspaceRuntimeKernel() {
     if (state !== 'QUIESCING' && state !== 'RECONCILING') {
       throw new Error(`WorkspaceRuntimeCannotSealAfterClosedInvariantFailure:${state}`)
     }
+    cancelReplacementContinuations('shutdown')
     if (authority) deactivateAuthorityRecord(authority)
     authority = null
     reconciliationOrigin = null
@@ -1023,12 +1165,27 @@ export function createWorkspaceRuntimeKernel() {
   }
 
   function launchReplacementNow(
-    kind: WorkspaceReplacementRootKind,
-    options: WorkspaceRuntimeActionOptions & { readonly requireIdle: boolean },
-    enterQuiescing: () => void,
+    ...args: [...WorkspaceReplacementLaunchArguments, enterQuiescing: () => void]
   ): WorkspaceReconcileAuthority | null {
-    if (options.signal?.aborted) throw options.signal.reason
+    const [kind, options, enterQuiescing] = args
+    const continuation = replacementContinuationRecord(options.continuation)
+    if (options.continuation.signal.aborted) throw options.continuation.signal.reason
     const promotedRoot = replacementPromotedRoot(options.lineageId)
+    if (
+      continuation.released ||
+      continuation.admission !== kind ||
+      !promotedRoot ||
+      promotedRoot.kind !== kind ||
+      promotedRoot.type !== 'write-root' ||
+      !promotedRoot.repositoryAdmissionOpen ||
+      (continuation.producer !== null && continuation.producer !== promotedRoot) ||
+      continuation.workspace.workspaceId !== workspaceId ||
+      continuation.workspace.replacementEpoch !== replacementEpoch
+    ) {
+      throw new Error('WorkspaceReplacementContinuationPromotionInvalid')
+    }
+    assertCurrentEpoch(promotedRoot.permit)
+    if (promotedRoot.permit.signal.aborted) throw promotedRoot.permit.signal.reason
     if (
       state !== 'RUNNING' ||
       (options.requireIdle && !replacementOtherwiseIdle(options.lineageId))
@@ -1036,7 +1193,7 @@ export function createWorkspaceRuntimeKernel() {
       return null
     const blockerIds = replacementBlockerIds(options.lineageId)
     if (blockerIds.length > 0) throw new WorkspaceRuntimeReplacementBlockedError(blockerIds)
-    const root = promotedRoot ?? admitRoot(kind, 'write-root', options)
+    const root = promotedRoot
     if (authority) deactivateAuthorityRecord(authority)
     const record = {} as AuthorityPermitRecord
     const next = createPermit<WorkspaceReconcileAuthority>(
@@ -1044,21 +1201,33 @@ export function createWorkspaceRuntimeKernel() {
       root.controller.signal,
       record,
     )
-    const transferredProducerOwnership = promotedRoot?.kind === 'maintenance'
-    if (transferredProducerOwnership) root.unlink()
+    const transferringProducer = continuation.producer !== null
+    continuation.unlinkProducer()
+    continuation.unlinkProducer = () => undefined
+    continuation.producer = null
+    root.unlink()
+    if (transferringProducer && continuation.admission === 'workspace-replacement') {
+      continuation.unlinkRequest = linkAbortSignal(root.requestedSignal, continuation.controller)
+    }
+    const unlinkContinuation = linkAbortSignal(continuation.controller.signal, root.controller)
+    const unlinkAuthority = () => {
+      if (continuation.unlinkAuthority !== unlinkAuthority) return
+      continuation.unlinkAuthority = null
+      unlinkContinuation()
+    }
+    continuation.unlinkAuthority = unlinkAuthority
     Object.assign(record, {
       type: 'replacement-authority',
       rootKind: kind,
       permit: next,
       controller: root.controller,
-      unlink: transferredProducerOwnership ? () => {} : root.unlink,
+      unlink: unlinkAuthority,
       active: true,
     } satisfies AuthorityPermitRecord)
     root.repositoryAdmissionOpen = false
     authority = record
     quiesceMode = 'graceful'
     state = 'QUIESCING'
-    if (workspaceId === null) throw new Error('WorkspaceRuntimeIdentityMissing')
     gatedDirty ??= { workspaceId, replacementEpoch, broad: false }
     enterQuiescing()
     if (kind === 'workspace-replacement') {
@@ -1232,6 +1401,7 @@ export function createWorkspaceRuntimeKernel() {
     if (state !== 'STARTING' && state !== 'QUIESCED' && state !== 'FAILED_CLOSED') {
       throw new Error(`WorkspaceRuntimeCannotSeal:${state}`)
     }
+    cancelReplacementContinuations('shutdown')
     if (authority) deactivateAuthorityRecord(authority)
     authority = null
     state = 'SEALED'
@@ -1249,6 +1419,7 @@ export function createWorkspaceRuntimeKernel() {
 
   const internal = Object.freeze({
     snapshot: currentSnapshot,
+    cancelReplacementContinuations,
     beginQuiesce,
     beginGracefulQuiesce,
     tryBeginQuiesceIfIdle,
@@ -1272,8 +1443,12 @@ export function createWorkspaceRuntimeKernel() {
     releaseWorkspaceRuntimeDemandBoundary,
     claimWorkspaceForegroundDemand,
     releaseWorkspaceForegroundDemand,
+    preemptMaintenanceReplacement,
     awaitWorkspaceForegroundDemandIdle,
     workspaceForegroundDemandInterruptionSignal,
+    claimWorkspaceReplacementContinuation,
+    cancelWorkspaceReplacementContinuation,
+    releaseWorkspaceReplacementContinuation,
     preemptWorkspaceMaintenancePreparation,
     preemptWorkspaceReplacementContendersForRemoteTransition,
     tryRunWorkspaceActionIfIdle,
@@ -1352,6 +1527,10 @@ export function claimWorkspaceForegroundDemand(): WorkspaceForegroundDemandOwner
   return claimProductionWorkspaceForegroundDemand()
 }
 
+export function preemptWorkspaceMaintenanceForForegroundDemand(): boolean {
+  return productionWorkspaceRuntime.preemptMaintenanceReplacement()
+}
+
 export function releaseWorkspaceForegroundDemand(handle: WorkspaceForegroundDemandOwner): void {
   productionWorkspaceRuntime.releaseWorkspaceForegroundDemand(handle)
 }
@@ -1362,6 +1541,18 @@ export function awaitWorkspaceForegroundDemandIdle(signal?: AbortSignal): Promis
 
 export function workspaceForegroundDemandInterruptionSignal(): AbortSignal {
   return productionWorkspaceForegroundDemandInterruptionSignal()
+}
+
+export function claimWorkspaceReplacementContinuation(
+  permit: WorkspaceWritePermit,
+): WorkspaceReplacementContinuation {
+  return productionWorkspaceRuntime.claimWorkspaceReplacementContinuation(permit)
+}
+
+export function releaseWorkspaceReplacementContinuation(
+  continuation: WorkspaceReplacementContinuation,
+): void {
+  productionWorkspaceRuntime.releaseWorkspaceReplacementContinuation(continuation)
 }
 
 export function preemptWorkspaceMaintenancePreparation(permit: WorkspaceWritePermit): void {

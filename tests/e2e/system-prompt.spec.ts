@@ -115,19 +115,7 @@ test('debounced system-prompt saves never interrupt the active editor with a not
   })
   await page.route('https://openrouter.ai/api/v1/models*', async (route) => {
     await catalogGate
-    await route.fulfill({
-      contentType: 'application/json',
-      headers: { 'access-control-allow-origin': '*' },
-      body: JSON.stringify({
-        data: [
-          {
-            id: 'anthropic/claude-opus-4.8',
-            name: 'Claude Opus 4.8',
-            supported_parameters: ['tools'],
-          },
-        ],
-      }),
-    })
+    await route.fallback()
   })
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'gen-1', content: 'ok', finish: 'stop' }]),
@@ -164,19 +152,7 @@ test('model discovery cannot move settings tabs under an in-progress gesture', a
   })
   await page.route('https://openrouter.ai/api/v1/models*', async (route) => {
     await catalogGate
-    await route.fulfill({
-      contentType: 'application/json',
-      headers: { 'access-control-allow-origin': '*' },
-      body: JSON.stringify({
-        data: [
-          {
-            id: 'anthropic/claude-opus-4.8',
-            name: 'Claude Opus 4.8',
-            supported_parameters: ['tools'],
-          },
-        ],
-      }),
-    })
+    await route.fallback()
   })
   try {
     await mockChatCompletions(page, {

@@ -3,6 +3,7 @@ export const PROTOCOL_CONTRACT_STAGE = Object.freeze({
   label:
     'Audit production unions, protocol ownership, configuration, durable, stage, and locality contracts',
   policy: 'blocking',
+  consumerModules: Object.freeze(['tests/helpers/protocol-contract-facts.ts']),
   argv: Object.freeze([
     'node',
     'scripts/audit-protocol-contracts.mjs',

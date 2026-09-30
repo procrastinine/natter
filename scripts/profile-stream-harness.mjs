@@ -126,94 +126,6 @@ function normalizedLoopbackHost(hostname) {
   return hostname === '[::1]' || hostname === '::1' ? '::1' : hostname
 }
 
-export async function activeWorkspaceDatabaseName(page) {
-  return page.evaluate(async () => {
-    const openDatabase = (name) =>
-      new Promise((resolve, reject) => {
-        const request = indexedDB.open(name)
-        const clear = () => {
-          request.onsuccess = null
-          request.onerror = null
-        }
-        request.onsuccess = () => {
-          const database = request.result
-          clear()
-          resolve(database)
-        }
-        request.onerror = () => {
-          const error = request.error
-          clear()
-          reject(error)
-        }
-      })
-    const requestResult = (request) =>
-      new Promise((resolve, reject) => {
-        const clear = () => {
-          request.onsuccess = null
-          request.onerror = null
-        }
-        request.onsuccess = () => {
-          const result = request.result
-          clear()
-          resolve(result)
-        }
-        request.onerror = () => {
-          const error = request.error
-          clear()
-          reject(error)
-        }
-      })
-    const transactionResult = async (transaction, result) => {
-      const terminal = new Promise((resolve, reject) => {
-        const clear = () => {
-          transaction.removeEventListener('complete', complete)
-          transaction.removeEventListener('abort', abort)
-        }
-        const complete = () => {
-          clear()
-          resolve()
-        }
-        const abort = () => {
-          const error = transaction.error
-          clear()
-          reject(error)
-        }
-        transaction.addEventListener('complete', complete)
-        transaction.addEventListener('abort', abort)
-      })
-      try {
-        const value = await result
-        await terminal
-        return value
-      } catch (error) {
-        await terminal.catch(() => undefined)
-        throw error
-      }
-    }
-    const names =
-      typeof indexedDB.databases === 'function'
-        ? (await indexedDB.databases()).flatMap((database) =>
-            database.name === undefined ? [] : [database.name],
-          )
-        : []
-    if (!names.includes('natter-control')) return 'natter'
-    const control = await openDatabase('natter-control')
-    try {
-      const transaction = control.transaction('manifests', 'readonly')
-      const manifest = await transactionResult(
-        transaction,
-        requestResult(transaction.objectStore('manifests').get('workspace')),
-      )
-      if (typeof manifest?.activeDatabaseName !== 'string') {
-        throw new Error('BrowserWorkspaceControlManifestInvalid')
-      }
-      return manifest.activeDatabaseName
-    } finally {
-      control.close()
-    }
-  })
-}
-
 export async function startFakeProvider({ providerUrl, timeoutMs = 10_000 } = {}) {
   if (providerUrl) {
     const explicit = assertLoopbackUrl(providerUrl, 'provider URL')
@@ -352,11 +264,9 @@ async function resetWorkspace(page, appUrl) {
       }
     }
     for (const name of [...names].sort()) {
-      await new Promise((resolve, reject) => {
-        const request = indexedDB.deleteDatabase(name)
-        request.onsuccess = () => resolve()
-        request.onerror = () => reject(request.error)
-        request.onblocked = () => reject(new Error(`${name} database deletion was blocked`))
+      await globalThis.__natterNativeStorageFixture.deleteOffline({
+        databaseName: name,
+        purpose: 'reset',
       })
     }
   })
@@ -453,27 +363,23 @@ function parseChatRoute(hash) {
 
 async function waitForMessageHeader(page, messageId) {
   let header
-  const databaseName = await activeWorkspaceDatabaseName(page)
+
   await waitUntil(
     async () => {
       header = await page.evaluate(
-        async ({ databaseName, id }) => {
-          const db = await new Promise((resolve, reject) => {
-            const request = indexedDB.open(databaseName)
-            request.onsuccess = () => resolve(request.result)
-            request.onerror = () => reject(request.error)
-          })
-          try {
-            return await new Promise((resolve, reject) => {
-              const request = db.transaction('messages', 'readonly').objectStore('messages').get(id)
-              request.onsuccess = () => resolve(request.result ?? null)
-              request.onerror = () => reject(request.error)
-            })
-          } finally {
-            db.close()
-          }
+        async ({ id }) => {
+          return globalThis.__natterNativeStorageFixture.active(
+            { purpose: 'read-only-assertion' },
+            async (db, request) => {
+              return (
+                (await request(
+                  db.transaction('messages', 'readonly').objectStore('messages').get(id),
+                )) ?? null
+              )
+            },
+          )
         },
-        { databaseName, id: messageId },
+        { id: messageId },
       )
       return header !== null && header !== undefined
     },
@@ -523,57 +429,50 @@ export async function waitForWorkspaceStreamQuiescence(page, assistantIds, timeo
 }
 
 async function readWorkspaceStreamState(page, assistantIds, includeLeaseRows = false) {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, ids, includeLeaseRows }) => {
-      const db = await new Promise((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        const transaction = db.transaction(['messages', 'streamLeases', 'streamChunks'], 'readonly')
-        const requestResult = (request) =>
-          new Promise((resolve, reject) => {
-            request.onsuccess = () => resolve(request.result)
-            request.onerror = () => reject(request.error)
-          })
-        const messageStore = transaction.objectStore('messages')
-        const [rows, leaseRowsOrCount, chunkCount] = await Promise.all([
-          Promise.all(ids.map((id) => requestResult(messageStore.get(id)))),
-          requestResult(
-            includeLeaseRows
-              ? transaction.objectStore('streamLeases').getAll()
-              : transaction.objectStore('streamLeases').count(),
-          ),
-          requestResult(transaction.objectStore('streamChunks').count()),
-        ])
-        const leases = Array.isArray(leaseRowsOrCount)
-          ? leaseRowsOrCount.map((lease) => ({
-              streamId: lease.streamId,
-              chatId: lease.chatId,
-              messageId: lease.messageId,
-              phase: lease.phase,
-              custody: lease.custody,
-              revision: lease.revision,
-            }))
-          : undefined
-        return {
-          states: rows.map((row, index) => ({
-            id: ids[index],
-            status: row?.generation?.status ?? 'missing',
-            integrity: row?.generation?.integrity ?? null,
-            finishedAt: row?.generation?.finishedAt ?? null,
-          })),
-          leaseCount: leases?.length ?? leaseRowsOrCount,
-          chunkCount,
-          ...(leases ? { leases } : {}),
-        }
-      } finally {
-        db.close()
-      }
+    async ({ ids, includeLeaseRows }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, requestResult) => {
+          const transaction = db.transaction(
+            ['messages', 'streamLeases', 'streamChunks'],
+            'readonly',
+          )
+          const messageStore = transaction.objectStore('messages')
+          const [rows, leaseRowsOrCount, chunkCount] = await Promise.all([
+            Promise.all(ids.map((id) => requestResult(messageStore.get(id)))),
+            requestResult(
+              includeLeaseRows
+                ? transaction.objectStore('streamLeases').getAll()
+                : transaction.objectStore('streamLeases').count(),
+            ),
+            requestResult(transaction.objectStore('streamChunks').count()),
+          ])
+          const leases = Array.isArray(leaseRowsOrCount)
+            ? leaseRowsOrCount.map((lease) => ({
+                streamId: lease.streamId,
+                chatId: lease.chatId,
+                messageId: lease.messageId,
+                phase: lease.phase,
+                custody: lease.custody,
+                revision: lease.revision,
+              }))
+            : undefined
+          return {
+            states: rows.map((row, index) => ({
+              id: ids[index],
+              status: row?.generation?.status ?? 'missing',
+              integrity: row?.generation?.integrity ?? null,
+              finishedAt: row?.generation?.finishedAt ?? null,
+            })),
+            leaseCount: leases?.length ?? leaseRowsOrCount,
+            chunkCount,
+            ...(leases ? { leases } : {}),
+          }
+        },
+      )
     },
-    { databaseName, ids: assistantIds, includeLeaseRows },
+    { ids: assistantIds, includeLeaseRows },
   )
 }
 

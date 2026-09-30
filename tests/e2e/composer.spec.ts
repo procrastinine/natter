@@ -1,4 +1,5 @@
 import { configureWorkspaceThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
+import { createFakeStreamScenario, retargetOnlyProfileToFakeProvider } from './fake-stream-provider'
 import { createChatUiJourneyProfile, expect, test } from './fixtures'
 import {
   buildSseBody,
@@ -542,54 +543,43 @@ test('a successful send stays cleared after leaving and returning to the chat', 
     .toBeNull()
 })
 
-test('the composer swaps Send for Abort while a stream owns the active placeholder', async ({
+test('visible streamed text keeps Stop active and preserves the next draft until completion', async ({
   page,
 }) => {
-  // Hold the fetch open so both "mid-stream" assertions land while the
-  // stream is still active. The Composer renders *either* Send *or* Abort
-  // (not Send-disabled next to Abort), so the test asserts Send is gone
-  // and Abort is there — not Send-disabled. An earlier version of this
-  // test expected `Send.toBeDisabled()`, which times out under parallel
-  // CPU pressure because Playwright polls a locator that no longer exists
-  // in the DOM; the UI and the test had drifted.
-  await mockChatCompletions(page, {
-    delayMs: 3000,
-    body: buildSseBody([{ id: 'g', content: 'slow', finish: 'stop' }]),
+  const scenario = await createFakeStreamScenario({
+    targetChars: 64,
+    reasoningChars: 0,
+    chunkChars: 64,
+    initialDelayMs: 0,
+    delayMs: 0,
+    holdBeforeFinish: true,
   })
-  const input = page.locator('[data-ui="composer-input"]')
-  await input.fill('please wait')
-  const send = page.locator('[data-ui="send"]')
-  await send.click()
-  // Mid-stream: Send is swapped out for Abort.
-  await expect(page.locator('[data-ui="abort"]')).toBeVisible()
-  await expect(send).toHaveCount(0)
-  // After the stream finishes, Send comes back and is enabled with new input.
-  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible({
-    timeout: 10_000,
-  })
-  await input.fill('next')
-  await expect(send).toBeEnabled()
-})
+  try {
+    await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
+    await createChatAndOpen(page)
+    await sendMessage(page, 'first turn')
+    const input = page.locator('[data-ui="composer-input"]')
+    const send = page.locator('[data-ui="send"][type="submit"]')
+    const assistants = page.locator('[data-ui="message"][data-role="assistant"]')
+    await expect(assistants.first().locator('[data-ui="message-body"]')).not.toBeEmpty()
+    await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Cancel preparing', exact: true })).toHaveCount(0)
+    await expect(send).toHaveCount(0)
 
-test('the composer stays editable while streaming but Enter does not send a second turn', async ({
-  page,
-}) => {
-  await mockChatCompletions(page, {
-    delayMs: 2000,
-    body: buildSseBody([{ id: 'g', content: 'slow', finish: 'stop' }]),
-  })
-  const input = page.locator('[data-ui="composer-input"]')
-  await input.fill('first turn')
-  await page.locator('[data-ui="send"]').click()
-  await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+    await input.fill('draft during stream')
+    await input.press('Enter')
+    await expect(input).toHaveValue('draft during stream')
+    await expect(page.locator('[data-ui="message"][data-role="user"]')).toHaveCount(1)
+    expect((await scenario.snapshot()).requestCount).toBe(1)
 
-  await input.fill('draft during stream')
-  await expect(input).toHaveValue('draft during stream')
-  await input.press('Enter')
-  await expect(input).toHaveValue('draft during stream')
-  await expect(page.locator('[data-ui="message"][data-role="user"]')).toHaveCount(1)
-
-  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible({
-    timeout: 10_000,
-  })
+    await scenario.release()
+    await sendMessage(page, 'draft during stream', 'enter')
+    await expect(assistants).toHaveCount(2)
+    await expect(assistants.last().locator('[data-ui="message-body"]')).not.toBeEmpty()
+    await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
+    await expect(input).toHaveValue('')
+    expect((await scenario.snapshot()).requestCount).toBe(2)
+  } finally {
+    await scenario.dispose()
+  }
 })

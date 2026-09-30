@@ -58,9 +58,16 @@ const LOCALITY_UNION_ROOTS = Object.freeze({
   'workspace-change': 'src/store/workspace-protocol.ts#WorkspaceChange|kind',
   'workspace-delta-fact': 'src/store/workspace-protocol.ts#WorkspaceDeltaFact|kind',
   'workspace-dependency': 'src/store/workspace-protocol.ts#WorkspaceDependency|kind',
+  'workspace-slot-message':
+    'src/store/browser-workspace-slot-coordination.ts#WorkspaceSlotMessage|kind',
 })
 
 const SURFACES = Object.freeze([
+  {
+    id: 'workspace-slot-message',
+    source: LOCALITY_UNION_ROOTS['workspace-slot-message'],
+    inventory: 'WORKSPACE_SLOT_MESSAGE_LOCALITY',
+  },
   {
     id: 'workspace-query',
     source: LOCALITY_UNION_ROOTS['workspace-query'],

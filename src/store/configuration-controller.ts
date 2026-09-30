@@ -80,6 +80,7 @@ import type {
   ConfigurationSelectedTextTemplate,
   ConfigurationSelectionQueryTarget,
   ConfigurationShellProjection,
+  GenerationDiscoveryEvidence,
   PendingChatSettingsFieldIntent,
   PendingChatSettingsReplacementIntent,
   PendingConfigurationAcknowledgement,
@@ -226,6 +227,7 @@ export type ActiveGenerationConfigurationRequirement =
     }
 
 export interface ActiveGenerationConfigurationClaim {
+  readonly discovery?: GenerationDiscoveryEvidence
   readonly settings: ChatSettings
   readonly presetId: PresetId | null
   readonly profile: ConnectionDispatchProfileProof
@@ -711,6 +713,7 @@ class TabConfigurationController implements ConfigurationController {
   private readonly pendingPromptGenerationRevisions = new Map<ChatId, number>()
   private generationWorkspaceSettingsRevision = 0
   private activeGenerationFrameCache: {
+    readonly model: ConfigurationModelFrameSlot
     readonly workspace: WorkspaceFence
     readonly target: ActiveConfigurationTarget
     readonly selection: ConfigurationSelectionFrameSlot
@@ -1547,6 +1550,7 @@ class TabConfigurationController implements ConfigurationController {
     }
     const selection = state.selection
     state.baseResolution = createActiveGenerationConfigurationFrame({
+      model: this.frameModel,
       workspace: state.workspace,
       target,
       selection: Object.freeze({
@@ -2083,7 +2087,11 @@ class TabConfigurationController implements ConfigurationController {
     const revision = selection?.value.requestRevision
     const modelId = selection?.target.settings.model || null
     const shell = this.frameShell
-    if (!profile || !revision || !shell) {
+    if (!selection || !shell) {
+      this.blockActiveModelFrame()
+      return
+    }
+    if (!profile || !revision) {
       this.clearActiveModelFrame()
       return
     }
@@ -2514,6 +2522,7 @@ class TabConfigurationController implements ConfigurationController {
       cached?.workspace === workspace &&
       cached.target === target &&
       cached.selection === selection &&
+      cached.model === this.frameModel &&
       cached.shell === shell &&
       cached.shellLoad === shellLoad &&
       cached.promptRevision === promptRevision &&
@@ -2539,6 +2548,7 @@ class TabConfigurationController implements ConfigurationController {
       }),
     )
     const resolvedFrame = createActiveGenerationConfigurationFrame({
+      model: this.frameModel,
       workspace,
       target,
       selection,
@@ -2560,6 +2570,7 @@ class TabConfigurationController implements ConfigurationController {
           })
         : resolvedFrame
     this.activeGenerationFrameCache = {
+      model: this.frameModel,
       workspace,
       target,
       selection,
@@ -2724,6 +2735,7 @@ class TabConfigurationController implements ConfigurationController {
 }
 
 interface ActiveGenerationConfigurationFrameInput {
+  readonly model: ConfigurationModelFrameSlot
   readonly workspace: WorkspaceFence
   readonly target: ActiveConfigurationTarget
   readonly selection: ConfigurationSelectionFrameSlot
@@ -2737,6 +2749,7 @@ interface ActiveGenerationConfigurationFrameInput {
 }
 
 function createActiveGenerationConfigurationFrame({
+  model,
   workspace,
   target,
   selection,
@@ -2803,7 +2816,19 @@ function createActiveGenerationConfigurationFrame({
     if (savedTextTemplate === null) {
       return CONFIGURATION_MISSING_ACTIVE_GENERATION_CONFIGURATION_RESOLUTION
     }
+    const selectedModel = readyConfigurationModel(model)
+    const discovery =
+      selectedModel?.target.profileId === profile.id &&
+      selectedModel.target.modelId === settings.model &&
+      configurationRequestRevisionKey(selectedModel.target.requestRevision) ===
+        configurationRequestRevisionKey(requestRevision)
+        ? {
+            ...(selectedModel.value.endpoints ? { endpoints: selectedModel.value.endpoints } : {}),
+            ...(selectedModel.value.privacy ? { privacy: selectedModel.value.privacy } : {}),
+          }
+        : undefined
     const claim = deepFreezeActiveGenerationValue({
+      ...(discovery ? { discovery } : {}),
       settings,
       presetId,
       profile: dispatchProfile,
@@ -3235,8 +3260,9 @@ function mergeActiveConfigurationPayload<Row>(
   projection: ConfigurationDiscoveryPayloadProjection<Row>,
   previousRow: Row | undefined,
   previousToken: ConfigurationDiscoveryPayloadToken | undefined,
+  retainMissingRow: boolean,
 ): { readonly row?: Row; readonly token?: ConfigurationDiscoveryPayloadToken } {
-  if (projection.kind === 'not-requested') {
+  if (projection.kind === 'not-requested' || (projection.kind === 'missing' && retainMissingRow)) {
     return previousRow && previousToken ? { row: previousRow, token: previousToken } : {}
   }
   if (projection.kind === 'missing') return {}
@@ -3264,16 +3290,19 @@ function mergeActiveConfigurationModel(
     projection.models,
     sameRevision ? previous.value.models : undefined,
     sameRevision ? previous.value.payloadTokens.models : undefined,
+    false,
   )
   const endpoints = mergeActiveConfigurationPayload(
     projection.endpoints,
     sameModel ? previous.value.endpoints : undefined,
     sameModel ? previous.value.payloadTokens.endpoints : undefined,
+    true,
   )
   const privacy = mergeActiveConfigurationPayload(
     projection.privacy,
     sameModel ? previous.value.privacy : undefined,
     sameModel ? previous.value.payloadTokens.privacy : undefined,
+    true,
   )
   return Object.freeze({
     ...(models.row ? { models: models.row } : {}),

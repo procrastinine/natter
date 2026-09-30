@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
+import { VERIFICATION_STAGES } from '../../scripts/run-verification.mjs'
 import {
   buildTestCompilerCohort,
+  capturedTestCompilerExecution,
   TEST_COMPILER_COHORT_DESCRIPTOR,
   TEST_COMPILER_COHORT_DESCRIPTOR_DIGEST,
   type TestCompilerCapture,
@@ -159,6 +161,55 @@ describe('legacy test architecture migration ledger', () => {
     expect(mixed.problems).toContain('TestCompilerCohortSnapshotMismatch')
   })
 
+  it('discharges only the exact test compiler contract from the same immutable candidate', () => {
+    const snapshot = verificationSnapshot({ 'tests/unit/current.test.ts': 'suite-hash' })
+    const compilerCohort = buildTestCompilerCohort({ snapshot, capture: compilerCapture(snapshot) })
+    const candidate = {
+      id: compilerCohort.candidateId,
+      digest: 'candidate-digest',
+      snapshot,
+      compilerCohort,
+    }
+    const stage = VERIFICATION_STAGES.find((stage) => stage.id === 'test-typescript')
+    if (!stage) throw new Error('TestCompilerStageMissing')
+    expect(capturedTestCompilerExecution(stage, candidate)).toMatchObject({
+      exitCode: 0,
+      signal: null,
+      diagnostics: [],
+      evidence: {
+        kind: 'candidate-test-compiler',
+        candidateId: candidate.id,
+        snapshotDigest: snapshot.digest,
+        compilerCohortDigest: compilerCohort.digest,
+        captureDigest: compilerCohort.capture.digest,
+      },
+    })
+    expect(() =>
+      capturedTestCompilerExecution(
+        { ...stage, argv: [...stage.argv, '--skipLibCheck'] },
+        candidate,
+      ),
+    ).toThrow('VerificationCompilerProofStageMismatch')
+    expect(() =>
+      capturedTestCompilerExecution({ ...stage, environment: { LANG: 'different' } }, candidate),
+    ).toThrow('VerificationCompilerProofStageMismatch')
+    expect(() =>
+      capturedTestCompilerExecution(stage, { ...candidate, id: 'other-candidate' }),
+    ).toThrow('VerificationCompilerProofCandidateMismatch')
+    expect(() =>
+      capturedTestCompilerExecution(stage, {
+        ...candidate,
+        snapshot: { ...snapshot, digest: 'other-snapshot' },
+      }),
+    ).toThrow('VerificationCompilerProofCandidateMismatch')
+    expect(() =>
+      capturedTestCompilerExecution(stage, {
+        ...candidate,
+        compilerCohort: { ...compilerCohort, status: 'pending' },
+      }),
+    ).toThrow('VerificationCompilerProofCandidateMismatch')
+  })
+
   it('rederives status and every persisted field instead of trusting a recomputed outer digest', () => {
     const snapshot = verificationSnapshot({ 'tests/unit/current.test.ts': 'suite-hash' })
     const resolved = buildTestCompilerCohort({ snapshot, capture: compilerCapture(snapshot) })
@@ -243,7 +294,8 @@ function encodedOutput(value: string): TestCompilerEncodedOutput {
 
 function verificationSnapshot(files: Readonly<Record<string, string>>): VerificationSnapshot {
   const withoutDigest = {
-    schemaVersion: 2 as const,
+    schemaVersion: 4 as const,
+    unitExecution: { status: 'owned' as const, providerInputs: {}, projects: [] },
     obligationSchemaVersion: 2,
     files: Object.fromEntries(
       Object.entries(files).map(([path, sha256Value]) => [

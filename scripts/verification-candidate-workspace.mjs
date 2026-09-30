@@ -211,6 +211,7 @@ export async function resolveVerificationCandidateRuntime(value) {
   const packageJsonBytes = readFileSync(packageJsonPath)
   const packageJson = JSON.parse(packageJsonBytes.toString('utf8'))
   const cliEntryPath = resolve(dirname(packageJsonPath), packageJson.bin?.tsc ?? '')
+  assertCompilerEntrypoint(candidate.runtimeRoot, cliEntryPath)
   const cliEntryBytes = readFileSync(cliEntryPath)
   const getExePathModule = await import(
     `${pathToFileURL(resolve(dirname(packageJsonPath), 'lib/getExePath.js')).href}?candidate-runtime=${candidate.id}`
@@ -421,6 +422,13 @@ function sealCandidateSource(runtimeRoot, manifest) {
   }
 }
 
+function assertCompilerEntrypoint(runtimeRoot, cliEntryPath) {
+  const declared = resolve(runtimeRoot, TEST_COMPILER_COHORT_DESCRIPTOR.compiler.cliRelativePath)
+  if (realpathSync(declared) !== realpathSync(cliEntryPath)) {
+    throw new Error('VerificationCompilerEntrypointMismatch')
+  }
+}
+
 async function captureTestCompiler({ runtimeRoot, candidateId, snapshot, executionRuntime }) {
   const require = createRequire(resolve(runtimeRoot, 'package.json'))
   const packageJsonPath = require.resolve(
@@ -429,6 +437,7 @@ async function captureTestCompiler({ runtimeRoot, candidateId, snapshot, executi
   const packageJsonBytes = readFileSync(packageJsonPath)
   const packageJson = JSON.parse(packageJsonBytes.toString('utf8'))
   const cliEntryPath = resolve(dirname(packageJsonPath), packageJson.bin?.tsc ?? '')
+  assertCompilerEntrypoint(runtimeRoot, cliEntryPath)
   const cliEntryBytes = readFileSync(cliEntryPath)
   const getExePathModule = await import(
     `${pathToFileURL(resolve(dirname(packageJsonPath), 'lib/getExePath.js')).href}?candidate=${candidateId}`

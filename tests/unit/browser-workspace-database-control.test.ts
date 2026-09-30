@@ -382,33 +382,32 @@ describe('browser workspace database control', () => {
     expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
   })
 
-  it('waits on durable selection ownership then resumes before discarding an abandoned destination', async () => {
+  it('resumes a deferred source without discarding live staging and cleans it only after owner loss', async () => {
     const prepared = await beginBrowserWorkspaceDatabaseReplacement()
+    const transition = { ...prepared, roundId: 'finished-round' }
     const destination = await openRawDatabase(prepared.destinationDatabaseName)
     destination.close()
     const locks = new HeldSelectionGateLockManager()
     Object.defineProperty(navigator, 'locks', { configurable: true, value: locks })
-    let settled = false
-    const recovery = recoverQuiescedBrowserWorkspaceReplacement(prepared).finally(() => {
-      settled = true
-    })
 
-    await Promise.resolve()
-    expect(settled).toBe(false)
-    expect(await Dexie.exists(prepared.destinationDatabaseName)).toBe(true)
-
-    locks.release()
-    await expect(recovery).resolves.toEqual({
+    await expect(recoverQuiescedBrowserWorkspaceReplacement(transition)).resolves.toEqual({
       kind: 'uncommitted',
       databaseName: prepared.sourceDatabaseName,
       activationSequence: 0,
     })
     expect(await Dexie.exists(prepared.destinationDatabaseName)).toBe(true)
+    expect((await readBrowserWorkspaceDatabaseManifest()).pending).toEqual(prepared)
+
+    locks.release()
+    await expect(recoverQuiescedBrowserWorkspaceReplacement(transition)).resolves.toEqual({
+      kind: 'uncommitted',
+      databaseName: prepared.sourceDatabaseName,
+      activationSequence: 0,
+    })
     expect((await readBrowserWorkspaceDatabaseManifest()).pending).toEqual({
       ...prepared,
       phase: 'discard',
     })
-
     await expect(cleanPendingBrowserWorkspaceDatabase()).resolves.toMatchObject({
       status: 'cleaned',
       phase: 'discard',
@@ -425,7 +424,9 @@ describe('browser workspace database control', () => {
     destination.close()
     await activatePreparedBrowserWorkspaceDatabase(prepared, storageBaseline)
 
-    await expect(recoverQuiescedBrowserWorkspaceReplacement(prepared)).resolves.toEqual({
+    await expect(
+      recoverQuiescedBrowserWorkspaceReplacement({ ...prepared, roundId: 'committed-round' }),
+    ).resolves.toEqual({
       kind: 'committed',
       databaseName: prepared.destinationDatabaseName,
       activationSequence: 1,

@@ -11,6 +11,7 @@ import {
   tryWithBrowserWorkspaceSelectionGate,
   withBrowserWorkspaceSelectionGate,
   withBrowserWorkspaceSlotOperation,
+  withBrowserWorkspaceSlotRound,
   withExclusiveBrowserWorkspaceSlots,
 } from '../../src/store/browser-workspace-slot-coordination'
 
@@ -19,26 +20,78 @@ const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
 let activeSlotLease: BrowserWorkspaceSlotLeaseHandle | null = null
 
 function installBrowserWorkspaceSlotCoordinator(
-  lifecycle: Omit<Parameters<typeof installSlotCoordinator>[0], 'validateQuiesce'>,
+  lifecycle: Omit<
+    Parameters<typeof installSlotCoordinator>[0],
+    'validateQuiesce' | 'foregroundDemandSignal' | 'preemptMaintenance'
+  >,
 ) {
   return installSlotCoordinator({
+    foregroundDemandSignal: () => new AbortController().signal,
+    preemptMaintenance: () => undefined,
     validateQuiesce: async () => true,
     ...lifecycle,
   })
 }
 
 class ImmediateLockManager {
+  private readonly rounds = new Map<
+    string,
+    { readonly finished: Promise<void>; readonly release: () => void }
+  >()
+
+  holdRound(id: string): () => void {
+    const name = `natter:workspace-slot-round:${id}`
+    if (this.rounds.has(name)) throw new Error('RoundAlreadyHeld')
+    let finish!: () => void
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    const release = () => {
+      this.rounds.delete(name)
+      finish()
+    }
+    this.rounds.set(name, { finished, release })
+    return release
+  }
+
+  releaseRounds(): void {
+    for (const round of this.rounds.values()) round.release()
+  }
+
   request<T>(
     name: string,
     options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
-    callback: (lock: Lock) => Promise<T> | T,
+    callback: (lock: Lock | null) => Promise<T> | T,
   ): Promise<T> {
     if (options.ifAvailable && options.signal) {
       throw new DOMException('signal and ifAvailable cannot be combined', 'NotSupportedError')
     }
-    return Promise.resolve(callback({ name, mode: options.mode }))
+    if (!name.startsWith('natter:workspace-slot-round:')) {
+      return Promise.resolve(callback({ name, mode: options.mode }))
+    }
+    if (options.signal?.aborted) return Promise.reject(options.signal.reason)
+    const held = this.rounds.get(name)
+    if (options.ifAvailable)
+      return Promise.resolve(callback(held ? null : { name, mode: options.mode }))
+    if (options.mode === 'exclusive') {
+      const release = this.holdRound(name.slice('natter:workspace-slot-round:'.length))
+      return Promise.resolve()
+        .then(() => callback({ name, mode: options.mode }))
+        .finally(release)
+    }
+    if (!held) return Promise.resolve(callback({ name, mode: options.mode }))
+    return new Promise<void>((resolve, reject) => {
+      const abort = () => reject(options.signal?.reason)
+      options.signal?.addEventListener('abort', abort, { once: true })
+      void held.finished.then(() => {
+        options.signal?.removeEventListener('abort', abort)
+        resolve()
+      })
+    }).then(() => callback({ name, mode: options.mode }))
   }
 }
+
+let roundManager: ImmediateLockManager
 
 class SerialLockManager {
   readonly requested: string[] = []
@@ -176,7 +229,11 @@ class FakeBroadcastChannel extends EventTarget {
 
   close(): void {}
 
-  postMessage(): void {}
+  readonly messages: unknown[] = []
+
+  postMessage(message: unknown): void {
+    this.messages.push(message)
+  }
 
   receive(data: unknown): void {
     this.dispatchEvent(new MessageEvent('message', { data }))
@@ -184,6 +241,22 @@ class FakeBroadcastChannel extends EventTarget {
 }
 
 describe('browser workspace slot coordination', () => {
+  it.each([new DOMException('selection cancelled', 'AbortError'), { caller: 'test' }, null])(
+    'preserves exact cancellation and callback rejection through selection: %s',
+    async (reason: unknown) => {
+      const signal = AbortSignal.abort(reason)
+      const start = vi.fn(async () => undefined)
+      await expect(withBrowserWorkspaceSelectionGate(start, signal)).rejects.toBe(reason)
+      await expect(tryWithBrowserWorkspaceSelectionGate(start, signal)).rejects.toBe(reason)
+      expect(start).not.toHaveBeenCalled()
+      await expect(
+        tryWithBrowserWorkspaceSelectionGate(async () => {
+          throw reason
+        }),
+      ).rejects.toBe(reason)
+    },
+  )
+
   beforeEach(() => {
     __resetBrowserWorkspaceSlotCoordinatorForTests()
     activeSlotLease = null
@@ -192,13 +265,15 @@ describe('browser workspace slot coordination', () => {
       configurable: true,
       value: FakeBroadcastChannel,
     })
+    roundManager = new ImmediateLockManager()
     Object.defineProperty(navigator, 'locks', {
       configurable: true,
-      value: new ImmediateLockManager(),
+      value: roundManager,
     })
   })
 
   afterEach(async () => {
+    roundManager.releaseRounds()
     if (activeSlotLease) await releaseBrowserWorkspaceSlotLease(activeSlotLease)
     activeSlotLease = null
     __resetBrowserWorkspaceSlotCoordinatorForTests()
@@ -211,9 +286,94 @@ describe('browser workspace slot coordination', () => {
     vi.restoreAllMocks()
   })
 
+  it('routes foreground demand only to the exact owned replacement round', async () => {
+    const preemptMaintenance = vi.fn()
+    installSlotCoordinator({
+      foregroundDemandSignal: () => new AbortController().signal,
+      preemptMaintenance,
+      validateQuiesce: async () => true,
+      reconcile: async () => undefined,
+    })
+    const transition = {
+      nonce: 'owned-replacement',
+      sourceDatabaseName: 'natter' as const,
+      destinationDatabaseName: 'natter-workspace-a' as const,
+    }
+    const channel = FakeBroadcastChannel.instances[0]
+    if (!channel) throw new Error('slot channel missing')
+    let previousRound: unknown
+    for (let index = 0; index < 2; index += 1) {
+      await withBrowserWorkspaceSlotRound(transition, async (quiesce) => {
+        quiesce()
+        const current = channel.messages.at(-1) as typeof transition & { roundId: string }
+        channel.receive({ ...current, kind: 'foreground-demand', senderId: 'peer', nonce: 'old' })
+        channel.receive({
+          ...current,
+          kind: 'foreground-demand',
+          senderId: 'peer',
+          roundId: 'old-round',
+        })
+        if (previousRound) channel.receive(previousRound)
+        expect(preemptMaintenance).toHaveBeenCalledTimes(index)
+        const demand = { ...current, kind: 'foreground-demand', senderId: 'peer' }
+        channel.receive(demand)
+        expect(preemptMaintenance).toHaveBeenCalledTimes(index + 1)
+        previousRound = demand
+      })
+      channel.receive(previousRound)
+      expect(preemptMaintenance).toHaveBeenCalledTimes(index + 1)
+    }
+  })
+
+  it.each(['before', 'during'] as const)(
+    'reports foreground demand %s peer reconciliation without waiting for it to finish',
+    async (when) => {
+      const demand = new AbortController()
+      if (when === 'before') demand.abort()
+      let entered!: () => void
+      const entering = new Promise<void>((resolve) => {
+        entered = resolve
+      })
+      let finish!: () => void
+      const blocked = new Promise<void>((resolve) => {
+        finish = resolve
+      })
+      const owner = installSlotCoordinator({
+        foregroundDemandSignal: () => demand.signal,
+        preemptMaintenance: () => undefined,
+        validateQuiesce: async () => true,
+        reconcile: async () => {
+          entered()
+          await blocked
+        },
+      })
+      activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
+      const channel = FakeBroadcastChannel.instances[0]
+      if (!channel) throw new Error('slot channel missing')
+      const transition = {
+        nonce: 'peer-replacement',
+        roundId: 'peer-round',
+        sourceDatabaseName: 'natter',
+        destinationDatabaseName: 'natter-workspace-a',
+      }
+      const releaseRound = roundManager.holdRound(transition.roundId)
+      channel.receive({ ...transition, kind: 'quiesce', senderId: 'peer' })
+      await entering
+      if (when === 'during') demand.abort()
+      expect(channel.messages).toEqual([
+        expect.objectContaining({ ...transition, kind: 'foreground-demand' }),
+      ])
+      finish()
+      releaseRound()
+      await awaitBrowserWorkspaceSlotCoordinatorIdle(owner)
+    },
+  )
+
   it('reconciles a quiesced peer once for the matching durable transition', async () => {
     const transitions: string[] = []
     installSlotCoordinator({
+      foregroundDemandSignal: () => new AbortController().signal,
+      preemptMaintenance: () => undefined,
       validateQuiesce: async (transition) => transition.nonce === 'current-transition',
       reconcile: async (transition) => {
         transitions.push(`reconcile:${transition.nonce}`)
@@ -229,6 +389,7 @@ describe('browser workspace slot coordination', () => {
       kind: 'quiesce',
       senderId: 'peer',
       nonce: 'stale-transition',
+      roundId: 'stale-round',
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })
@@ -236,10 +397,12 @@ describe('browser workspace slot coordination', () => {
     await Promise.resolve()
     expect(transitions).toEqual([])
 
+    roundManager.holdRound('current-round')
     channel.receive({
       kind: 'quiesce',
       senderId: 'peer',
       nonce: 'current-transition',
+      roundId: 'current-round',
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })
@@ -249,6 +412,7 @@ describe('browser workspace slot coordination', () => {
       kind: 'quiesce',
       senderId: 'peer',
       nonce: 'current-transition',
+      roundId: 'current-round',
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })
@@ -257,10 +421,79 @@ describe('browser workspace slot coordination', () => {
     expect(transitions).toEqual(['reconcile:current-transition'])
   })
 
+  it('ignores an ended round even when its durable preparation remains current', async () => {
+    const reconcile = vi.fn(async () => undefined)
+    const owner = installSlotCoordinator({
+      foregroundDemandSignal: () => new AbortController().signal,
+      preemptMaintenance: () => undefined,
+      validateQuiesce: async () => true,
+      reconcile,
+    })
+    activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
+    const channel = FakeBroadcastChannel.instances[0]
+    if (!channel) throw new Error('slot channel missing')
+    const release = roundManager.holdRound('ended-round')
+    release()
+    channel.receive({
+      kind: 'quiesce',
+      senderId: 'peer',
+      nonce: 'still-preparing',
+      roundId: 'ended-round',
+      sourceDatabaseName: 'natter',
+      destinationDatabaseName: 'natter-workspace-a',
+    })
+    await awaitBrowserWorkspaceSlotCoordinatorIdle(owner)
+    expect(reconcile).not.toHaveBeenCalled()
+    expect(channel.messages).toEqual([])
+  })
+
+  it('ends peer quiescence at its round boundary while preparation remains owned', async () => {
+    let entered!: () => void
+    const entering = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const observed: string[] = []
+    const owner = installSlotCoordinator({
+      foregroundDemandSignal: () => new AbortController().signal,
+      preemptMaintenance: () => undefined,
+      validateQuiesce: async () => true,
+      reconcile: async (_transition, _signal, round) => {
+        observed.push('round-active')
+        expect(round.signal.aborted).toBe(false)
+        entered()
+        await round.finished
+        expect(round.signal.aborted).toBe(true)
+        observed.push('source-ready')
+      },
+    })
+    activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
+    const channel = FakeBroadcastChannel.instances[0]
+    if (!channel) throw new Error('slot channel missing')
+    const release = roundManager.holdRound('round-one')
+    try {
+      channel.receive({
+        kind: 'quiesce',
+        senderId: 'peer',
+        nonce: 'same-preparation',
+        roundId: 'round-one',
+        sourceDatabaseName: 'natter',
+        destinationDatabaseName: 'natter-workspace-a',
+      })
+      await entering
+      expect(observed).toEqual(['round-active'])
+    } finally {
+      release()
+    }
+    await awaitBrowserWorkspaceSlotCoordinatorIdle(owner)
+    expect(observed).toEqual(['round-active', 'source-ready'])
+  })
+
   it('ignores a quiesce message not admitted by the durable slot journal', async () => {
     const reconcile = vi.fn(async () => undefined)
     const validateQuiesce = vi.fn(async () => false)
     installSlotCoordinator({
+      foregroundDemandSignal: () => new AbortController().signal,
+      preemptMaintenance: () => undefined,
       validateQuiesce,
       reconcile,
     })
@@ -269,6 +502,7 @@ describe('browser workspace slot coordination', () => {
     if (!channel) throw new Error('slot channel missing')
     const transition = {
       nonce: 'foreign-storage-partition',
+      roundId: 'foreign-round',
       sourceDatabaseName: 'natter' as const,
       destinationDatabaseName: 'natter-workspace-a' as const,
     }
@@ -369,10 +603,12 @@ describe('browser workspace slot coordination', () => {
       kind: 'quiesce',
       senderId: 'peer',
       nonce,
+      roundId: nonce,
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })
 
+    roundManager.holdRound('owner-a-active')
     channelA.receive(message('owner-a-active'))
     await expect.poll(() => ownerACalls).toBe(1)
     channelA.receive(message('owner-a-queued'))
@@ -392,6 +628,7 @@ describe('browser workspace slot coordination', () => {
 
     const channelB = FakeBroadcastChannel.instances.at(-1)
     if (!channelB) throw new Error('owner B slot channel missing')
+    roundManager.holdRound('owner-b-active')
     channelB.receive(message('owner-b-active'))
     await expect.poll(() => ownerBCalls).toBe(1)
     disposeBrowserWorkspaceSlotCoordinator(ownerB)
@@ -413,10 +650,12 @@ describe('browser workspace slot coordination', () => {
     activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
     const channelA = FakeBroadcastChannel.instances[0]
     if (!channelA) throw new Error('owner A slot channel missing')
+    roundManager.holdRound('owner-a-started')
     channelA.receive({
       kind: 'quiesce',
       senderId: 'peer',
       nonce: 'owner-a-started',
+      roundId: 'owner-a-started',
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })
@@ -435,6 +674,7 @@ describe('browser workspace slot coordination', () => {
       kind: 'quiesce',
       senderId: 'peer',
       nonce: 'owner-a-after-dispose',
+      roundId: 'owner-a-after-dispose',
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })

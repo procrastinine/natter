@@ -109,6 +109,88 @@ describe('ScrollRegion continuity lease', () => {
     }
   }
 
+  function nativeActivationFixture() {
+    const activate = vi.fn()
+    const fixture = setup(
+      {},
+      <button type="button" onClick={activate}>
+        Activate
+      </button>,
+    )
+    const control = fixture.region.querySelector('button') as HTMLButtonElement
+    const captures = new Set<number>()
+    control.setPointerCapture = vi.fn((id: number) => captures.add(id))
+    control.releasePointerCapture = vi.fn((id: number) => captures.delete(id))
+    control.hasPointerCapture = (id) => captures.has(id)
+    control.checkVisibility = () => true
+    control.getBoundingClientRect = () => new DOMRect(10, 10, 100, 30)
+    const pointer = (type: string, options: MouseEventInit = {}) => {
+      const event = new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        detail: type === 'click' ? 1 : 0,
+        buttons: type === 'pointerup' ? 0 : 1,
+        clientX: 25,
+        clientY: 25,
+        ...options,
+      })
+      Object.defineProperties(event, { pointerId: { value: 1 }, isPrimary: { value: true } })
+      act(() => {
+        control.dispatchEvent(event)
+      })
+    }
+    return { ...fixture, activate, control, captures, pointer }
+  }
+
+  it('retains the native click target while passive layout moves the same control', () => {
+    const fixture = nativeActivationFixture()
+    fixture.pointer('pointerdown')
+    expect(fixture.activate).not.toHaveBeenCalled()
+    fixture.control.getBoundingClientRect = () => new DOMRect(10, 90, 100, 30)
+    fixture.pointer('pointermove')
+    fixture.pointer('pointerup')
+    expect(fixture.control.releasePointerCapture).not.toHaveBeenCalled()
+    fixture.captures.clear()
+    fixture.pointer('click')
+    expect(fixture.activate).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['scope', 'blur', 'unavailable'] as const)(
+    'cancels native activation on %s without consuming the next gesture',
+    (reason) => {
+      const fixture = nativeActivationFixture()
+      fixture.pointer('pointerdown')
+      if (reason === 'scope') fixture.rerender({ selectionKey: 'tail-b' })
+      if (reason === 'blur') fireEvent(window, new Event('blur'))
+      if (reason === 'unavailable') fixture.control.setAttribute('aria-disabled', 'true')
+      fixture.pointer('pointerup')
+      fixture.pointer('click')
+      expect(fixture.activate).not.toHaveBeenCalled()
+      expect(fixture.control.releasePointerCapture).toHaveBeenCalledWith(1)
+      fixture.control.removeAttribute('aria-disabled')
+      fixture.pointer('pointerdown')
+      fixture.pointer('pointerup')
+      fixture.pointer('click')
+      expect(fixture.activate).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('does not classify native summary keyboard activation as scrolling', () => {
+    const fixture = setup(
+      {},
+      <details>
+        <summary>Details</summary>Body
+      </details>,
+    )
+    acquireOpen(fixture)
+    const summary = fixture.region.querySelector('summary') as HTMLElement
+    const revision = fixture.commands().getUserScrollRevision()
+    fireEvent.keyDown(summary, { key: ' ' })
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    expect(fixture.commands().getUserScrollRevision()).toBe(revision)
+  })
+
   function setup(
     initialProps: Partial<RegionProps> = {},
     initialChildren: ReactNode = <div>content</div>,

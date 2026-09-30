@@ -1,3 +1,5 @@
+import type { VerificationStageReference } from './verification-stage-contract.mjs'
+
 export interface TestEvidenceAuditReport {
   ok: boolean
   structurallyValid: boolean
@@ -112,10 +114,7 @@ export interface TestGuaranteeClaim {
   missing?: string
 }
 
-export interface TestEvidenceReference {
-  path: string
-  locator: string
-}
+export type TestEvidenceReference = { path: string; locator: string } | VerificationStageReference
 
 export function auditTestEvidence(options?: {
   root?: string

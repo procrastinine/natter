@@ -1303,7 +1303,7 @@
 [data-ui="toast-tray"] {
   position: fixed;
   right: var(--space-5);
-  bottom: var(--space-5);
+  bottom: calc(var(--space-6) + var(--floating-control-size) + var(--space-3));
   z-index: var(--z-toast, 100);
   display: flex;
   flex-direction: column-reverse;
@@ -1313,7 +1313,7 @@
 }
 
 [data-ui="toast-tray"] [data-ui="toast"] {
-  pointer-events: auto;
+  pointer-events: none;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -1346,6 +1346,7 @@
 
 [data-ui="toast-undo"],
 [data-ui="toast-dismiss"] {
+  pointer-events: auto;
   background: transparent;
   border: none;
   padding: var(--space-1) var(--space-2);

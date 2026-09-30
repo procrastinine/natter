@@ -1,7 +1,19 @@
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
+import {
+  createFilesystemLocalModuleSource,
+  LOCAL_MODULE_CODE_EXTENSIONS,
+  reverseReachableLocalModules,
+  scanReachableLocalModuleGraph,
+} from './local-module-graph.mjs'
+import { VERIFICATION_STAGES } from './run-verification.mjs'
+import { validateOpaqueModuleDispositions } from './verification-impact-plan.mjs'
+import {
+  VERIFICATION_EXPLICIT_MODULE_EDGES,
+  VERIFICATION_OPAQUE_MODULE_REFERENCE_DISPOSITIONS,
+} from './verification-obligation-manifest.mjs'
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url))
 const DEFAULT_ROOT = resolve(SCRIPT_DIRECTORY, '..')
@@ -38,9 +50,94 @@ export function discoverE2eCleanupEvidenceSites(rootDirectory = DEFAULT_ROOT) {
   return discoverE2eSemanticSiteSets(rootDirectory).cleanupEvidenceSites
 }
 
+export function validateNativeFixtureOwnership(sites) {
+  return sites.flatMap((site) =>
+    ['indexeddb.factory.open', 'indexeddb.factory.delete-database'].includes(site.operation) &&
+    site.path !== 'scripts/native-workspace-storage-fixture.mjs'
+      ? [
+          {
+            code:
+              site.operation === 'indexeddb.factory.open'
+                ? 'native-fixture-open-bypass'
+                : 'native-fixture-delete-bypass',
+            siteId: site.id,
+            detail: `${site.path}:${site.line} performs ${site.operation} outside the shared native fixture owner.`,
+          },
+        ]
+      : [],
+  )
+}
+
+export function discoverBrowserFixtureSources(rootDirectory = DEFAULT_ROOT) {
+  const source = createFilesystemLocalModuleSource({ root: rootDirectory })
+  const e2ePaths = [...source.allPaths].filter(
+    (path) => path.startsWith('tests/e2e/') && /\.[cm]?[jt]sx?$/u.test(path),
+  )
+  const nodeEntries = VERIFICATION_STAGES.filter((stage) => stage.argv[0] === 'node')
+    .map((stage) => stage.argv[1])
+    .filter((path) => !path.startsWith('node_modules/'))
+  const { graph, projections } = scanReachableLocalModuleGraph({
+    source,
+    entryPaths: [...new Set([...e2ePaths, ...nodeEntries])],
+    projectFile(file) {
+      return (
+        file.kind === 'code' &&
+        ts
+          .preProcessFile(file.sourceFile.text, true, true)
+          .importedFiles.some(({ fileName }) =>
+            ['@playwright/test', 'playwright'].includes(fileName),
+          )
+      )
+    },
+  })
+  const browserConsumers = new Set(
+    reverseReachableLocalModules(
+      graph,
+      [...projections].filter(([, browser]) => browser).map(([path]) => path),
+    ),
+  )
+  const selected = new Set()
+  const pending = [...e2ePaths, ...nodeEntries.filter((path) => browserConsumers.has(path))]
+  while (pending.length) {
+    const path = pending.pop()
+    if (selected.has(path)) continue
+    selected.add(path)
+    pending.push(...(graph.dependencies.get(path) ?? []))
+  }
+  const diagnostics = graph.diagnostics.filter(({ path }) => selected.has(path))
+  const dispositions = VERIFICATION_OPAQUE_MODULE_REFERENCE_DISPOSITIONS.filter(({ path }) =>
+    selected.has(path),
+  )
+  const disposedKeys = new Set(dispositions.map(({ path, code }) => `${path}|${code}`))
+  const dispositionProblems = validateOpaqueModuleDispositions(
+    diagnostics,
+    dispositions,
+    Object.fromEntries([...selected].map((path) => [path, true])),
+  )
+  const missingInputs = VERIFICATION_EXPLICIT_MODULE_EDGES.filter(
+    ({ importer, dependency }) =>
+      dispositions.some(({ path }) => path === importer) && !source.allPaths.has(dependency),
+  )
+  const unresolved = diagnostics.filter(({ path, code }) => !disposedKeys.has(`${path}|${code}`))
+  if (dispositionProblems.length || missingInputs.length || unresolved.length) {
+    throw new Error(
+      `NativeFixtureDependencyGraphInvalid:${JSON.stringify({ diagnostics: unresolved, dispositionProblems, missingInputs })}`,
+    )
+  }
+  for (const path of [...selected]) {
+    const companion = path.replace(/\.(mjs|cjs|js)$/u, (_extension, kind) =>
+      kind === 'mjs' ? '.d.mts' : kind === 'cjs' ? '.d.cts' : '.d.ts',
+    )
+    if (companion !== path && source.allPaths.has(companion)) selected.add(companion)
+  }
+  return [...selected]
+    .filter((path) => LOCAL_MODULE_CODE_EXTENSIONS.some((extension) => path.endsWith(extension)))
+    .map((path) => resolve(rootDirectory, path))
+    .sort()
+}
+
 function discoverE2eSemanticSiteSets(rootDirectory) {
-  const e2eRoot = resolve(rootDirectory, 'tests/e2e')
-  const files = sourceFiles(e2eRoot)
+  const files = discoverBrowserFixtureSources(rootDirectory)
   const config = ts.readConfigFile(resolve(rootDirectory, 'tsconfig.app.json'), ts.sys.readFile)
   if (config.error) {
     throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'))
@@ -52,6 +149,8 @@ function discoverE2eSemanticSiteSets(rootDirectory) {
       ...parsed.options,
       noEmit: true,
       noResolve: true,
+      allowJs: true,
+      checkJs: false,
       noUnusedLocals: false,
       noUnusedParameters: false,
     },
@@ -323,7 +422,9 @@ export function auditE2eBrowserStorage(
     ])
   }
   const { storageSites, cleanupEvidenceSites } = discoverE2eSemanticSiteSets(rootDirectory)
-  return validateE2eBrowserStorageInventory(inventory, storageSites, cleanupEvidenceSites)
+  const result = validateE2eBrowserStorageInventory(inventory, storageSites, cleanupEvidenceSites)
+  const violations = [...result.violations, ...validateNativeFixtureOwnership(storageSites)]
+  return { ...result, violations, ok: violations.length === 0 }
 }
 
 function discoverFileSites(sourceFile, sourcePath, checker) {
@@ -438,6 +539,23 @@ function classifyCleanupEvidenceCall(node) {
     ])
   }
   if (!ts.isPropertyAccessExpression(expression)) return null
+  if (isNativeFixtureReceiver(expression.expression)) {
+    if (
+      [
+        'active',
+        'control',
+        'observeNamed',
+        'offline',
+        'release',
+        'cancel',
+        'readActiveIdentity',
+      ].includes(expression.name.text)
+    ) {
+      return cleanupEvidenceSite(`fixture.native.${expression.name.text}`, ['close-database'])
+    }
+    if (expression.name.text === 'deleteOffline')
+      return cleanupEvidenceSite('fixture.native.delete-offline', ['delete-database', 'clear-data'])
+  }
   if (expression.name.text === 'reload') {
     return cleanupEvidenceSite('fixture.page.reload', ['reload'])
   }
@@ -509,11 +627,50 @@ function cleanupEvidenceSite(operation, effects) {
   }
 }
 
+function isNativeFixtureReceiver(expression) {
+  const value = unwrapExpression(expression)
+  return (
+    ts.isPropertyAccessExpression(value) &&
+    value.name.text === '__natterNativeStorageFixture' &&
+    ['globalThis', 'window'].includes(value.expression.getText())
+  )
+}
+
 function classifyCall(node, checker, values) {
   const expression = node.expression
   if (!ts.isPropertyAccessExpression(expression)) return null
   const method = expression.name.text
   const receiver = unwrapExpression(expression.expression)
+
+  if (isNativeFixtureReceiver(receiver)) {
+    const fixedPurpose = {
+      holdActiveStores: 'fault-injection',
+      readActiveIdentity: 'read-only-assertion',
+      databaseNames: 'read-only-assertion',
+      release: 'fault-injection',
+      cancel: 'fault-injection',
+    }[method]
+    const options = node.arguments[0]
+    const purposeProperty =
+      options && ts.isObjectLiteralExpression(options)
+        ? options.properties.find(
+            (property) =>
+              ts.isPropertyAssignment(property) && propertyName(property.name) === 'purpose',
+          )
+        : null
+    const purpose =
+      fixedPurpose ??
+      (purposeProperty && ts.isPropertyAssignment(purposeProperty)
+        ? staticLiteral(purposeProperty.initializer, values, checker)
+        : null)
+    return site(
+      'native-fixture',
+      E2E_STORAGE_PURPOSES.includes(purpose) ? 'selection' : 'unknown',
+      `native-fixture.${method}`,
+      purpose ?? '<dynamic>',
+      '<operation-scope>',
+    )
+  }
 
   if (
     method === 'keys' &&
@@ -552,6 +709,15 @@ function classifyCall(node, checker, values) {
     return site('indexeddb', 'unknown', `indexeddb.factory.${method}`)
   }
 
+  if (method === 'completion' && isType(receiver, checker, 'NativeFixtureDatabase')) {
+    return site(
+      'native-fixture',
+      'transaction-control',
+      'native-fixture.transaction-completion',
+      null,
+      '<transaction-scope>',
+    )
+  }
   if (method === 'transaction' && isType(receiver, checker, 'IDBDatabase')) {
     return site(
       'indexeddb',
@@ -1058,7 +1224,11 @@ function prototypeStorageMethod(expression) {
 
 function isType(expression, checker, expected) {
   const expectedNames =
-    expected === 'IDBCursor' ? new Set(['IDBCursor', 'IDBCursorWithValue']) : new Set([expected])
+    expected === 'IDBCursor'
+      ? new Set(['IDBCursor', 'IDBCursorWithValue'])
+      : expected === 'IDBDatabase'
+        ? new Set(['IDBDatabase', 'NativeFixtureDatabase'])
+        : new Set([expected])
   const pending = [checker.getTypeAtLocation(unwrapExpression(expression))]
   const visited = new Set()
   while (pending.length > 0) {
@@ -1360,21 +1530,6 @@ function validateMutationScope(scope, location, violations) {
       detail: `${location}.mutationScope.targets must name at least one mutation target.`,
     })
   }
-}
-
-function sourceFiles(root) {
-  const files = []
-  const pending = [root]
-  while (pending.length > 0) {
-    const directory = pending.pop()
-    if (!directory) continue
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = resolve(directory, entry.name)
-      if (entry.isDirectory()) pending.push(path)
-      else if (entry.isFile() && /\.(?:ts|tsx)$/u.test(entry.name)) files.push(path)
-    }
-  }
-  return files.sort()
 }
 
 function isRecord(value) {

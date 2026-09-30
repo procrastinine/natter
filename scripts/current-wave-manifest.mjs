@@ -72,6 +72,11 @@ export const currentWaveManifest = Object.freeze({
   ]),
   forbiddenMatches: Object.freeze([
     {
+      id: 'superseded-maintenance-retry-and-quiesce-owners',
+      pattern:
+        'BrowserWorkspaceCompactionCatchupBudgetExceeded|isRetryableBrowserWorkspaceCompactionError|postBrowserWorkspaceSlotQuiesce|WorkspaceMaintenanceContinuation|installBrowserWorkspaceReplacementReopen',
+    },
+    {
       id: 'split-message-header-delta-fact',
       file: 'src/store/workspace-protocol.ts',
       pattern: "kind: 'message-header'\\n\\s+chatId",
@@ -532,7 +537,10 @@ export const currentWaveManifest = Object.freeze({
     },
   ]),
   sourceObligations: Object.freeze([]),
-  heartbeatObligations: Object.freeze(['materialize-runnable-current-contract-snapshot']),
+  heartbeatObligations: Object.freeze([
+    'browser-workspace-lifecycle-contract',
+    'workspace-runtime-resources',
+  ]),
   costObligations: Object.freeze([
     'complete-non-fail-fast-github-equivalent-suite',
     'generic-ui-journey-and-scroll-continuity',

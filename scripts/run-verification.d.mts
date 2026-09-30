@@ -1,4 +1,6 @@
+import type { BrowserExecutionPhase } from './playwright-selection.mjs'
 import type { Writable } from 'node:stream'
+import type { VerificationPerformancePreparation } from './verification-performance-evidence.mjs'
 
 export type VerificationPolicy = 'advisory' | 'blocking'
 export type VerificationAssurance = 'guarantee' | 'hygiene' | 'inventory' | 'runtime'
@@ -16,9 +18,42 @@ export interface VerificationStage {
   readonly policy: VerificationPolicy
   readonly argv: readonly string[]
   readonly stderr?: 'allow' | 'empty'
+  readonly compilerProof?: true
+  readonly preparation?: 'performance-evidence'
+  readonly performanceStageAliases?: Readonly<Record<string, string>>
+  readonly environment?: Readonly<NodeJS.ProcessEnv>
+  readonly kind?: 'node' | 'vitest' | 'playwright'
+  readonly assurance?: VerificationAssurance
+  readonly nodeOptions?: readonly string[]
+  readonly inputPaths?: readonly string[]
+  readonly inputPrefixes?: readonly string[]
+  readonly prerequisites?: readonly { readonly id: string; readonly consumerModules?: readonly string[]; readonly propagateImpact?: boolean }[]
+  readonly prerequisiteIds?: readonly string[]
+  readonly unitFiles?: readonly string[]
+  readonly browserProjects?: readonly string[]
+  readonly browserTasks?: readonly { readonly project: string; readonly files: readonly string[] }[]
+  readonly browserPhases?: readonly BrowserExecutionPhase[]
 }
 
+export interface VerificationCompilerEvidence {
+  readonly kind: 'candidate-test-compiler'
+  readonly candidateId: string
+  readonly candidateDigest: string
+  readonly snapshotDigest: string
+  readonly compilerCohortDigest: string
+  readonly captureDigest: string
+}
+export type TestCompilerProof = (stage: VerificationStage) => VerificationExecution
+export interface VerificationStageExecutionContext {
+  readonly root: string
+  readonly artifactRoot: string
+  readonly runId: string
+  readonly runDirectory: string
+  readonly environment: NodeJS.ProcessEnv
+}
 export interface VerificationExecution {
+  readonly evidence?: VerificationCompilerEvidence
+
   readonly exitCode: number | null
   readonly signal: NodeJS.Signals | null
   readonly diagnostics: readonly string[]
@@ -44,6 +79,7 @@ export interface VerificationMetadata {
 }
 
 export interface VerificationStageResult {
+  readonly evidence?: VerificationCompilerEvidence | null
   readonly id: string
   readonly label: string
   readonly policy: VerificationPolicy
@@ -88,6 +124,7 @@ export interface VerificationSummary {
 }
 
 export interface RunVerificationOptions {
+  readonly testCompilerProof?: TestCompilerProof
   readonly root?: string
   readonly baseEnv?: Readonly<NodeJS.ProcessEnv>
   readonly executionRuntime?: {
@@ -99,6 +136,7 @@ export interface RunVerificationOptions {
   readonly executeStage?: (
     stage: VerificationStage,
     metadata: VerificationMetadata,
+    context: VerificationStageExecutionContext,
   ) => Promise<VerificationExecution>
   readonly persistSummary?: (summary: VerificationSummary) => Promise<void>
   readonly finalValidator?: () => void | Promise<void>
@@ -142,7 +180,7 @@ export function createVerificationSummary(
 export function serializeVerificationSummary(summary: VerificationSummary): string
 export function executeVerificationStage(
   stage: VerificationStage,
-  metadata: VerificationMetadata,
+  metadata: VerificationMetadata | undefined,
   options?: {
     readonly root?: string
     readonly baseEnv?: Readonly<NodeJS.ProcessEnv>
@@ -156,6 +194,11 @@ export function executeVerificationStage(
     readonly forwardOutput?: boolean
     readonly outputDestinations?: { readonly stdout: Writable; readonly stderr: Writable }
     readonly performanceEvidencePath?: string | null
+    readonly testCompilerProof?: TestCompilerProof
+    readonly executionId?: string
+    readonly diagnosticPrefix?: string
+    readonly executeProcess?: (stage: VerificationStage, metadata: VerificationMetadata | undefined, context: VerificationStageExecutionContext) => Promise<VerificationExecution>
+    readonly browserPhase?: boolean
   },
 ): Promise<VerificationExecution>
 export function verificationStageEnvironment(
@@ -168,3 +211,18 @@ export function verificationStageEnvironment(
     readonly performanceEvidencePath?: string | null
   },
 ): NodeJS.ProcessEnv
+
+export function verificationStageInputPaths(stage: VerificationStage, allPaths?: Iterable<string>): string[]
+export function compileSliceVerificationStages(
+  tasks: { readonly node: readonly { readonly id: string; readonly argv: readonly string[] }[]; readonly vitest: readonly string[]; readonly playwright: readonly { readonly project: string; readonly files: readonly string[] }[] },
+  options?: { readonly catalog?: readonly VerificationStage[]; readonly sourceFiles?: readonly string[]; readonly stageIds?: readonly string[]; readonly inputPaths?: ReadonlySet<string> },
+): readonly VerificationStage[]
+export function prepareVerificationStageExecution(stage: VerificationStage, options: VerificationPerformancePreparation): Promise<string | null>
+
+export function verifyVerificationStageExecution(
+  stage: VerificationStage,
+  execution: VerificationExecution,
+  options: { readonly root: string; readonly artifactRoot: string; readonly environment: Readonly<NodeJS.ProcessEnv> },
+): Promise<VerificationExecution>
+
+export function directBrowserVerificationStages(selection: string, files: readonly string[]): readonly VerificationStage[]

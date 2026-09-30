@@ -1,6 +1,7 @@
 import type {
   BrowserWorkspacePreparedReplacement,
   BrowserWorkspaceReplacementCommit,
+  BrowserWorkspaceReplacementReopenOutcome,
   BrowserWorkspaceSnapshot,
 } from './browser-workspace-contract'
 
@@ -13,6 +14,8 @@ export type BrowserWorkspaceReplacementTransitionPhase =
   | 'committing'
   | 'committed'
   | 'uncommitted'
+  | 'deferred'
+  | 'cancelled'
   | 'unknown'
   | 'selection-settling'
   | 'selection-settled'
@@ -20,12 +23,22 @@ export type BrowserWorkspaceReplacementTransitionPhase =
   | 'terminal'
 
 export type BrowserWorkspaceReplacementOutcome<T> =
+  | { readonly kind: 'online-ready' }
+  | { readonly kind: 'cancelled'; readonly reason: unknown; readonly readiness: 'ready' | 'closed' }
   | {
       readonly kind: 'committed-ready'
       readonly commit: BrowserWorkspaceReplacementCommit<T>
     }
   | {
+      readonly kind: 'committed-closed'
+      readonly commit: BrowserWorkspaceReplacementCommit<T>
+    }
+  | {
       readonly kind: 'uncommitted-ready'
+      readonly error: unknown
+    }
+  | {
+      readonly kind: 'uncommitted-closed'
       readonly error: unknown
     }
   | {
@@ -45,6 +58,7 @@ export type BrowserWorkspaceReplacementOutcome<T> =
 export interface BrowserWorkspaceReplacementTransitionController<T> {
   readonly phase: () => BrowserWorkspaceReplacementTransitionPhase
   readonly hasDisposition: () => boolean
+  readonly isDeferred: () => boolean
   readonly ownAbandon: (operation: () => Promise<void>) => void
   readonly beginQuiescing: () => void
   readonly markQuiesced: () => void
@@ -53,6 +67,8 @@ export interface BrowserWorkspaceReplacementTransitionController<T> {
   readonly beginCommitting: () => void
   readonly markCommitted: (prepared: BrowserWorkspacePreparedReplacement<T>) => void
   readonly markUncommitted: (error: unknown) => void
+  readonly markDeferred: () => void
+  readonly markCancelled: (reason: unknown) => void
   readonly markOutcomeUnknown: (error: unknown) => void
   readonly settleSelection: () => Promise<void>
   readonly finalize: () => Promise<BrowserWorkspaceReplacementOutcome<T>>
@@ -60,7 +76,7 @@ export interface BrowserWorkspaceReplacementTransitionController<T> {
 
 interface BrowserWorkspaceReplacementTransitionPorts<T> {
   readonly originalWorkspace: BrowserWorkspaceSnapshot
-  readonly reopen: () => Promise<BrowserWorkspaceSnapshot>
+  readonly reopen: (retained: boolean) => Promise<BrowserWorkspaceReplacementReopenOutcome>
   readonly publish: (commit: BrowserWorkspaceReplacementCommit<T>) => Promise<void> | void
 }
 
@@ -70,7 +86,7 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
   let phase: BrowserWorkspaceReplacementTransitionPhase = 'admitted'
   let abandon: (() => Promise<void>) | null = null
   let commit: BrowserWorkspaceReplacementCommit<T> | null = null
-  let disposition: 'committed' | 'uncommitted' | 'unknown' | null = null
+  let disposition: 'committed' | 'uncommitted' | 'unknown' | 'deferred' | 'cancelled' | null = null
   let dispositionError: unknown
   let dispositionSet = false
   const selectionFailures: unknown[] = []
@@ -87,9 +103,17 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
     phase = next
   }
 
+  const abandonOnce = async (): Promise<void> => {
+    if (!abandon) return
+    const operation = abandon
+    abandon = null
+    await operation()
+  }
+
   const controller: BrowserWorkspaceReplacementTransitionController<T> = {
     phase: () => phase,
     hasDisposition: () => dispositionSet,
+    isDeferred: () => disposition === 'deferred',
     ownAbandon: (operation) => {
       if (phase !== 'admitted' || abandon) {
         throw new Error('BrowserWorkspaceReplacementAbandonOwnerInvalid')
@@ -116,6 +140,26 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
       dispositionError = error
       dispositionSet = true
     },
+    markDeferred: () => {
+      if (dispositionSet || !['quiescing', 'quiesced', 'writing'].includes(phase)) {
+        throw new Error(`BrowserWorkspaceReplacementDispositionInvalid:${phase}:deferred`)
+      }
+      phase = 'deferred'
+      disposition = 'deferred'
+      dispositionSet = true
+    },
+    markCancelled: (reason) => {
+      if (
+        dispositionSet ||
+        !['admitted', 'quiescing', 'quiesced', 'writing', 'prepared'].includes(phase)
+      ) {
+        throw new Error(`BrowserWorkspaceReplacementDispositionInvalid:${phase}:cancelled`)
+      }
+      phase = 'cancelled'
+      disposition = 'cancelled'
+      dispositionError = reason
+      dispositionSet = true
+    },
     markOutcomeUnknown: (error) => {
       if (dispositionSet || !['writing', 'prepared', 'committing'].includes(phase)) {
         throw new Error(`BrowserWorkspaceReplacementDispositionInvalid:${phase}:unknown`)
@@ -130,7 +174,7 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
       if (!dispositionSet || !disposition) {
         return Promise.reject(new Error(`BrowserWorkspaceReplacementDispositionMissing:${phase}`))
       }
-      if (phase !== 'committed' && phase !== 'uncommitted' && phase !== 'unknown') {
+      if (!['committed', 'uncommitted', 'unknown', 'deferred', 'cancelled'].includes(phase)) {
         return Promise.reject(
           new Error(`BrowserWorkspaceReplacementDispositionInvalid:${phase}:settle-selection`),
         )
@@ -138,10 +182,8 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
       phase = 'selection-settling'
       const settling = Promise.resolve()
         .then(async () => {
-          if (disposition === 'uncommitted' && abandon) {
-            const operation = abandon
-            abandon = null
-            await collectFailure(selectionFailures, operation)
+          if (disposition === 'uncommitted' || disposition === 'cancelled') {
+            await collectFailure(selectionFailures, abandonOnce)
           }
         })
         .then(() => {
@@ -168,6 +210,7 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
         commit,
         originalWorkspace: ports.originalWorkspace,
         initialFailures: selectionFailures,
+        abandon: abandonOnce,
         reopen: ports.reopen,
         publish: ports.publish,
       }).then((outcome) => {
@@ -182,12 +225,13 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
 }
 
 async function finalizeBrowserWorkspaceReplacement<T>(input: {
-  readonly disposition: 'committed' | 'uncommitted' | 'unknown'
+  readonly disposition: 'committed' | 'uncommitted' | 'unknown' | 'deferred' | 'cancelled'
   readonly dispositionError: unknown
   readonly commit: BrowserWorkspaceReplacementCommit<T> | null
   readonly originalWorkspace: BrowserWorkspaceSnapshot
   readonly initialFailures: readonly unknown[]
-  readonly reopen: () => Promise<BrowserWorkspaceSnapshot>
+  readonly abandon: () => Promise<void>
+  readonly reopen: (retained: boolean) => Promise<BrowserWorkspaceReplacementReopenOutcome>
   readonly publish: (commit: BrowserWorkspaceReplacementCommit<T>) => Promise<void> | void
 }): Promise<BrowserWorkspaceReplacementOutcome<T>> {
   const failures: unknown[] = [...input.initialFailures]
@@ -195,42 +239,69 @@ async function finalizeBrowserWorkspaceReplacement<T>(input: {
     failures.push(input.dispositionError)
   } else if (input.disposition === 'unknown') {
     failures.push(input.dispositionError)
-  } else if (!input.commit) {
+  } else if (input.disposition === 'committed' && !input.commit) {
     throw new Error('BrowserWorkspaceReplacementCommittedValueMissing')
-  } else {
+  } else if (input.disposition === 'committed') {
     await collectFailure(failures, () =>
       input.publish(input.commit as BrowserWorkspaceReplacementCommit<T>),
     )
   }
 
-  const reopened = await Promise.resolve()
-    .then(input.reopen)
-    .then(
-      (value) => ({ status: 'fulfilled', value }) as const,
-      (reason: unknown) => ({ status: 'rejected', reason }) as const,
-    )
-  if (reopened.status === 'rejected') {
-    failures.push(reopened.reason)
-  } else if (input.disposition !== 'unknown') {
-    const expected =
-      input.disposition === 'committed'
-        ? (input.commit as BrowserWorkspaceReplacementCommit<T>).workspace
-        : input.originalWorkspace
-    if (!sameWorkspaceSnapshot(reopened.value, expected)) {
-      failures.push(new Error('BrowserWorkspaceReplacementReopenFenceMismatch'))
+  let cancelledReopen: Extract<
+    BrowserWorkspaceReplacementReopenOutcome,
+    { kind: 'cancelled-closed' }
+  > | null = null
+  {
+    const reopened = await Promise.resolve()
+      .then(() => input.reopen(input.disposition === 'deferred'))
+      .then(
+        (value) => ({ status: 'fulfilled', value }) as const,
+        (reason: unknown) => ({ status: 'rejected', reason }) as const,
+      )
+    if (reopened.status === 'rejected') {
+      failures.push(reopened.reason)
+    } else if (reopened.value.kind === 'cancelled-closed') {
+      cancelledReopen = reopened.value
+    } else if (input.disposition !== 'unknown') {
+      const expected =
+        input.disposition === 'committed'
+          ? (input.commit as BrowserWorkspaceReplacementCommit<T>).workspace
+          : input.originalWorkspace
+      if (!sameWorkspaceSnapshot(reopened.value.workspace, expected)) {
+        failures.push(new Error('BrowserWorkspaceReplacementReopenFenceMismatch'))
+      }
     }
+  }
+  if (input.disposition === 'deferred' && (failures.length > 0 || cancelledReopen)) {
+    await collectFailure(failures, input.abandon)
+  }
+  if (input.disposition === 'deferred' || input.disposition === 'cancelled') {
+    if (failures.length > 0) return { kind: 'uncommitted-recovery-required', failures }
+    if (cancelledReopen) {
+      return { kind: 'cancelled', reason: cancelledReopen.reason, readiness: 'closed' }
+    }
+    return input.disposition === 'deferred'
+      ? { kind: 'online-ready' }
+      : {
+          kind: 'cancelled',
+          reason: input.dispositionError,
+          readiness: 'ready',
+        }
   }
   if (input.disposition === 'committed') {
     const committed = input.commit as BrowserWorkspaceReplacementCommit<T>
     return failures.length === 0
-      ? { kind: 'committed-ready', commit: committed }
+      ? { kind: cancelledReopen ? 'committed-closed' : 'committed-ready', commit: committed }
       : { kind: 'committed-recovery-required', commit: committed, failures }
   }
   if (input.disposition === 'unknown') {
     return { kind: 'outcome-unknown', failures }
   }
   return failures.length === 1
-    ? { kind: 'uncommitted-ready', error: input.dispositionError }
+    ? {
+        kind: cancelledReopen ? 'uncommitted-closed' : 'uncommitted-ready',
+        error: input.dispositionError,
+      }
     : { kind: 'uncommitted-recovery-required', failures }
 }
 

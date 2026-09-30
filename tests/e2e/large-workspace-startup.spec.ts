@@ -2,13 +2,14 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { BrowserContext, CDPSession, Page } from '@playwright/test'
-import { chromium, expect, test } from '@playwright/test'
+import { test as base, chromium, expect } from '@playwright/test'
 import { discoverCanonicalPhysicalStorageTableNames } from '../../scripts/audit-storage-ownership-reclamation.mjs'
 import {
   GENERATED_WORKSPACE_ACTIVE_CHAT_ID,
   GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID,
   GENERATED_WORKSPACE_SCALES,
 } from '../../scripts/generated-workspace-fixture.mjs'
+import { installNativeWorkspaceStorageFixture } from '../../scripts/native-workspace-storage-fixture.mjs'
 import {
   armDestinationFrameBudgetRecorder,
   assertDestinationFrameBudget,
@@ -32,7 +33,7 @@ import {
   type GeneratedWorkspaceStateName,
   readReusableGeneratedWorkspaceStateManifest,
 } from './generated-workspace-state'
-import { activeWorkspaceDatabaseName, readMessages, submitPresentationTextDialog } from './helpers'
+import { readMessages, submitPresentationTextDialog } from './helpers'
 
 const ACTIVE_ROUTE = `/#/chat/${GENERATED_WORKSPACE_ACTIVE_CHAT_ID}/message/${GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID}`
 const INITIAL_TRANSCRIPT_FLOOR = 10
@@ -55,7 +56,14 @@ const GENERATED_WORKSPACE_MODEL_ID = 'google/gemini-3.5-flash'
 const BROWSER_WORKSPACE_CONTROL_DATABASE_NAME = 'natter-control'
 const CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES = discoverCanonicalPhysicalStorageTableNames()
 
-test.describe.configure({ mode: 'serial', timeout: 5 * 60_000 })
+const test = base.extend({
+  context: async ({ context }, use) => {
+    await context.addInitScript(installNativeWorkspaceStorageFixture)
+    await use(context)
+  },
+})
+
+test.describe.configure({ mode: 'default', timeout: 5 * 60_000 })
 
 test('foreground fork accounting distinguishes bounded replacement activation', () => {
   const stable = foregroundForkProfileFixture()
@@ -213,62 +221,61 @@ test('foreground recorder preserves native transaction identity across observati
   )
   await page.goto('/control-probe')
   const observations = await page.evaluate(async () => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter-control', 1)
-      request.onupgradeneeded = () => {
-        request.result.createObjectStore('manifests', { keyPath: 'id' })
-        request.result.createObjectStore('compactionStates', { keyPath: 'databaseName' })
-      }
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    const snapshot = () =>
-      (
-        window as typeof window & {
-          __natterStartupScaleProbe: { snapshot(): StartupProbeSnapshot }
+    return globalThis.__natterNativeStorageFixture.offline(
+      {
+        purpose: 'legacy-fixture',
+        databaseName: 'natter-control',
+        version: 1,
+        upgrade: (upgradeDatabase) => {
+          upgradeDatabase.createObjectStore('manifests', { keyPath: 'id' })
+          upgradeDatabase.createObjectStore('compactionStates', { keyPath: 'databaseName' })
+        },
+      },
+      async (database) => {
+        const snapshot = () =>
+          (
+            window as typeof window & {
+              __natterStartupScaleProbe: { snapshot(): StartupProbeSnapshot }
+            }
+          ).__natterStartupScaleProbe.snapshot()
+        const write = (stores: string[], mutate: (transaction: IDBTransaction) => void) => {
+          const transaction = database.transaction(stores, 'readwrite')
+          mutate(transaction)
+          return database.completion(transaction)
         }
-      ).__natterStartupScaleProbe.snapshot()
-    const write = (stores: string[], mutate: (transaction: IDBTransaction) => void) =>
-      new Promise<void>((resolve, reject) => {
-        const transaction = database.transaction(stores, 'readwrite')
-        transaction.oncomplete = () => resolve()
-        transaction.onabort = () => reject(transaction.error)
-        mutate(transaction)
-      })
-    try {
-      await write(['manifests'], (transaction) =>
-        transaction.objectStore('manifests').put({
-          id: 'workspace',
-          activeDatabaseName: 'natter-workspace-b',
-        }),
-      )
-      const before = snapshot()
-      await write(['compactionStates'], (transaction) =>
-        transaction.objectStore('compactionStates').put({
-          databaseName: 'natter-workspace-b',
-        }),
-      )
-      await write(['compactionStates'], (transaction) =>
-        transaction.objectStore('compactionStates').delete('natter-workspace-a'),
-      )
-      const activation = write(['compactionStates', 'manifests'], (transaction) => {
-        transaction.objectStore('manifests').put({
-          id: 'workspace',
-          activeDatabaseName: 'natter',
-          pending: { phase: 'cleanup' },
+
+        await write(['manifests'], (transaction) =>
+          transaction.objectStore('manifests').put({
+            id: 'workspace',
+            activeDatabaseName: 'natter-workspace-b',
+          }),
+        )
+        const before = snapshot()
+        await write(['compactionStates'], (transaction) =>
+          transaction.objectStore('compactionStates').put({
+            databaseName: 'natter-workspace-b',
+          }),
+        )
+        await write(['compactionStates'], (transaction) =>
+          transaction.objectStore('compactionStates').delete('natter-workspace-a'),
+        )
+        const activation = write(['compactionStates', 'manifests'], (transaction) => {
+          transaction.objectStore('manifests').put({
+            id: 'workspace',
+            activeDatabaseName: 'natter',
+            pending: { phase: 'cleanup' },
+          })
+          transaction.objectStore('compactionStates').put({ databaseName: 'natter' })
         })
-        transaction.objectStore('compactionStates').put({ databaseName: 'natter' })
-      })
-      const pending = snapshot()
-      await activation
-      const committed = snapshot()
-      await write(['compactionStates'], (transaction) =>
-        transaction.objectStore('compactionStates').delete('natter-workspace-b'),
-      )
-      return { before, pending, committed, after: snapshot() }
-    } finally {
-      database.close()
-    }
+        const pending = snapshot()
+        await activation
+        const committed = snapshot()
+        await write(['compactionStates'], (transaction) =>
+          transaction.objectStore('compactionStates').delete('natter-workspace-b'),
+        )
+        return { before, pending, committed, after: snapshot() }
+      },
+    )
   })
   expect(
     observations.pending.controlMutations.filter((mutation) => mutation.outcome === 'pending'),
@@ -644,6 +651,7 @@ async function profileFreshWorkspace(baseURL: string): Promise<FreshStartupProfi
     const diagnostics = collectUnexpectedDiagnostics(context)
     await installProviderCatalogFixture(context)
     await installStartupProbe(context, { kind: 'empty' })
+    await context.addInitScript(installNativeWorkspaceStorageFixture)
     const page = context.pages()[0] ?? (await context.newPage())
     const cdp = await context.newCDPSession(page)
     await page.goto(new URL('/#/new', baseURL).href, {
@@ -688,6 +696,7 @@ async function profileCachedWorkspace(
     const browserLaunchMs = performance.now() - browserLaunchStartedAt
     const diagnostics = collectUnexpectedDiagnostics(context)
     await installProviderCatalogFixture(context)
+    await context.addInitScript(installNativeWorkspaceStorageFixture)
     const page = context.pages()[0] ?? (await context.newPage())
     const profile = await profileStartup(
       context,
@@ -757,6 +766,7 @@ async function profileActiveStreamReload(baseURL: string, name: GeneratedWorkspa
     const diagnostics = collectUnexpectedDiagnostics(context)
     await installProviderCatalogFixture(context)
     await installStartupProbe(context)
+    await context.addInitScript(installNativeWorkspaceStorageFixture)
     const page = context.pages()[0] ?? (await context.newPage())
     await page.goto(new URL(ACTIVE_ROUTE, baseURL).href, {
       waitUntil: 'domcontentloaded',
@@ -856,47 +866,28 @@ async function profileActiveStreamReload(baseURL: string, name: GeneratedWorkspa
 }
 
 async function retargetGeneratedActiveProfile(page: Page, providerBaseUrl: string): Promise<void> {
-  const databaseName = await activeWorkspaceDatabaseName(page)
   await page.evaluate(
-    async ({ chatId, databaseName, providerBaseUrl }) => {
-      const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      const requestResult = <T>(request: IDBRequest<T>) =>
-        new Promise<T>((resolve, reject) => {
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-      try {
-        const transaction = database.transaction(['chats', 'profiles'], 'readwrite')
-        const chat = (await requestResult(transaction.objectStore('chats').get(chatId))) as
-          | { settings?: { profileId?: unknown } }
-          | undefined
-        if (!chat) throw new Error('GeneratedActiveChatMissing')
-        const profileId = chat.settings?.profileId
-        if (typeof profileId !== 'string') throw new Error('GeneratedActiveProfileIdMissing')
-        const profiles = transaction.objectStore('profiles')
-        const profile = (await requestResult(profiles.get(profileId))) as
-          | Record<string, unknown>
-          | undefined
-        if (!profile) throw new Error('GeneratedActiveProfileMissing')
-        await requestResult(profiles.put({ ...profile, baseUrl: providerBaseUrl }))
-        await new Promise<void>((resolve, reject) => {
-          transaction.oncomplete = () => resolve()
-          transaction.onabort = () => reject(transaction.error)
-          transaction.onerror = () => reject(transaction.error)
-        })
-      } finally {
-        database.close()
-      }
+    async ({ chatId, providerBaseUrl }) => {
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'fault-injection' },
+        async (database, requestResult) => {
+          const transaction = database.transaction(['chats', 'profiles'], 'readwrite')
+          const chat = (await requestResult(transaction.objectStore('chats').get(chatId))) as
+            | { settings?: { profileId?: unknown } }
+            | undefined
+          if (!chat) throw new Error('GeneratedActiveChatMissing')
+          const profileId = chat.settings?.profileId
+          if (typeof profileId !== 'string') throw new Error('GeneratedActiveProfileIdMissing')
+          const profiles = transaction.objectStore('profiles')
+          const profile = (await requestResult(profiles.get(profileId))) as
+            | Record<string, unknown>
+            | undefined
+          if (!profile) throw new Error('GeneratedActiveProfileMissing')
+          await requestResult(profiles.put({ ...profile, baseUrl: providerBaseUrl }))
+        },
+      )
     },
-    {
-      chatId: GENERATED_WORKSPACE_ACTIVE_CHAT_ID,
-      databaseName,
-      providerBaseUrl,
-    },
+    { chatId: GENERATED_WORKSPACE_ACTIVE_CHAT_ID, providerBaseUrl },
   )
 }
 

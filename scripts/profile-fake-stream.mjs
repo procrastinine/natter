@@ -1,6 +1,6 @@
 import { chromium } from '@playwright/test'
+import { installNativeWorkspaceStorageFixture } from './native-workspace-storage-fixture.mjs'
 import {
-  activeWorkspaceDatabaseName,
   assertLoopbackUrl,
   createProviderScenario,
   installProfileDurableReasoningObserver,
@@ -44,7 +44,6 @@ let scenario
 let browser
 let page
 let client
-let workspaceDatabaseName
 
 try {
   provider = await startFakeProvider({
@@ -57,6 +56,7 @@ try {
     args: ['--js-flags=--expose-gc'],
   })
   page = await browser.newPage()
+  await page.addInitScript(installNativeWorkspaceStorageFixture)
   await page.addInitScript(installProfileIdbActivityProbe)
   await page.addInitScript(installProfileDurableReasoningObserver)
   page.setDefaultTimeout(options.timeoutMs)
@@ -67,7 +67,6 @@ try {
     appUrl: options.url,
     providerBaseUrl: scenario.providerBaseUrl,
   })
-  workspaceDatabaseName = await activeWorkspaceDatabaseName(page)
   await waitForProfileIdbIdle()
 
   const samples = [await heap({ kind: 'fresh' })]
@@ -438,9 +437,7 @@ function profiledStoreState(phase, state) {
 }
 
 async function collectRuntimeEvidence() {
-  const databaseName = workspaceDatabaseName
-  if (!databaseName) throw new Error('profile workspace database identity is unavailable')
-  return page.evaluate(async (databaseName) => {
+  return page.evaluate(async () => {
     const idb = globalThis.__natterProfileIdbActivity
     if (!idb) throw new Error('profile IndexedDB activity probe is unavailable')
     const textLength = (content) =>
@@ -454,62 +451,55 @@ async function collectRuntimeEvidence() {
     if (typeof durableReasoningText !== 'function') {
       throw new Error('profile durable reasoning observer is unavailable')
     }
-    const db = await idb.openDatabase(databaseName)
-    try {
-      const transaction = db.transaction(
-        ['messages', 'messageBodies', 'streamLeases', 'streamChunks'],
-        'readonly',
-      )
-      const [messages, bodies, leases, chunkCount] = await idb.transactionResult(
-        transaction,
-        Promise.all([
-          idb.requestResult(transaction.objectStore('messages').getAll()),
-          idb.requestResult(transaction.objectStore('messageBodies').getAll()),
-          idb.requestResult(transaction.objectStore('streamLeases').getAll()),
-          idb.requestResult(transaction.objectStore('streamChunks').count()),
-        ]),
-      )
-      const bodyById = new Map(bodies.map((body) => [body.id, body]))
-      const active = messages.filter((message) => message.generation?.status === 'streaming')
-      const activeChatId = /^#\/chat\/([^/]+)/u.exec(location.hash)?.[1] ?? null
-      return {
-        chatStore: { chatCursorCount: null, cursorEntryCount: null },
-        streamStore: {
-          activeCount: active.length,
-          activeTargets: active.map((message) => ({
-            chatId: message.chatId,
-            messageId: message.id,
-          })),
-          liveSnapshotCount: leases.length,
-          liveTextLength: active.reduce(
-            (sum, message) => sum + textLength(bodyById.get(message.id)?.content),
-            0,
-          ),
-          liveReasoningLength: active.reduce(
-            (sum, message) => sum + durableReasoningText(bodyById.get(message.id)).length,
-            0,
-          ),
-          liveSetCount: null,
-          liveClearCount: null,
-          maxLiveTextLength: null,
-          maxLiveReasoningLength: null,
-          streamChunkCount: chunkCount,
-        },
-        uiStore: { activeChatId },
-      }
-    } finally {
-      db.close()
-    }
-  }, databaseName)
+    return globalThis.__natterNativeStorageFixture.active(
+      { purpose: 'read-only-assertion' },
+      async (db, requestResult) => {
+        const transaction = db.transaction(
+          ['messages', 'messageBodies', 'streamLeases', 'streamChunks'],
+          'readonly',
+        )
+        const [messages, bodies, leases, chunkCount] = await Promise.all([
+          requestResult(transaction.objectStore('messages').getAll()),
+          requestResult(transaction.objectStore('messageBodies').getAll()),
+          requestResult(transaction.objectStore('streamLeases').getAll()),
+          requestResult(transaction.objectStore('streamChunks').count()),
+        ])
+        const bodyById = new Map(bodies.map((body) => [body.id, body]))
+        const active = messages.filter((message) => message.generation?.status === 'streaming')
+        const activeChatId = /^#\/chat\/([^/]+)/u.exec(location.hash)?.[1] ?? null
+        return {
+          chatStore: { chatCursorCount: null, cursorEntryCount: null },
+          streamStore: {
+            activeCount: active.length,
+            activeTargets: active.map((message) => ({
+              chatId: message.chatId,
+              messageId: message.id,
+            })),
+            liveSnapshotCount: leases.length,
+            liveTextLength: active.reduce(
+              (sum, message) => sum + textLength(bodyById.get(message.id)?.content),
+              0,
+            ),
+            liveReasoningLength: active.reduce(
+              (sum, message) => sum + durableReasoningText(bodyById.get(message.id)).length,
+              0,
+            ),
+            liveSetCount: null,
+            liveClearCount: null,
+            maxLiveTextLength: null,
+            maxLiveReasoningLength: null,
+            streamChunkCount: chunkCount,
+          },
+          uiStore: { activeChatId },
+        }
+      },
+    )
+  })
 }
 
 async function collectStoreState(chatId) {
-  const databaseName = workspaceDatabaseName
-  if (!databaseName) throw new Error('profile workspace database identity is unavailable')
   return page.evaluate(
-    async ({ databaseName, id }) => {
-      const idb = globalThis.__natterProfileIdbActivity
-      if (!idb) throw new Error('profile IndexedDB activity probe is unavailable')
+    async ({ id }) => {
       const list = document.querySelector('[data-ui="message-list"]')
       const tree = document.querySelector('[data-ui="branch-tree-view"]')
       const scrollRegion = document.querySelector('[data-ui="scroll-region"]')
@@ -561,81 +551,74 @@ async function collectStoreState(chatId) {
       const treeInspectorTextChars =
         document.querySelector('[data-ui="branch-tree-inspector-content"]')?.textContent?.length ??
         0
-      const db = await idb.openDatabase(databaseName)
-      try {
-        const transaction = db.transaction(
-          ['messages', 'messageBodies', 'streamChunks'],
-          'readonly',
-        )
-        const counts = Object.fromEntries(
-          await idb.transactionResult(
-            transaction,
-            Promise.all(
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, requestResult) => {
+          const transaction = db.transaction(
+            ['messages', 'messageBodies', 'streamChunks'],
+            'readonly',
+          )
+          const counts = Object.fromEntries(
+            await Promise.all(
               ['messages', 'messageBodies', 'streamChunks'].map(async (name) => [
                 name,
-                await idb.requestResult(transaction.objectStore(name).count()),
+                await requestResult(transaction.objectStore(name).count()),
               ]),
             ),
-          ),
-        )
-        return {
-          chatId: id,
-          url: location.href,
-          mountedMessages,
-          mountedMessageIds: mountedMessageNodes.map((node) =>
-            node.getAttribute('data-message-id'),
-          ),
-          mountedIndices: [...document.querySelectorAll('[data-ui="message-virtual-row"]')].map(
-            (node) => Number(node.getAttribute('data-index') ?? -1),
-          ),
-          mountedRows,
-          scrollRegion: scrollRegionRect
-            ? {
-                top: scrollRegionRect.top,
-                bottom: scrollRegionRect.bottom,
-                height: scrollRegionRect.height,
-                scrollTop: scrollRegion?.scrollTop ?? 0,
-                scrollHeight: scrollRegion?.scrollHeight ?? 0,
-              }
-            : null,
-          loadedMessages: Number(list?.getAttribute('data-rendered-count') ?? 0),
-          generationContinuityCount: Number(
-            list?.getAttribute('data-generation-continuity-count') ?? 0,
-          ),
-          userScrollRevision: Number(list?.getAttribute('data-user-scroll-revision') ?? 0),
-          capturedUserScrollRevision: Number(
-            list?.getAttribute('data-generation-captured-user-scroll-revision') ?? -1,
-          ),
-          layoutAnchorId: list?.getAttribute('data-layout-anchor-id') ?? null,
-          historyDemandAnchorId: list?.getAttribute('data-history-demand-anchor-id') ?? null,
-          virtualized: list?.getAttribute('data-virtualized') === 'true',
-          initialRenderWork: Number(list?.getAttribute('data-initial-render-work') ?? 0),
-          totalMessages: Number(list?.getAttribute('data-total-count') ?? 0),
-          assistantTextLengths,
-          transcriptVisible: isVisible(list),
-          treeVisible: isVisible(tree),
-          treeNodeCount: document.querySelectorAll('[data-ui="branch-tree-node"]').length,
-          treePreviewTextChars,
-          treeInspectorTextChars,
-          markdownOverflows,
-          markdownSegments,
-          counts,
-        }
-      } finally {
-        db.close()
-      }
+          )
+          return {
+            chatId: id,
+            url: location.href,
+            mountedMessages,
+            mountedMessageIds: mountedMessageNodes.map((node) =>
+              node.getAttribute('data-message-id'),
+            ),
+            mountedIndices: [...document.querySelectorAll('[data-ui="message-virtual-row"]')].map(
+              (node) => Number(node.getAttribute('data-index') ?? -1),
+            ),
+            mountedRows,
+            scrollRegion: scrollRegionRect
+              ? {
+                  top: scrollRegionRect.top,
+                  bottom: scrollRegionRect.bottom,
+                  height: scrollRegionRect.height,
+                  scrollTop: scrollRegion?.scrollTop ?? 0,
+                  scrollHeight: scrollRegion?.scrollHeight ?? 0,
+                }
+              : null,
+            loadedMessages: Number(list?.getAttribute('data-rendered-count') ?? 0),
+            generationContinuityCount: Number(
+              list?.getAttribute('data-generation-continuity-count') ?? 0,
+            ),
+            userScrollRevision: Number(list?.getAttribute('data-user-scroll-revision') ?? 0),
+            capturedUserScrollRevision: Number(
+              list?.getAttribute('data-generation-captured-user-scroll-revision') ?? -1,
+            ),
+            layoutAnchorId: list?.getAttribute('data-layout-anchor-id') ?? null,
+            historyDemandAnchorId: list?.getAttribute('data-history-demand-anchor-id') ?? null,
+            virtualized: list?.getAttribute('data-virtualized') === 'true',
+            initialRenderWork: Number(list?.getAttribute('data-initial-render-work') ?? 0),
+            totalMessages: Number(list?.getAttribute('data-total-count') ?? 0),
+            assistantTextLengths,
+            transcriptVisible: isVisible(list),
+            treeVisible: isVisible(tree),
+            treeNodeCount: document.querySelectorAll('[data-ui="branch-tree-node"]').length,
+            treePreviewTextChars,
+            treeInspectorTextChars,
+            markdownOverflows,
+            markdownSegments,
+            counts,
+          }
+        },
+      )
     },
-    { databaseName, id: chatId },
+    { id: chatId },
   )
 }
 
 async function readAssistantLengths(messageId) {
-  const databaseName = workspaceDatabaseName
-  if (!databaseName) throw new Error('profile workspace database identity is unavailable')
   return page.evaluate(
-    async ({ databaseName, id }) => {
-      const idb = globalThis.__natterProfileIdbActivity
-      if (!idb) throw new Error('profile IndexedDB activity probe is unavailable')
+    async ({ id }) => {
       const textLength = (content) =>
         Array.isArray(content)
           ? content.reduce(
@@ -647,22 +630,19 @@ async function readAssistantLengths(messageId) {
       if (typeof durableReasoningText !== 'function') {
         throw new Error('profile durable reasoning observer is unavailable')
       }
-      const db = await idb.openDatabase(databaseName)
-      try {
-        const transaction = db.transaction('messageBodies', 'readonly')
-        const body = await idb.transactionResult(
-          transaction,
-          idb.requestResult(transaction.objectStore('messageBodies').get(id)),
-        )
-        return {
-          text: textLength(body?.content),
-          reasoning: durableReasoningText(body).length,
-        }
-      } finally {
-        db.close()
-      }
+      return globalThis.__natterNativeStorageFixture.active(
+        { purpose: 'read-only-assertion' },
+        async (db, requestResult) => {
+          const transaction = db.transaction('messageBodies', 'readonly')
+          const body = await requestResult(transaction.objectStore('messageBodies').get(id))
+          return {
+            text: textLength(body?.content),
+            reasoning: durableReasoningText(body).length,
+          }
+        },
+      )
     },
-    { databaseName, id: messageId },
+    { id: messageId },
   )
 }
 
@@ -716,73 +696,8 @@ function installProfileIdbActivityProbe() {
     for (const resolve of [...idleWaiters]) resolve()
     idleWaiters.clear()
   }
-  const openDatabase = (name) =>
-    new Promise((resolve, reject) => {
-      const request = indexedDB.open(name)
-      const clear = () => {
-        request.onsuccess = null
-        request.onerror = null
-      }
-      request.onsuccess = () => {
-        const database = request.result
-        clear()
-        resolve(database)
-      }
-      request.onerror = () => {
-        const error = request.error
-        clear()
-        reject(error)
-      }
-    })
-  const requestResult = (request) =>
-    new Promise((resolve, reject) => {
-      const clear = () => {
-        request.onsuccess = null
-        request.onerror = null
-      }
-      request.onsuccess = () => {
-        const result = request.result
-        clear()
-        resolve(result)
-      }
-      request.onerror = () => {
-        const error = request.error
-        clear()
-        reject(error)
-      }
-    })
-  const transactionResult = async (transaction, result) => {
-    const terminal = new Promise((resolve, reject) => {
-      const clear = () => {
-        transaction.removeEventListener('complete', complete)
-        transaction.removeEventListener('abort', abort)
-      }
-      const complete = () => {
-        clear()
-        resolve()
-      }
-      const abort = () => {
-        const error = transaction.error
-        clear()
-        reject(error)
-      }
-      transaction.addEventListener('complete', complete)
-      transaction.addEventListener('abort', abort)
-    })
-    try {
-      const value = await result
-      await terminal
-      return value
-    } catch (error) {
-      await terminal.catch(() => undefined)
-      throw error
-    }
-  }
   const tracker = Object.freeze({
-    openDatabase,
-    requestResult,
     snapshot: () => Object.freeze({ active: active.size, revision }),
-    transactionResult,
     whenIdle: () =>
       active.size === 0
         ? Promise.resolve()

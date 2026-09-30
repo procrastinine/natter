@@ -1025,16 +1025,23 @@ export interface PendingConfigurationAcknowledgement
   >[]
 }
 
+export interface GenerationDiscoveryEvidence {
+  readonly endpoints?: CachedEndpointsRow
+  readonly privacy?: CachedPrivacyPolicyRow
+}
+
 export type PrepareAttemptConfigurationIntent =
   | {
       readonly kind: 'captured'
       readonly preferredDispatchKeyId: KeyId | null
+      readonly discovery?: GenerationDiscoveryEvidence
       readonly settings: ChatSettings
       readonly expectedConfigurationVersion: number
     }
   | {
       readonly kind: 'transaction-current'
       readonly preferredDispatchKeyId: KeyId | null
+      readonly discovery?: GenerationDiscoveryEvidence
     }
 
 export interface PrepareAttemptPlacementIntent {

@@ -154,10 +154,10 @@ function routeForegroundEffectMatches(
   chatId: ChatId | null | undefined,
 ): boolean {
   if (window.location.hash !== demand.expectedHash) return false
-  if (demand.expectedHash === renderedHref) return true
-  if (!chatId) return false
   const expected = parseRoute(demand.expectedHash)
   const rendered = parseRoute(renderedHref)
+  if (routeToHref(expected) === routeToHref(rendered)) return true
+  if (!chatId) return false
   return (
     expected.kind === 'chat' &&
     rendered.kind === 'chat' &&
@@ -500,7 +500,8 @@ let hashListenerInstalled = false
 
 function ensureHashListener(): void {
   if (typeof window === 'undefined') return
-  if (!hashListenerInstalled) {
+  const initializing = !hashListenerInstalled
+  if (initializing) {
     hashListenerInstalled = true
     window.addEventListener('hashchange', reconcileRouteSnapshotWithAddress)
     window.addEventListener('pageshow', reconcileRouteSnapshotWithAddress)
@@ -509,7 +510,9 @@ function ensureHashListener(): void {
     })
   }
   reconcileRouteSnapshotWithAddress()
-  if (!currentRouteForegroundDemand) claimRouteForegroundDemand(window.location.hash)
+  if (initializing && !currentRouteForegroundDemand) {
+    claimRouteForegroundDemand(window.location.hash)
+  }
 }
 
 function reconcileRouteSnapshotWithAddress(): void {

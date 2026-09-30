@@ -1,6 +1,7 @@
 import Dexie from 'dexie'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { MutationScope } from '../../src/core/types'
+import { raceWithAbortSignal } from '../../src/lib/abort'
 import { BROWSER_WRITER_LOCK_NAME, type BrowserLockRow } from '../../src/store/browser-lock-record'
 import { createDbForTests } from '../../src/store/db'
 import {
@@ -26,6 +27,7 @@ import {
   withTrackedScopes,
 } from '../../src/store/locks'
 import { resumeLocalTransactionAdmissions } from '../../src/store/transaction-activity'
+import { TestWebLockManager } from '../helpers/web-locks'
 
 beforeAll(() => {
   resumeLocalTransactionAdmissions()
@@ -196,7 +198,101 @@ async function lockDatabases() {
   }
 }
 
+describe('abort composition', () => {
+  it.each([new DOMException('caller cancelled', 'AbortError'), { caller: 'test' }, null])(
+    'preserves exact cancellation and operation failure identity: %s',
+    async (reason: unknown) => {
+      const controller = new AbortController()
+      const fail = () => {
+        throw reason
+      }
+      await expect(raceWithAbortSignal(fail)).rejects.toBe(reason)
+      await expect(raceWithAbortSignal(fail, controller.signal)).rejects.toBe(reason)
+      await expect(
+        raceWithAbortSignal(() => Promise.reject(reason), controller.signal),
+      ).rejects.toBe(reason)
+      const pending = deferred()
+      const running = raceWithAbortSignal(() => pending.promise, controller.signal)
+      controller.abort(reason)
+      await expect(running).rejects.toBe(reason)
+      pending.resolve()
+      const start = vi.fn()
+      await expect(raceWithAbortSignal(start, controller.signal)).rejects.toBe(reason)
+      await expect(
+        withCoordinationLock('already-aborted', start, { signal: controller.signal }),
+      ).rejects.toBe(reason)
+      expect(start).not.toHaveBeenCalled()
+    },
+  )
+})
+
 describe('IndexedDB fallback fencing', () => {
+  it.each([new DOMException('pending caller cancelled', 'AbortError'), { caller: 'test' }, null])(
+    'retains the exact abort when coordination disposal wins pending admission: %s',
+    async (reason: unknown) => {
+      const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
+      Reflect.deleteProperty(navigator, 'locks')
+      const databases = await lockDatabases()
+      const controller = new AbortController()
+      const operation = vi.fn()
+      try {
+        const waiting = withCoordinationLock('cancel-pending', operation, {
+          database: databases.left,
+          signal: controller.signal,
+        })
+        controller.abort(reason)
+        await expect(waiting).rejects.toBe(reason)
+        await awaitLockRuntimeIdle()
+        expect(operation).not.toHaveBeenCalled()
+        expect(
+          await databases.left.browserLocks.get(coordinationLockName('cancel-pending')),
+        ).toBeUndefined()
+      } finally {
+        await databases.close()
+        if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks)
+      }
+    },
+  )
+
+  it('rejects a falsy abort reason while waiting for another fallback lease to expire', async () => {
+    const databases = await lockDatabases()
+    const controller = new AbortController()
+    const waitingForLease = deferred()
+    const setTimer = globalThis.setTimeout
+    const timer = vi
+      .spyOn(globalThis, 'setTimeout')
+      .mockImplementation((callback, delay, ...args: unknown[]) => {
+        const handle = setTimer(callback, delay, ...args)
+        if (delay === 12_345) waitingForLease.resolve()
+        return handle
+      })
+    const backend = createIndexedDbLockBackend({
+      openDatabase: async () => databases.right,
+      now: () => 0,
+    })
+    const operation = vi.fn()
+    try {
+      await databases.left.browserLocks.put({
+        name: BROWSER_WRITER_LOCK_NAME,
+        ownerClientId: 'other-owner',
+        leaseId: 'other-lease',
+        fencingToken: 1,
+        acquiredAt: 0,
+        heartbeatAt: 0,
+        expiresAt: 12_345,
+      })
+      const waiting = backend.run(['message:waiting'], operation, { signal: controller.signal })
+      await waitingForLease.promise
+      controller.abort(null)
+      await expect(waiting).rejects.toBeNull()
+      expect(operation).not.toHaveBeenCalled()
+    } finally {
+      timer.mockRestore()
+      await backend.disposeAndDrain?.()
+      await databases.close()
+    }
+  })
+
   it('physically releases an admitted coordination lease after its owner aborts', async () => {
     __resetLockTrackerForTests({ admissionsOpen: true })
     const databases = await lockDatabases()
@@ -827,89 +923,165 @@ describe('IndexedDB fallback fencing', () => {
   })
 })
 
-class WorkspaceGateLockManager {
-  private readonly held = new Map<string, Set<Lock>>()
-  private readonly queues = new Map<string, Array<{ mode: LockMode; run(): void }>>()
+describe('shared Web Locks fixture contract', () => {
+  it.each([
+    { heldMode: 'shared', requestedMode: 'shared', available: true },
+    { heldMode: 'shared', requestedMode: 'exclusive', available: false },
+    { heldMode: 'exclusive', requestedMode: 'shared', available: false },
+    { heldMode: 'exclusive', requestedMode: 'exclusive', available: false },
+  ] as const)(
+    'settles ifAvailable $requestedMode against $heldMode without waiting',
+    async ({ heldMode, requestedMode, available }) => {
+      const manager = new TestWebLockManager()
+      const entered = deferred()
+      const release = deferred()
+      const ownerCallback = vi.fn(async () => {
+        entered.resolve()
+        await release.promise
+      })
+      const owner = manager.request('resource', { mode: heldMode }, ownerCallback)
+      expect(ownerCallback).not.toHaveBeenCalled()
+      await entered.promise
+      try {
+        await expect(
+          manager.request('resource', { mode: requestedMode, ifAvailable: true }, (lock) =>
+            lock ? lock.mode : null,
+          ),
+        ).resolves.toBe(available ? requestedMode : null)
+        expect((await manager.query()).pending).toEqual([])
+        expect(manager.attempts.get('resource')).toBe(2)
+      } finally {
+        release.resolve()
+        await owner
+      }
+      expect(await manager.query()).toEqual({ held: [], pending: [] })
+    },
+  )
 
-  async query(): Promise<LockManagerSnapshot> {
-    return {
-      held: [...this.held.values()].flatMap((locks) => [...locks]),
-      pending: [...this.queues].flatMap(([name, requests]) =>
-        requests.map(({ mode }) => ({ name, mode })),
+  it('rejects ifAvailable combined with a signal without creating a request', async () => {
+    const manager = new TestWebLockManager()
+    const callback = vi.fn()
+    await expect(
+      manager.request(
+        'resource',
+        { ifAvailable: true, signal: new AbortController().signal },
+        callback,
       ),
-    }
-  }
+    ).rejects.toMatchObject({ name: 'NotSupportedError' })
+    expect(callback).not.toHaveBeenCalled()
+    expect(await manager.query()).toEqual({ held: [], pending: [] })
+    expect(manager.attempts.size).toBe(0)
+  })
 
-  request<T>(
-    name: string,
-    optionsOrCallback: LockOptions | ((lock: Lock | null) => T | PromiseLike<T>),
-    maybeCallback?: (lock: Lock | null) => T | PromiseLike<T>,
-  ): Promise<T> {
-    const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
-    const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback
-    if (!callback) throw new Error('LockCallbackMissing')
-    if (options.signal?.aborted) return Promise.reject(options.signal.reason)
-    return new Promise<T>((resolve, reject) => {
-      const queue = this.queues.get(name) ?? []
-      this.queues.set(name, queue)
-      const request = {
-        mode: options.mode ?? 'exclusive',
-        run: () => {
-          options.signal?.removeEventListener('abort', abort)
-          const lock = { name, mode: request.mode } as Lock
-          const held = this.held.get(name) ?? new Set<Lock>()
-          this.held.set(name, held)
-          held.add(lock)
-          const release = () => {
-            held.delete(lock)
-            if (held.size === 0) this.held.delete(name)
-            this.drain(name)
-          }
-          void Promise.resolve()
-            .then(() => callback(lock))
-            .then(
-              (value) => {
-                release()
-                resolve(value)
-              },
-              (error) => {
-                release()
-                reject(error)
-              },
-            )
-        },
-      }
-      const abort = () => {
-        const index = queue.indexOf(request)
-        if (index >= 0) queue.splice(index, 1)
-        reject(options.signal?.reason)
-        this.drain(name)
-      }
-      options.signal?.addEventListener('abort', abort, { once: true })
-      queue.push(request)
-      this.drain(name)
+  it('keeps a queued exclusive ahead of later shared requests and rejects opportunistic bypass', async () => {
+    const manager = new TestWebLockManager()
+    const firstEntered = deferred()
+    const releaseFirst = deferred()
+    const writerEntered = deferred()
+    const releaseWriter = deferred()
+    const first = manager.request('resource', { mode: 'shared' }, async () => {
+      firstEntered.resolve()
+      await releaseFirst.promise
     })
-  }
-
-  private drain(name: string): void {
-    const queue = this.queues.get(name)
-    const held = this.held.get(name)
-    if ([...(held ?? [])].some((lock) => lock.mode === 'exclusive')) return
-    while (queue?.length) {
-      if (queue[0]?.mode === 'exclusive') {
-        if ((this.held.get(name)?.size ?? 0) === 0) queue.shift()?.run()
-        break
-      }
-      queue.shift()?.run()
+    await firstEntered.promise
+    const writer = manager.request('resource', async () => {
+      writerEntered.resolve()
+      await releaseWriter.promise
+    })
+    const laterCallback = vi.fn(() => 'later')
+    const later = manager.request('resource', { mode: 'shared' }, laterCallback)
+    try {
+      await expect(
+        manager.request('resource', { mode: 'shared', ifAvailable: true }, (lock) => lock),
+      ).resolves.toBeNull()
+      expect((await manager.query()).pending).toEqual([
+        { name: 'resource', mode: 'exclusive' },
+        { name: 'resource', mode: 'shared' },
+      ])
+      releaseFirst.resolve()
+      await writerEntered.promise
+      expect(laterCallback).not.toHaveBeenCalled()
+      releaseWriter.resolve()
+      await expect(later).resolves.toBe('later')
+    } finally {
+      releaseFirst.resolve()
+      releaseWriter.resolve()
+      await Promise.all([first, writer, later])
     }
-    if (queue?.length === 0) this.queues.delete(name)
-  }
-}
+    expect(await manager.query()).toEqual({ held: [], pending: [] })
+  })
+
+  it.each([
+    { name: 'DOMException', reason: () => new DOMException('cancelled', 'AbortError') },
+    { name: 'object', reason: () => ({ cancelled: true }) },
+    { name: 'null', reason: () => null },
+  ])('removes a queued request with its exact $name reason', async ({ reason }) => {
+    const manager = new TestWebLockManager()
+    const entered = deferred()
+    const release = deferred()
+    const owner = manager.request('resource', async () => {
+      entered.resolve()
+      await release.promise
+    })
+    await entered.promise
+    const controller = new AbortController()
+    const callback = vi.fn()
+    const waiting = manager.request('resource', { signal: controller.signal }, callback)
+    const rejection = reason()
+    const rejected = expect(waiting).rejects.toBe(rejection)
+    const successor = manager.request('resource', () => 'successor')
+    controller.abort(rejection)
+    try {
+      await rejected
+      expect(callback).not.toHaveBeenCalled()
+      expect((await manager.query()).pending).toEqual([{ name: 'resource', mode: 'exclusive' }])
+      release.resolve()
+      await expect(successor).resolves.toBe('successor')
+    } finally {
+      release.resolve()
+      await Promise.all([owner, successor])
+    }
+    expect(await manager.query()).toEqual({ held: [], pending: [] })
+  })
+
+  it('owns cancellation only until grant and releases exact callback rejection before the next owner', async () => {
+    const manager = new TestWebLockManager()
+    const cancelled = new AbortController()
+    const beforeGrant = { cancelled: 'before grant' }
+    const skipped = vi.fn()
+    const early = manager.request('resource', { signal: cancelled.signal }, skipped)
+    const earlyRejection = expect(early).rejects.toBe(beforeGrant)
+    cancelled.abort(beforeGrant)
+    await earlyRejection
+    expect(skipped).not.toHaveBeenCalled()
+
+    const entered = deferred()
+    const release = deferred()
+    const controller = new AbortController()
+    const failure = new DOMException('callback failed', 'InvalidStateError')
+    const owner = manager.request('resource', { signal: controller.signal }, async () => {
+      entered.resolve()
+      await release.promise
+      throw failure
+    })
+    const rejected = expect(owner).rejects.toBe(failure)
+    await entered.promise
+    const successorCallback = vi.fn(() => 'next')
+    const successor = manager.request('resource', successorCallback)
+    controller.abort({ cancelled: 'after grant' })
+    expect((await manager.query()).held).toEqual([{ name: 'resource', mode: 'exclusive' }])
+    expect(successorCallback).not.toHaveBeenCalled()
+    release.resolve()
+    await rejected
+    await expect(successor).resolves.toBe('next')
+    expect(await manager.query()).toEqual({ held: [], pending: [] })
+  })
+})
 
 describe('Web Locks workspace gate', () => {
   it('lets ordinary mutations share the gate and makes replacement exclusive', async () => {
     const original = Object.getOwnPropertyDescriptor(navigator, 'locks')
-    const manager = new WorkspaceGateLockManager()
+    const manager = new TestWebLockManager()
     Object.defineProperty(navigator, 'locks', { configurable: true, value: manager })
     __resetLockTrackerForTests({ admissionsOpen: true })
     const releaseOrdinary = deferred()
@@ -941,9 +1113,9 @@ describe('Web Locks workspace gate', () => {
 })
 
 describe('generation lifetime admission', () => {
-  async function withManager(run: (manager: WorkspaceGateLockManager) => Promise<void>) {
+  async function withManager(run: (manager: TestWebLockManager) => Promise<void>) {
     const original = Object.getOwnPropertyDescriptor(navigator, 'locks')
-    const manager = new WorkspaceGateLockManager()
+    const manager = new TestWebLockManager()
     Object.defineProperty(navigator, 'locks', { configurable: true, value: manager })
     try {
       await run(manager)

@@ -7,7 +7,7 @@ import {
   verificationDependencyRecipeInputPaths,
 } from './verification-dependency-image.mjs'
 
-export const VERIFICATION_OBLIGATION_SCHEMA_VERSION = 2
+export const VERIFICATION_OBLIGATION_SCHEMA_VERSION = 3
 
 const CONVERSATION_VIEWPORT_BROWSER_FILES = Object.freeze([
   'tests/e2e/branch-tree-streaming.spec.ts',
@@ -64,19 +64,13 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   }),
   proof('browser-workspace-production-startup', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: ['tests/e2e/production-startup.spec.ts', 'tests/e2e/startup-recovery.spec.ts'],
   }),
   proof('physical-storage-compaction-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: ['tests/e2e/storage-reclamation.spec.ts'],
   }),
-  proof('physical-storage-compaction-firefox', 'browser', {
-    runner: 'playwright',
-    project: 'firefox',
-    files: ['tests/e2e/storage-reclamation.spec.ts'],
-  }),
+
   proof('conversation-viewport-presentation-contract', 'integration', {
     runner: 'vitest',
     files: [
@@ -94,22 +88,10 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   }),
   proof('conversation-viewport-presentation-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
-    files: CONVERSATION_VIEWPORT_BROWSER_FILES,
-  }),
-  proof('conversation-viewport-serial-browser', 'browser', {
-    runner: 'playwright',
-    project: 'chromium-send-performance',
-    files: ['tests/e2e/render-window.spec.ts'],
-  }),
-  proof('conversation-viewport-presentation-firefox', 'browser', {
-    runner: 'playwright',
-    project: 'firefox',
     files: [...CONVERSATION_VIEWPORT_BROWSER_FILES, 'tests/e2e/render-window.spec.ts'],
   }),
   proof('remote-locality-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: [
       'tests/e2e/attachment-manager.spec.ts',
       'tests/e2e/concurrent-ops.spec.ts',
@@ -131,35 +113,24 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
       'tests/unit/workspace-runtime-resource-manifest.test.ts',
     ],
   }),
-  proof('configuration-edit-continuity-chromium', 'browser', {
+  proof('configuration-edit-continuity-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: ['tests/e2e/system-prompt.spec.ts', 'tests/e2e/advanced-generation-routing.spec.ts'],
   }),
-  proof('configuration-edit-continuity-firefox', 'browser', {
-    runner: 'playwright',
-    project: 'firefox',
-    files: ['tests/e2e/system-prompt.spec.ts', 'tests/e2e/advanced-generation-routing.spec.ts'],
-  }),
+
   proof('configuration-target-presentation-unit', 'unit', {
     runner: 'vitest',
     files: ['tests/unit/privacy-policies.test.tsx'],
   }),
   proof('configuration-target-presentation-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: ['tests/e2e/sidebar.spec.ts', 'tests/e2e/provider-crosswalk-switching.spec.ts'],
   }),
-  proof('composer-paste-growth-chromium', 'browser', {
+  proof('composer-paste-growth-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: ['tests/e2e/composer.spec.ts'],
   }),
-  proof('composer-paste-growth-firefox', 'browser', {
-    runner: 'playwright',
-    project: 'firefox',
-    files: ['tests/e2e/composer.spec.ts'],
-  }),
+
   proof('destination-frame-budget-contract', 'integration', {
     runner: 'vitest',
     files: [
@@ -171,12 +142,10 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   }),
   proof('destination-frame-budget-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: ['tests/e2e/render-window-loading.spec.ts'],
   }),
   proof('destination-frame-budget-scale-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium-large-workspace',
     files: ['tests/e2e/large-workspace-startup.spec.ts'],
   }),
   proof('terminal-presentation-handoff-contract', 'integration', {
@@ -198,7 +167,6 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   }),
   proof('terminal-presentation-handoff-browser', 'browser', {
     runner: 'playwright',
-    project: 'chromium',
     files: [
       'tests/e2e/branch-tree-streaming.spec.ts',
       'tests/e2e/concurrent-ops.spec.ts',
@@ -207,7 +175,6 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   }),
   proof('send-critical-path-browser', 'performance', {
     runner: 'playwright',
-    project: 'chromium-send-performance',
     files: ['tests/e2e/send-performance.spec.ts'],
   }),
   proof('production-coordination', 'static', {
@@ -229,10 +196,6 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
       'tests/unit/tab-cross-tab-locality-audit.test.ts',
     ],
   }),
-  proof('test-runtime-isolation', 'static', {
-    runner: 'node',
-    argv: ['scripts/audit-test-runtime-isolation.mjs'],
-  }),
   proof('test-evidence-architecture', 'unit', {
     runner: 'vitest',
     files: [
@@ -249,6 +212,7 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
       'tests/unit/local-module-graph.test.ts',
       'tests/unit/verification-git-comparison.test.ts',
       'tests/unit/verification-impact-plan.test.ts',
+      'tests/unit/playwright-proof.test.ts',
     ],
   }),
   proof('verification-runner', 'unit', {
@@ -331,12 +295,12 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
   obligation(
     'native-find-viewport',
     ['src/ui/chat/ScrollRegion.tsx', 'src/ui/chat/MessageList.tsx'],
-    ['conversation-viewport-presentation-contract', 'conversation-viewport-presentation-firefox'],
+    ['conversation-viewport-presentation-contract', 'conversation-viewport-presentation-browser'],
   ),
   obligation(
     'composer-paste-growth',
     ['src/ui/chat/Composer.tsx', 'src/ui/chat/InlineEditor.tsx'],
-    ['composer-paste-growth-chromium', 'composer-paste-growth-firefox'],
+    ['composer-paste-growth-browser'],
   ),
   obligation(
     'configuration-edit-continuity',
@@ -352,11 +316,7 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
       'src/ui/settings/ChatModelPanel.tsx',
       'src/ui/settings/PromptPresetEditor.tsx',
     ],
-    [
-      'configuration-edit-continuity-unit',
-      'configuration-edit-continuity-chromium',
-      'configuration-edit-continuity-firefox',
-    ],
+    ['configuration-edit-continuity-unit', 'configuration-edit-continuity-browser'],
   ),
   obligation(
     'workspace-capability-activation-lifecycle',
@@ -411,7 +371,6 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
       'browser-workspace-lifecycle-contract',
       'browser-workspace-production-startup',
       'physical-storage-compaction-browser',
-      'physical-storage-compaction-firefox',
       'production-coordination',
       'protocol-contracts',
       'protocol-contracts-contract',
@@ -435,8 +394,6 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
     [
       'conversation-viewport-presentation-contract',
       'conversation-viewport-presentation-browser',
-      'conversation-viewport-presentation-firefox',
-      'conversation-viewport-serial-browser',
       'destination-frame-budget-contract',
       'destination-frame-budget-browser',
       'destination-frame-budget-scale-browser',
@@ -491,6 +448,12 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
       'scripts/audit-current-wave.mjs',
       'scripts/current-wave-manifest.mjs',
       'scripts/audit-test-runtime-isolation.mjs',
+      'scripts/playwright-projects.d.mts',
+      'scripts/playwright-projects.mjs',
+      'scripts/playwright-selection.mjs',
+      'scripts/playwright-selection.d.mts',
+      'scripts/playwright-proof-reporter.d.mts',
+      'scripts/playwright-proof-reporter.mjs',
       'scripts/plan-slice-verification.d.mts',
       'scripts/plan-slice-verification.mjs',
       'scripts/verification-candidate-admission.d.mts',
@@ -603,22 +566,8 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
 ])
 
 const VERIFICATION_FIXED_GLOBAL_INPUTS = Object.freeze([
-  '.dependency-cruiser.cjs',
   '.github/workflows/verify.yml',
   '.gitignore',
-  'biome.json',
-  'eslint.config.js',
-  'index.html',
-  'jscpd.config.json',
-  'jscpd.production.json',
-  'knip.json',
-  'knip.production.json',
-  'playwright.config.ts',
-  'tsconfig.app.json',
-  'tsconfig.json',
-  'tsconfig.node.json',
-  'tsconfig.test.json',
-  'vite.config.ts',
 ])
 
 export function verificationGlobalInputPaths(options = {}) {
@@ -631,21 +580,27 @@ export function verificationGlobalInputPaths(options = {}) {
   }
   for (const path of options.allPaths ?? []) {
     if (path.startsWith('patches/')) inputs.add(path)
-    if (
-      path.startsWith('scripts/') ||
-      path.startsWith('src/styles/') ||
-      path.startsWith('tests/helpers/') ||
-      path === 'tests/setup.ts' ||
-      /^tests\/e2e\/[^/]+\.setup\.ts$/u.test(path) ||
-      path.startsWith('tools/')
-    ) {
-      inputs.add(path)
-    }
   }
   return Object.freeze([...inputs].sort(compareText))
 }
 
 export const VERIFICATION_EXPLICIT_MODULE_EDGES = Object.freeze([
+  ...['scripts/verify-dist.mjs', 'scripts/report-performance-baseline.mjs'].map((importer) =>
+    Object.freeze({
+      importer,
+      dependency: 'scripts/performance-baseline.json',
+      rationale:
+        'The artifact verifier and aggregate performance report read this exact budget file through node:fs.',
+    }),
+  ),
+  ...['src/ui/chat/MessageList.tsx', 'vite.config.ts'].map((dependency) =>
+    Object.freeze({
+      importer: 'scripts/measure-terminal-paint-waterfall.mjs',
+      dependency,
+      rationale:
+        'The browser measurement selects dist/assets/MessageList-*.js, the Vite output for the lazy MessageList source entry, then imports that generated asset through the preview server.',
+    }),
+  ),
   edge('scripts/audit-architecture-coverage.mjs', 'scripts/architecture-coverage-manifest.mjs'),
   edge(
     'scripts/audit-architecture-inventory-closure.mjs',
@@ -673,8 +628,15 @@ export const VERIFICATION_EXPLICIT_MODULE_EDGES = Object.freeze([
   edge('scripts/launch-slice-verification.mjs', 'scripts/run-slice-verification.mjs'),
 ])
 
-export const VERIFICATION_OPAQUE_MODULE_REFERENCE_DISPOSITIONS = Object.freeze(
-  [
+export const VERIFICATION_OPAQUE_MODULE_REFERENCE_DISPOSITIONS = Object.freeze([
+  Object.freeze({
+    path: 'scripts/measure-terminal-paint-waterfall.mjs',
+    code: 'opaque-module-reference',
+    expectedCount: 1,
+    rationale:
+      'The one browser-realm import consumes the generated MessageList asset selected from dist/assets; its source entry and Vite producer configuration are explicit module edges. A missing emitted asset already rejects the measurement.',
+  }),
+  ...[
     'scripts/audit-architecture-coverage.mjs',
     'scripts/audit-architecture-inventory-closure.mjs',
     'scripts/audit-hidden-tab-visual-continuity.mjs',
@@ -694,7 +656,14 @@ export const VERIFICATION_OPAQUE_MODULE_REFERENCE_DISPOSITIONS = Object.freeze(
         'The audit accepts one explicit external manifest/inventory override; its production default is a static or registered explicit edge.',
     }),
   ),
-)
+  Object.freeze({
+    path: 'scripts/verification-candidate-workspace.mjs',
+    code: 'opaque-module-reference',
+    expectedCount: 2,
+    rationale:
+      'Candidate capture and runtime admission import the pinned external native compiler resolver from the immutable dependency image; package, resolver and executable identities are covered by the compiler cohort and dependency fingerprints.',
+  }),
+])
 
 function proof(id, kind, execution) {
   return Object.freeze({ id, kind, execution: Object.freeze(execution) })

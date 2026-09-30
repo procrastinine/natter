@@ -44,6 +44,10 @@ export function installPreloadErrorRecovery(
   const buildToken = options.buildToken ?? runtimeBuildToken(target.document)
   const reload = options.reload ?? (() => target.location.reload())
   const onPreloadError = (event: Event) => {
+    if (isPageHiding()) {
+      event.preventDefault()
+      return
+    }
     try {
       const storage = options.storage ?? browserSessionStorage(target)
       if (!storage) throw new Error('SessionStorageUnavailable')
@@ -60,3 +64,4 @@ export function installPreloadErrorRecovery(
 }
 
 import { browserSessionStorage } from './browser-storage'
+import { isPageHiding } from './page-lifecycle'

@@ -1,14 +1,44 @@
 import { spawn } from 'node:child_process'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { appendFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { playwrightProjects } from './playwright-projects.mjs'
+import {
+  browserSuiteFiles,
+  fullBrowserTasks,
+  readBrowserProof,
+  reconcileBrowserPhaseProofs,
+} from './playwright-proof-reporter.mjs'
+import {
+  browserExecutionPhases,
+  browserGroupProjects,
+  browserTaskGroups,
+} from './playwright-selection.mjs'
 import { PROTOCOL_CONTRACT_STAGE } from './protocol-contract-descriptor.mjs'
-import { persistVerificationPerformanceEvidence } from './verification-performance-evidence.mjs'
+import {
+  TEST_COMPILER_COHORT_DESCRIPTOR,
+  TEST_COMPILER_DIAGNOSTIC_ARGV,
+} from './test-compiler-cohort.mjs'
+import {
+  persistVerificationPerformanceEvidence,
+  VERIFICATION_PERFORMANCE_REQUIRED_STAGE_IDS,
+} from './verification-performance-evidence.mjs'
 import {
   createVerificationRuntimeInvocation,
   executeFileBackedVerificationProcess,
   verificationChildEnvironment,
 } from './verification-process-execution.mjs'
+import {
+  verificationStageAssurance as assuranceKind,
+  resolveVerificationStagePrerequisites,
+  verificationStage as stage,
+  verificationPrerequisiteDiagnostics,
+  verificationStageBlocks,
+  verificationStageStatus,
+} from './verification-stage-contract.mjs'
+import { isVitestSuitePath, vitestSuiteFiles } from './vitest-projects.mjs'
+import { readVitestProof } from './vitest-proof-reporter.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
 const SUMMARY_PATH = resolve(ROOT, 'test-results/verification-summary.json')
@@ -17,7 +47,6 @@ const FIXED_CHILD_ENV = Object.freeze({
   E2E_FAKE_PROVIDER_PORT: '4174',
   E2E_PORT: '4173',
   E2E_REUSE_EXISTING_SERVER: '0',
-  E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE: '1',
   TZ: 'UTC',
 })
 
@@ -26,52 +55,50 @@ export const VERIFICATION_STAGES = Object.freeze([
     'internal',
     'validate-environment',
   ]),
-  stage('application-typescript', 'Typecheck the application contract', 'blocking', [
-    'pnpm',
-    'exec',
-    'tsc',
-    '-p',
-    'tsconfig.app.json',
-    '--noEmit',
-    '--pretty',
-    'false',
-  ]),
-  stage('test-typescript', 'Typecheck the preserved test contract', 'blocking', [
-    'pnpm',
-    'exec',
-    'tsc',
-    '-p',
-    'tsconfig.test.json',
-    '--noEmit',
-    '--pretty',
-    'false',
-  ]),
+  stage(
+    'application-typescript',
+    'Typecheck the application contract',
+    'blocking',
+    ['pnpm', 'exec', 'tsc', '-p', 'tsconfig.app.json', '--noEmit', '--pretty', 'false'],
+    { inputPaths: ['tsconfig.app.json'] },
+  ),
+  stage(
+    'test-typescript',
+    'Typecheck the preserved test contract',
+    'blocking',
+    TEST_COMPILER_DIAGNOSTIC_ARGV,
+    {
+      compilerProof: true,
+      environment: TEST_COMPILER_COHORT_DESCRIPTOR.compiler.environment,
+      inputPaths: ['tsconfig.test.json'],
+    },
+  ),
   stage('current-wave-ownership', 'Audit the frozen current-wave contract', 'blocking', [
     'node',
     'scripts/audit-current-wave.mjs',
   ]),
   stage('peer-dependencies', 'Check peer dependencies', 'advisory', ['pnpm', 'peers', 'check']),
-  stage('formatting', 'Check formatting and Biome lint', 'blocking', [
-    'pnpm',
-    'exec',
-    'biome',
-    'check',
-    '.',
-  ]),
-  stage('semantic-lint', 'Check semantic lint', 'blocking', [
-    'pnpm',
-    'exec',
-    'eslint',
-    'src/**/*.{ts,tsx}',
-    'tests/**/*.{ts,tsx}',
-    '*.config.ts',
-  ]),
-  stage('general-dead-code', 'Check repository-wide dead code', 'blocking', [
-    'pnpm',
-    'exec',
-    'knip',
-    '--no-progress',
-  ]),
+  stage(
+    'formatting',
+    'Check formatting and Biome lint',
+    'blocking',
+    ['pnpm', 'exec', 'biome', 'check', '.'],
+    { assurance: 'hygiene', inputPaths: ['biome.json'] },
+  ),
+  stage(
+    'semantic-lint',
+    'Check semantic lint',
+    'blocking',
+    ['pnpm', 'exec', 'eslint', 'src/**/*.{ts,tsx}', 'tests/**/*.{ts,tsx}', '*.config.ts'],
+    { assurance: 'hygiene', inputPaths: ['eslint.config.js'] },
+  ),
+  stage(
+    'general-dead-code',
+    'Check repository-wide dead code',
+    'blocking',
+    ['pnpm', 'exec', 'knip', '--no-progress'],
+    { assurance: 'hygiene', inputPaths: ['knip.json'] },
+  ),
   stage('production-reachability', 'Audit production file reachability', 'blocking', [
     'pnpm',
     'exec',
@@ -189,6 +216,10 @@ export const VERIFICATION_STAGES = Object.freeze([
     'blocking',
     ['node', 'scripts/audit-e2e-browser-storage.mjs'],
   ),
+  stage('test-runtime-isolation', 'Audit test runtime isolation', 'blocking', [
+    'node',
+    'scripts/audit-test-runtime-isolation.mjs',
+  ]),
   stage('test-evidence', 'Audit test evidence and local-CI parity', 'blocking', [
     'node',
     'scripts/audit-test-evidence.mjs',
@@ -207,31 +238,53 @@ export const VERIFICATION_STAGES = Object.freeze([
     '--mode',
     'inventory',
   ]),
-  stage('production-build', 'Build and verify the production artifact', 'blocking', [
-    'pnpm',
-    'build',
-  ]),
+  stage(
+    'production-build',
+    'Build and verify the production artifact',
+    'blocking',
+    ['pnpm', 'build'],
+    {
+      assurance: 'runtime',
+      inputPaths: [
+        'vite.config.ts',
+        'index.html',
+        'tsconfig.json',
+        'tsconfig.app.json',
+        'tsconfig.node.json',
+        'scripts/verify-dist.mjs',
+      ],
+      inputPrefixes: ['src/styles/', 'tools/'],
+    },
+  ),
   stage('vitest', 'Run unit and integration tests', 'blocking', ['pnpm', 'exec', 'vitest', 'run'], {
+    kind: 'vitest',
     stderr: 'empty',
+    nodeOptions: ['--trace-warnings'],
+    inputPaths: ['vitest.config.ts', 'tsconfig.test.json'],
+    prerequisites: [
+      { id: PROTOCOL_CONTRACT_STAGE.id, consumerModules: PROTOCOL_CONTRACT_STAGE.consumerModules },
+    ],
   }),
-  stage('chromium-e2e', 'Test the built app against the loopback fake provider', 'blocking', [
-    'pnpm',
-    'exec',
-    'playwright',
-    'test',
-    '--project=chromium-send-performance',
-  ]),
+  stage(
+    'chromium-e2e',
+    'Test the built app against the loopback fake provider',
+    'blocking',
+    ['node', 'scripts/run-verification.mjs', '--browser', 'chromium'],
+    browserStageOptions(browserGroupProjects('chromium')),
+  ),
   stage(
     'firefox-e2e',
     'Test the built app in Firefox against the loopback fake provider',
     'blocking',
-    ['pnpm', 'exec', 'playwright', 'test', '--project=firefox-send-performance'],
+    ['node', 'scripts/run-verification.mjs', '--browser', 'firefox'],
+    browserStageOptions(browserGroupProjects('firefox')),
   ),
   stage(
     'headed-hidden-tab-visual-continuity',
     'Prove native hidden-tab first-frame continuity in headed Chromium',
     'blocking',
     ['pnpm', 'run', 'e2e:headed-visibility'],
+    browserStageOptions(['chromium-headed-visibility']),
   ),
   stage(
     'dev-preview-parity',
@@ -245,23 +298,210 @@ export const VERIFICATION_STAGES = Object.freeze([
       '--project=chromium-preview-parity',
       '--project=chromium-dev-parity',
     ],
+    browserStageOptions(['chromium-preview-parity', 'chromium-dev-parity']),
   ),
-  stage('stream-profile-single', 'Profile one large real-shaped stream workload', 'blocking', [
-    'node',
-    'scripts/profile-fake-stream.mjs',
-    '--serve-preview',
-  ]),
+  stage(
+    'stream-profile-single',
+    'Profile one large real-shaped stream workload',
+    'blocking',
+    ['node', 'scripts/profile-fake-stream.mjs', '--serve-preview'],
+    { assurance: 'runtime', prerequisites: [{ id: 'production-build' }] },
+  ),
   stage(
     'stream-profile-concurrent',
     'Profile concurrent multi-tab real-shaped stream workloads',
     'blocking',
     ['node', 'scripts/profile-concurrent-fake-stream.mjs', '--serve-preview'],
+    { assurance: 'runtime', prerequisites: [{ id: 'production-build' }] },
   ),
-  stage('performance', 'Report performance ratchets and hard boundaries', 'blocking', [
-    'node',
-    'scripts/report-performance-baseline.mjs',
-  ]),
+  stage(
+    'performance',
+    'Report performance ratchets and hard boundaries',
+    'blocking',
+    ['node', 'scripts/report-performance-baseline.mjs'],
+    {
+      assurance: 'runtime',
+      preparation: 'performance-evidence',
+      prerequisites: VERIFICATION_PERFORMANCE_REQUIRED_STAGE_IDS.map((id) => ({
+        id,
+        propagateImpact: false,
+      })),
+    },
+  ),
 ])
+
+function browserStageOptions(browserProjects) {
+  return {
+    kind: 'playwright',
+    browserProjects,
+    prerequisites: [{ id: 'production-build' }],
+    inputPaths: [
+      'playwright.config.ts',
+      'scripts/playwright-projects.mjs',
+      'scripts/playwright-proof-reporter.mjs',
+      'scripts/fake-stream-server.mjs',
+      ...playwrightProjects()
+        .filter((project) => browserProjects.includes(project.name) && project.headed)
+        .map(() => 'scripts/run-headed-visibility.mjs'),
+    ],
+  }
+}
+
+export function verificationStageInputPaths(item, allPaths = []) {
+  return [
+    ...new Set([
+      ...(item.inputPaths ?? []),
+      ...(item.argv[0] === 'node' && /^scripts\/[^:]+\.[cm]?js$/u.test(item.argv[1] ?? '')
+        ? [item.argv[1]]
+        : []),
+      ...item.argv.filter((arg) =>
+        /^(?:[^/]+\.config\.|(?:knip|jscpd|tsconfig)[^/]*\.json$|\.dependency-cruiser\.)/u.test(
+          arg,
+        ),
+      ),
+      ...[...allPaths].filter((path) =>
+        item.inputPrefixes?.some((prefix) => path.startsWith(prefix)),
+      ),
+    ]),
+  ]
+}
+
+export function compileSliceVerificationStages(tasks, options = {}) {
+  const catalog = options.catalog ?? VERIFICATION_STAGES
+  const selected = tasks.node.map((task) => {
+    const argv = ['node', ...task.argv]
+    return (
+      catalog.find((item) => JSON.stringify(item.argv) === JSON.stringify(argv)) ??
+      stage(task.id, task.id, 'blocking', argv)
+    )
+  })
+  for (const id of options.stageIds ?? []) {
+    const item = catalog.find((candidate) => candidate.id === id)
+    if (!item) throw new Error(`VerificationStageUnknown:${id}`)
+    if (item.kind !== 'vitest' && item.kind !== 'playwright') selected.push(item)
+  }
+  if (tasks.vitest.length > 0) {
+    const template = catalog.find((item) => item.kind === 'vitest')
+    if (!template) throw new Error('VerificationVitestStageMissing')
+    selected.push(
+      Object.freeze({
+        ...template,
+        unitFiles: Object.freeze([...tasks.vitest]),
+        argv: Object.freeze([...template.argv, ...tasks.vitest]),
+      }),
+    )
+  }
+  for (const group of browserTaskGroups(tasks.playwright)) selected.push(sliceBrowserStage(group))
+  const inputs = options.inputPaths ?? new Set()
+  let resolved = resolveVerificationStagePrerequisites(selected, catalog, inputs)
+  const reportRequiresAllUnits = resolved.some(
+    (item) => item.preparation === 'performance-evidence',
+  )
+  const fullUnit = resolved.find(
+    (item) => item.kind === 'vitest' && (!item.unitFiles || reportRequiresAllUnits),
+  )
+  if (fullUnit) {
+    if (!options.sourceFiles) throw new Error('VerificationStageUnitPopulationRequired')
+    const files = options.sourceFiles.filter(isVitestSuitePath).sort()
+    if (!files.length) throw new Error('VerificationStageUnitPopulationEmpty')
+    resolved = resolveVerificationStagePrerequisites(
+      resolved.map((item) =>
+        item === fullUnit
+          ? stage(
+              item.id,
+              item.label,
+              item.policy,
+              [...catalog.find((candidate) => candidate.id === item.id).argv, ...files],
+              { ...item, unitFiles: files },
+            )
+          : item,
+      ),
+      catalog,
+      new Set(options.sourceFiles),
+    )
+  }
+  const browserStages = resolved.filter((item) => item.kind === 'playwright')
+  if (!browserStages.some((item) => !item.browserTasks)) return resolved
+  if (!options.sourceFiles) throw new Error('VerificationStageBrowserPopulationRequired')
+  const tasksByProject = new Map()
+  for (const item of browserStages) {
+    const tasks = item.browserTasks ?? fullBrowserTasks(item.browserProjects, options.sourceFiles)
+    for (const task of tasks) {
+      if (!task.files.length)
+        throw new Error(`VerificationStageBrowserPopulationEmpty:${task.project}`)
+      const files = tasksByProject.get(task.project) ?? new Set()
+      for (const file of task.files) files.add(file)
+      tasksByProject.set(task.project, files)
+    }
+  }
+  const groups = browserTaskGroups(
+    [...tasksByProject].map(([project, files]) => ({ project, files: [...files].sort() })),
+  )
+  const groupedStages = groups.map((group) => sliceBrowserStage(group))
+  const projectGroups = new Map(
+    groups.flatMap((group) =>
+      group.tasks.map((task) => [task.project, `playwright-${group.name}`]),
+    ),
+  )
+  const aliases = new Map(
+    browserStages.map((item) => {
+      const owners = new Set(
+        (item.browserTasks?.map((task) => task.project) ?? item.browserProjects).map((project) =>
+          projectGroups.get(project),
+        ),
+      )
+      if (owners.size !== 1) throw new Error(`VerificationStageBrowserGroupAmbiguous:${item.id}`)
+      return [item.id, [...owners][0]]
+    }),
+  )
+  const emitted = new Set()
+  const normalized = resolved.flatMap((item) => {
+    const alias = aliases.get(item.id)
+    if (alias) {
+      if (emitted.has(alias)) return []
+      emitted.add(alias)
+      return [groupedStages.find((group) => group.id === alias)]
+    }
+    return [
+      stage(item.id, item.label, item.policy, item.argv, {
+        ...item,
+        prerequisites: (item.prerequisites ?? []).map((dependency) => ({
+          ...dependency,
+          id: aliases.get(dependency.id) ?? dependency.id,
+        })),
+        ...(item.preparation === 'performance-evidence'
+          ? {
+              performanceStageAliases: Object.fromEntries(
+                VERIFICATION_PERFORMANCE_REQUIRED_STAGE_IDS.map((id) => [
+                  id,
+                  aliases.get(id) ?? id,
+                ]),
+              ),
+            }
+          : {}),
+      }),
+    ]
+  })
+  return resolveVerificationStagePrerequisites(
+    normalized,
+    [...catalog, ...groupedStages],
+    fullUnit ? new Set(options.sourceFiles) : inputs,
+  )
+}
+
+function sliceBrowserStage(group) {
+  return stage(
+    `playwright-${group.name}`,
+    `Run ${group.name} browser proofs`,
+    'blocking',
+    ['node', 'scripts/run-verification.mjs', '--browser', group.name],
+    {
+      ...browserStageOptions(group.tasks.map((task) => task.project)),
+      browserTasks: group.tasks,
+      browserPhases: browserExecutionPhases(group.tasks),
+    },
+  )
+}
 
 export const CHECKPOINT_REQUIRED_STAGE_IDS = Object.freeze(
   VERIFICATION_STAGES.filter(
@@ -319,7 +559,10 @@ export async function runVerification(options = {}) {
   const cpuUsage = options.cpuUsage ?? ((previous) => process.cpuUsage(previous))
   const runStartedAt = monotonicNow()
   const runStartedCpu = cpuUsage()
-  const stages = options.stages ?? VERIFICATION_STAGES
+  const stages = resolveVerificationStagePrerequisites(
+    options.stages ?? VERIFICATION_STAGES,
+    VERIFICATION_STAGES,
+  ).map((item) => materializeBrowserStage(item, root))
   const metadata =
     options.metadata ?? (await collectVerificationMetadata({ root, environment: baseEnv }))
   const runId = options.runId ?? verificationRunId(options.now?.() ?? new Date())
@@ -327,20 +570,25 @@ export async function runVerification(options = {}) {
   const runDirectory =
     options.runDirectory ?? resolve(artifactRoot, 'test-results/verification-stages', runId)
   let performanceEvidencePath = null
-  const executeStage =
-    options.executeStage ??
-    ((item, metadata) =>
-      executeVerificationStage(item, metadata, {
-        root,
-        baseEnv,
-        executionRuntime,
-        artifactRoot,
-        runDirectory,
-        runId,
-        performanceEvidencePath,
-        forwardOutput: options.forwardOutput !== false,
-        outputDestinations: options.outputDestinations,
-      }))
+  const executeStage = (item, metadata) =>
+    executeVerificationStage(item, metadata, {
+      root,
+      baseEnv,
+      executionRuntime,
+      testCompilerProof: options.testCompilerProof,
+      artifactRoot,
+      runDirectory,
+      runId,
+      performanceEvidencePath,
+      ...(options.executeStage
+        ? {
+            executeProcess: (stage, _metadata, context) =>
+              options.executeStage(stage, metadata, context),
+          }
+        : {}),
+      forwardOutput: options.forwardOutput !== false,
+      outputDestinations: options.outputDestinations,
+    })
   const persistSummary = options.persistSummary ?? persistVerificationSummary
   const dryRun = options.dryRun === true
   const infrastructureDiagnostics = []
@@ -371,29 +619,32 @@ export async function runVerification(options = {}) {
   for (let index = 0; index < stages.length; index += 1) {
     const item = stages[index]
     if (!item) continue
-    if (item.id === 'performance') {
-      try {
-        performanceEvidencePath = (
-          await persistVerificationPerformanceEvidence({
+    printStageHeader(index, stages.length, item)
+    const stageStartedAt = monotonicNow()
+    const stageStartedCpu = cpuUsage()
+    let execution
+    try {
+      const diagnostics = verificationPrerequisiteDiagnostics(item, results.slice(0, index))
+      performanceEvidencePath = diagnostics.length
+        ? null
+        : await prepareVerificationStageExecution(item, {
             artifactRoot,
             runDirectory,
             runId,
             provenance: options.provenance ?? null,
             stages: results,
           })
-        ).path
-      } catch (error) {
-        infrastructureDiagnostics.push(
-          `VerificationPerformanceEvidenceFailed:${errorName(error)}:${errorMessage(error)}`,
-        )
+      if (diagnostics.length > 0) {
+        execution = {
+          exitCode: null,
+          signal: null,
+          diagnostics,
+          stdoutPath: null,
+          stderrPath: null,
+        }
+      } else {
+        execution = await executeStage(item, metadata)
       }
-    }
-    printStageHeader(index, stages.length, item)
-    const stageStartedAt = monotonicNow()
-    const stageStartedCpu = cpuUsage()
-    let execution
-    try {
-      execution = await executeStage(item, metadata)
     } catch (error) {
       execution = {
         exitCode: null,
@@ -425,9 +676,7 @@ export async function runVerification(options = {}) {
     )
   }
 
-  const blockingFailures = results.filter(
-    (result) => result.policy === 'blocking' && result.status === 'failed',
-  )
+  const blockingFailures = results.filter(verificationStageBlocks)
   const hasInventoryOnlyResults = results.some((result) => result.status === 'inventoried')
   const requiredStageResults = resolveRequiredStageResults(
     options.requiredStageIds,
@@ -515,9 +764,7 @@ export function createVerificationSummary(
   infrastructureDiagnostics = [],
   provenance = null,
 ) {
-  const blockingFailures = stages
-    .filter((result) => result.policy === 'blocking' && result.status === 'failed')
-    .map((result) => result.id)
+  const blockingFailures = stages.filter(verificationStageBlocks).map((result) => result.id)
   const advisoryFailures = stages
     .filter((result) => result.policy === 'advisory' && result.status === 'failed')
     .map((result) => result.id)
@@ -555,8 +802,118 @@ export function serializeVerificationSummary(summary) {
   return `${JSON.stringify(summary, null, 2)}\n`
 }
 
+function materializeBrowserStage(item, root) {
+  if (item.kind !== 'playwright') return item
+  const tasks = item.browserTasks ?? fullBrowserTasks(item.browserProjects, browserSuiteFiles(root))
+  const phases = browserExecutionPhases(tasks)
+  if (item.browserPhases && JSON.stringify(item.browserPhases) !== JSON.stringify(phases))
+    throw new Error(`VerificationBrowserPhasePlanMismatch:${item.id}`)
+  return Object.freeze({ ...item, browserTasks: tasks, browserPhases: phases })
+}
+
+async function executeBrowserPhases(item, metadata, options) {
+  const root = options.root ?? ROOT
+  const artifactRoot = options.artifactRoot ?? root
+  const runId = options.runId ?? 'verification'
+  const runDirectory =
+    options.runDirectory ?? resolve(artifactRoot, 'test-results/verification-stages', runId)
+  const environment = verificationStageEnvironment(item, { ...options, root, runId, runDirectory })
+  const receipts = []
+  const diagnostics = []
+  const stdoutPath = resolve(runDirectory, `${item.id}.stdout.log`)
+  const stderrPath = resolve(runDirectory, `${item.id}.stderr.log`)
+  await mkdir(runDirectory, { recursive: true })
+  await writeFile(stdoutPath, '')
+  await writeFile(stderrPath, '')
+  for (const phase of item.browserPhases) {
+    const child = {
+      ...item,
+      id: `${item.id}-${phase.name}`,
+      argv: phase.argv,
+      browserTasks: phase.tasks,
+    }
+    const childEnvironment = verificationStageEnvironment(child, {
+      ...options,
+      root,
+      runId,
+      runDirectory,
+    })
+    await rm(childEnvironment.E2E_BROWSER_PROOF_PATH, { force: true })
+    const startedAt = performance.now()
+    let execution
+    try {
+      execution = await executeVerificationStage(child, metadata, {
+        ...options,
+        root,
+        artifactRoot,
+        runDirectory,
+        runId,
+        executionId: child.id,
+        browserPhase: true,
+      })
+    } catch (error) {
+      execution = {
+        exitCode: null,
+        signal: null,
+        diagnostics: [String(error)],
+        stdoutPath: null,
+        stderrPath: null,
+      }
+    }
+    diagnostics.push(...execution.diagnostics)
+    let proof = null
+    try {
+      proof = JSON.parse(await readFile(childEnvironment.E2E_BROWSER_PROOF_PATH, 'utf8'))
+    } catch (error) {
+      diagnostics.push(`VerificationBrowserPhaseReceipt:${child.id}:${String(error)}`)
+    }
+    receipts.push({
+      name: phase.name,
+      tasks: phase.tasks,
+      argv: phase.argv,
+      ...execution,
+      wallMs: performance.now() - startedAt,
+      proof,
+    })
+    for (const [key, target] of [
+      ['stdoutPath', stdoutPath],
+      ['stderrPath', stderrPath],
+    ]) {
+      if (execution[key]) {
+        try {
+          await appendFile(target, await readFile(resolve(artifactRoot, execution[key])))
+        } catch (error) {
+          diagnostics.push(`VerificationBrowserPhaseLog:${child.id}:${String(error)}`)
+        }
+      }
+    }
+    if (execution.signal !== null) break
+  }
+  const report = reconcileBrowserPhaseProofs(item.browserTasks, receipts)
+  diagnostics.push(...report.problems)
+  await writeFile(
+    environment.E2E_BROWSER_PROOF_PATH,
+    `${JSON.stringify({ ...report, status: diagnostics.length ? 'failed' : report.status, problems: diagnostics, phases: receipts }, null, 2)}\n`,
+  )
+  return {
+    exitCode: report.status === 'passed' && diagnostics.length === 0 ? 0 : 1,
+    signal: receipts.find((phase) => phase.signal !== null)?.signal ?? null,
+    diagnostics,
+    stdoutPath: relative(artifactRoot, stdoutPath),
+    stderrPath: relative(artifactRoot, stderrPath),
+  }
+}
+
 export async function executeVerificationStage(item, metadata, options = {}) {
+  if (item.kind === 'playwright' && !options.browserPhase)
+    return executeBrowserPhases(
+      materializeBrowserStage(item, options.root ?? ROOT),
+      metadata,
+      options,
+    )
+  if (item.compilerProof && options.testCompilerProof) return options.testCompilerProof(item)
   if (item.argv[0] === 'internal') {
+    if (!metadata) throw new Error('VerificationEnvironmentMetadataRequired')
     return { ...validateEnvironment(metadata), stdoutPath: null, stderrPath: null }
   }
   const root = options.root ?? ROOT
@@ -566,26 +923,71 @@ export async function executeVerificationStage(item, metadata, options = {}) {
   const runId = options.runId ?? 'verification'
   const runDirectory =
     options.runDirectory ?? resolve(artifactRoot, 'test-results/verification-stages', runId)
-  const execution = await executeFileBackedVerificationProcess({
-    id: item.id,
-    command: invocation.command,
-    args: invocation.args,
-    cwd: root,
-    environment: verificationStageEnvironment(item, {
-      root,
-      baseEnv,
-      runId,
-      runDirectory,
-      performanceEvidencePath: options.performanceEvidencePath,
-    }),
-    artifactRoot,
+  const environment = verificationStageEnvironment(item, {
+    root,
+    baseEnv,
+    runId,
     runDirectory,
-    diagnosticPrefix: 'VerificationStage',
-    forwardOutput: options.forwardOutput !== false,
-    outputDestinations: options.outputDestinations,
+    performanceEvidencePath: options.performanceEvidencePath,
   })
-  if (item.stderr !== 'empty' || execution.stderrPath === null) return execution
-  const stderr = await readFile(resolve(artifactRoot, execution.stderrPath), 'utf8')
+  const context = { root, artifactRoot, runId, runDirectory, environment }
+  const execution = options.executeProcess
+    ? await options.executeProcess(item, metadata, context)
+    : await executeFileBackedVerificationProcess({
+        id: options.executionId ?? item.id,
+        command: invocation.command,
+        args: invocation.args,
+        cwd: root,
+        environment,
+        artifactRoot,
+        runDirectory,
+        diagnosticPrefix: options.diagnosticPrefix ?? 'VerificationStage',
+        forwardOutput: options.forwardOutput !== false,
+        outputDestinations: options.outputDestinations,
+      })
+  return verifyVerificationStageExecution(item, execution, {
+    root,
+    artifactRoot,
+    environment,
+  })
+}
+
+export async function prepareVerificationStageExecution(item, options) {
+  if (item.preparation !== 'performance-evidence') return null
+  return (
+    await persistVerificationPerformanceEvidence({
+      ...options,
+      stageAliases: item.performanceStageAliases,
+    })
+  ).path
+}
+
+export async function verifyVerificationStageExecution(item, execution, options) {
+  const environment = options.environment
+  if (item.kind === 'vitest' && execution.exitCode === 0) {
+    try {
+      readVitestProof(
+        environment.VERIFICATION_VITEST_PROOF_PATH,
+        item.unitFiles ?? vitestSuiteFiles({ root: options.root }),
+        environment.VERIFICATION_VITEST_INVOCATION,
+      )
+    } catch (error) {
+      return { ...execution, exitCode: 1, diagnostics: [...execution.diagnostics, String(error)] }
+    }
+  }
+  if (item.kind === 'playwright' && execution.exitCode === 0) {
+    try {
+      readBrowserProof(
+        environment.E2E_BROWSER_PROOF_PATH,
+        item.browserTasks ??
+          fullBrowserTasks(item.browserProjects, browserSuiteFiles(options.root)),
+      )
+    } catch (error) {
+      return { ...execution, exitCode: 1, diagnostics: [...execution.diagnostics, String(error)] }
+    }
+  }
+  if (item.stderr !== 'empty' || execution.stderrPath == null) return execution
+  const stderr = await readFile(resolve(options.artifactRoot, execution.stderrPath), 'utf8')
   if (stderr.length === 0) return execution
   return Object.freeze({
     ...execution,
@@ -598,40 +1000,49 @@ export async function executeVerificationStage(item, metadata, options = {}) {
 }
 
 export function verificationStageEnvironment(item, options = {}) {
+  if (item.environment) return { ...item.environment }
   const root = options.root ?? ROOT
   const baseEnv = options.baseEnv ?? process.env
   const environment = verificationChildEnvironment({
-    kind: item.id,
+    kind: item.kind ?? item.id,
     root,
     runId: options.runId ?? String(process.pid),
     baseEnv: { ...FIXED_CHILD_ENV, ...baseEnv },
   })
-  if (
-    item.id === 'vitest' &&
-    !/(?:^|\s)--trace-warnings(?:\s|$)/u.test(environment.NODE_OPTIONS ?? '')
-  ) {
-    environment.NODE_OPTIONS = [environment.NODE_OPTIONS, '--trace-warnings']
-      .filter(Boolean)
-      .join(' ')
+  for (const flag of item.nodeOptions ?? []) {
+    const flags = environment.NODE_OPTIONS?.split(/\s+/u) ?? []
+    if (!flags.includes(flag)) environment.NODE_OPTIONS = [...flags, flag].filter(Boolean).join(' ')
   }
   environment.VERIFICATION_RUN_ID = options.runId ?? String(process.pid)
-  if (
-    [
-      'chromium-e2e',
-      'firefox-e2e',
-      'headed-hidden-tab-visual-continuity',
-      'dev-preview-parity',
-    ].includes(item.id)
-  ) {
+  if (item.kind === 'vitest') {
+    environment.VERIFICATION_VITEST_INVOCATION = randomUUID()
+    environment.VERIFICATION_VITEST_PROOF_PATH = resolve(
+      options.runDirectory ??
+        resolve(root, 'test-results/verification-stages', options.runId ?? String(process.pid)),
+      `${item.id}.proof.json`,
+    )
+    delete environment.VERIFICATION_VITEST_SELECTION
+    if (item.unitFiles) environment.VERIFICATION_VITEST_SELECTION = JSON.stringify(item.unitFiles)
+  }
+  if (item.kind === 'playwright') {
     environment.E2E_SKIP_BUILD = '1'
     environment.E2E_PLAYWRIGHT_OUTPUT_DIR = resolve(
       options.runDirectory ??
         resolve(root, 'test-results/verification-stages', options.runId ?? String(process.pid)),
       `${item.id}.playwright`,
     )
+    environment.E2E_BROWSER_PROOF_PATH = `${environment.E2E_PLAYWRIGHT_OUTPUT_DIR}.proof.json`
+    const projects = item.browserTasks?.map((task) => task.project) ?? item.browserProjects
+    delete environment.E2E_BROWSER_SELECTION
+    delete environment.E2E_BROWSER_PROJECTS
+    if (item.browserTasks) environment.E2E_BROWSER_SELECTION = JSON.stringify(item.browserTasks)
+    else environment.E2E_BROWSER_PROJECTS = JSON.stringify(projects)
+    for (const project of playwrightProjects()) {
+      if (projects.includes(project.name) && project.activation)
+        environment[project.activation] = '1'
+    }
   }
-  if (item.id === 'dev-preview-parity') environment.E2E_DEV_PREVIEW_PARITY = '1'
-  if (item.id === 'performance' && options.performanceEvidencePath) {
+  if (item.preparation === 'performance-evidence' && options.performanceEvidencePath) {
     environment.VERIFICATION_PERFORMANCE_INPUT = options.performanceEvidencePath
   }
   return environment
@@ -742,10 +1153,6 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
-function stage(id, label, policy, argv, options = {}) {
-  return Object.freeze({ id, label, policy, argv: Object.freeze(argv), ...options })
-}
-
 function plannedStageResult(item) {
   return {
     id: item.id,
@@ -764,7 +1171,6 @@ function plannedStageResult(item) {
 }
 
 function completedStageResult(item, execution, timing) {
-  const passed = execution.exitCode === 0 && execution.signal === null
   const assurance = assuranceKind(item)
   return {
     id: item.id,
@@ -772,13 +1178,14 @@ function completedStageResult(item, execution, timing) {
     policy: item.policy,
     argv: [...item.argv],
     assurance,
-    status: passed ? (assurance === 'inventory' ? 'inventoried' : 'passed') : 'failed',
+    status: verificationStageStatus(item, execution),
     exitCode: execution.exitCode,
     signal: execution.signal,
     diagnostics: [...execution.diagnostics],
     timing: Object.freeze({ ...timing }),
     stdoutPath: execution.stdoutPath ?? null,
     stderrPath: execution.stderrPath ?? null,
+    evidence: execution.evidence ?? null,
   }
 }
 
@@ -793,34 +1200,6 @@ function elapsedTiming(monotonicNow, cpuUsage, startedAt, startedCpu) {
 
 function emptyTiming() {
   return Object.freeze({ wallMs: 0, runnerCpuUserMs: 0, runnerCpuSystemMs: 0 })
-}
-
-function assuranceKind(item) {
-  if (
-    item.policy === 'advisory' ||
-    ['formatting', 'semantic-lint', 'general-dead-code'].includes(item.id)
-  ) {
-    return 'hygiene'
-  }
-  if (item.argv.some((arg, index) => arg === '--mode' && item.argv[index + 1] === 'inventory')) {
-    return 'inventory'
-  }
-  if (
-    [
-      'production-build',
-      'vitest',
-      'chromium-e2e',
-      'firefox-e2e',
-      'headed-hidden-tab-visual-continuity',
-      'dev-preview-parity',
-      'stream-profile-single',
-      'stream-profile-concurrent',
-      'performance',
-    ].includes(item.id)
-  ) {
-    return 'runtime'
-  }
-  return 'guarantee'
 }
 
 function packageManagerVersion(packageManager) {
@@ -851,6 +1230,10 @@ function printStageResult(result) {
     result.exitCode === null ? (result.signal ?? 'no exit code') : `exit ${result.exitCode}`
   const duration = result.timing ? `, ${result.timing.wallMs.toFixed(1)} ms` : ''
   console.log(`[verify] ${result.status} (${detail}${duration})`)
+  if (result.evidence)
+    console.log(
+      `[verify] reused ${result.evidence.kind} proof ${result.evidence.compilerCohortDigest}`,
+    )
   for (const diagnostic of result.diagnostics) console.log(`[verify] ${diagnostic}`)
 }
 
@@ -871,15 +1254,26 @@ function printFinalSummary(summary) {
   }
 }
 
+export function directBrowserVerificationStages(selection, files) {
+  const group = browserGroupProjects(selection)
+  const names = group.length ? group : [selection]
+  const tasks = fullBrowserTasks(names, files)
+  return browserTaskGroups(tasks).map(sliceBrowserStage)
+}
+
 function parseCliArgs(argv) {
   if (argv.length === 0) return { dryRun: false }
+  if (argv.length === 2 && argv[0] === '--browser') return { browser: argv[1] }
   if (argv.length === 1 && argv[0] === '--dry-run') return { dryRun: true }
   throw new Error(`Unknown verification runner arguments: ${argv.join(' ')}`)
 }
 
 async function main() {
   const cli = parseCliArgs(process.argv.slice(2))
-  const result = await runVerification(cli)
+  const stages = cli.browser
+    ? directBrowserVerificationStages(cli.browser, browserSuiteFiles(ROOT))
+    : undefined
+  const result = await runVerification({ ...cli, ...(stages ? { stages } : {}) })
   process.exitCode = result.exitCode
 }
 
