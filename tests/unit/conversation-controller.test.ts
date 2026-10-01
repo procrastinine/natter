@@ -209,8 +209,9 @@ class TestProjectionSource implements ConversationProjectionSource {
       } as const)
     },
   )
-  readonly loadInspector = vi.fn(async (_chatId: ChatId, messageId: MessageId) =>
-    this.envelope(this.presentations.get(messageId) ?? null),
+  readonly loadInspector = vi.fn(
+    async (_chatId: ChatId, messageId: MessageId, _signal: AbortSignal) =>
+      this.envelope(this.presentations.get(messageId) ?? null),
   )
   readonly loadPreviews = vi.fn(async (_chatId: ChatId, targets: readonly TreePreviewTarget[]) =>
     this.envelope(
@@ -3670,6 +3671,275 @@ describe('conversation controller', () => {
       root.id,
       leaf.id,
     ])
+  })
+
+  it('keeps former-path headers available for inspector and preview demand through repeated branch switches', async () => {
+    const root = message('root', null, 0, 'root body', 1)
+    const left = message('left', root.id, 0, 'left body', 2)
+    const leftTip = message('left-tip', left.id, 0, 'left tip', 3)
+    const right = message('right', root.id, 1, 'right body', 4)
+    const rightTip = message('right-tip', right.id, 0, 'right tip', 5)
+    const { controller, navigation, source } = harness([root, left, leftTip, right, rightTip])
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: leftTip.id })
+    await settle()
+    const initialHeaderFacts = controller.getSnapshot().active?.headerFacts
+    expect(initialHeaderFacts?.has(right.id)).toBe(false)
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'tree' })
+    await settle()
+    const treeHeaderFacts = controller.getSnapshot().active?.headerFacts
+    expect(treeHeaderFacts?.has(right.id)).toBe(true)
+    expect(initialHeaderFacts?.has(right.id)).toBe(false)
+    const inspectorOwner = {}
+    const previewOwner = {}
+    for (const [selected, inspected] of [
+      [rightTip, left],
+      [leftTip, right],
+      [rightTip, left],
+    ] as const) {
+      controller.setInspectorDemand(inspectorOwner, null)
+      controller.setTreePreviewDemand(previewOwner, null)
+      controller.navigate({ chatId: CHAT_ID, kind: 'message', messageId: selected.id })
+      await settle()
+      expect(presentedSpine(controller).path.leaf?.id).toBe(selected.id)
+      const active = controller.getSnapshot().active
+      expect(active?.headerFacts.get(inspected.id)).toBe(treeHeaderFacts?.get(inspected.id))
+      expectCoherentReadyPresentation(active?.presentation, 'tree')
+      controller.setTreePreviewDemand(previewOwner, {
+        chatId: CHAT_ID,
+        targets: [{ messageId: inspected.id, bodyVersion: 1 }],
+      })
+      await settle()
+      expect(controller.getSnapshot().active?.previews.get(inspected.id)?.text).toBe(
+        textOf(inspected),
+      )
+      controller.setInspectorDemand(inspectorOwner, { chatId: CHAT_ID, messageId: inspected.id })
+      await settle()
+      expect(controller.getSnapshot().active?.inspector.exact?.message.id).toBe(inspected.id)
+      expect(controller.getSnapshot().active?.inspector.failure).toBeNull()
+    }
+    expect(source.loadInspector.mock.calls.map((call) => call[1])).toEqual([
+      'left',
+      'right',
+      'left',
+    ])
+    expect(
+      source.loadPreviews.mock.calls.flatMap((call) => call[1].map((target) => target.messageId)),
+    ).toEqual(['left', 'right'])
+    expect(source.loadTranscriptPage).not.toHaveBeenCalled()
+    expect(source.loadTopology).toHaveBeenCalledOnce()
+    controller.setInspectorDemand(inspectorOwner, null)
+    controller.setTreePreviewDemand(previewOwner, null)
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'transcript' })
+    expect(controller.getSnapshot().active?.presentation).toMatchObject({
+      target: { kind: 'pending', surface: 'transcript' },
+      painted: { binding: { surface: 'tree' } },
+    })
+    expect(controller.getSnapshot().active?.topologyLoaded).toBe(true)
+    await settle()
+    expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'transcript')
+    expect(controller.getSnapshot().active?.topologyLoaded).toBe(false)
+    expect(controller.getSnapshot().active?.headerFacts.has(left.id)).toBe(false)
+    expect(treeHeaderFacts?.has(left.id)).toBe(true)
+  })
+
+  it('keeps topology for a prompt owner across the transcript handoff and releases its last claim', async () => {
+    const root = message('root', null, 0, 'root body', 1)
+    const left = message('left', root.id, 0, 'left body', 2)
+    const right = message('right', root.id, 1, 'right body', 3)
+    const { controller, navigation, source } = harness([root, left, right])
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: left.id })
+    await settle()
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'tree' })
+    await settle()
+    const claim = controller.claimPromptPathDemand({ workspaceFence: FENCE, chatId: CHAT_ID })
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'transcript' })
+    await settle()
+    expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'transcript')
+    expect(controller.getSnapshot().active?.topologyLoaded).toBe(true)
+    expect(source.loadTopology).toHaveBeenCalledOnce()
+    claim.release()
+    expect(controller.getSnapshot().active?.topologyLoaded).toBe(false)
+    expect(controller.getSnapshot().active?.headerFacts.has(right.id)).toBe(false)
+  })
+
+  it('keeps newer former-path headers and tombstones ahead of retained topology facts', async () => {
+    const root = message('root', null, 0, 'root body', 1)
+    const left = message('left', root.id, 0, 'left body', 2)
+    const right = message('right', root.id, 1, 'right body', 4)
+    const { controller, navigation, source } = harness([root, left, right])
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: left.id })
+    await settle()
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'tree' })
+    await settle()
+    const originalFacts = controller.getSnapshot().active?.headerFacts
+    controller.navigate({ chatId: CHAT_ID, kind: 'message', messageId: right.id })
+    await settle()
+    const edited = source.put(
+      {
+        ...left,
+        nodeVersion: 1,
+        content: [{ type: 'output_text', text: 'edited former branch' }],
+      },
+      2,
+    )
+    controller.applyCommittedEffect({
+      ...FENCE,
+      chatId: CHAT_ID,
+      source: 'remote',
+      kind: 'changed',
+      structural: { kind: 'none' },
+      revisions: [
+        { header: edited.header, structuralVersion: source.currentChat.structuralVersion },
+      ],
+    })
+    await settle()
+    expect(controller.getSnapshot().active?.headerFacts.get(left.id)).toBe(edited.header)
+    expect(originalFacts?.get(left.id)?.bodyVersion).toBe(1)
+    const deleted = source.put({ ...edited.message, deleted: true, nodeVersion: 2 }, 2)
+    controller.applyCommittedEffect({
+      ...FENCE,
+      chatId: CHAT_ID,
+      source: 'remote',
+      kind: 'changed',
+      structural: {
+        kind: 'exact-delta',
+        toVersion: source.currentChat.structuralVersion,
+        structuralVersions: [source.currentChat.structuralVersion],
+        messageIds: [left.id],
+      },
+      revisions: [
+        { header: deleted.header, structuralVersion: source.currentChat.structuralVersion },
+      ],
+    })
+    await settle()
+    expect(controller.getSnapshot().active?.headerFacts.get(left.id)?.deleted).toBe(true)
+    expect(originalFacts?.get(left.id)?.deleted).toBe(false)
+    expect(presentedSpine(controller).path.leaf?.id).toBe(right.id)
+    expect(source.loadInspector).not.toHaveBeenCalled()
+    expect(source.loadTranscriptPage).not.toHaveBeenCalled()
+  })
+
+  it('ignores an obsolete former-branch inspector completion after a new target wins', async () => {
+    const root = message('root', null, 0, 'root body', 1)
+    const left = message('left', root.id, 0, 'left body', 2)
+    const right = message('right', root.id, 1, 'right body', 4)
+    const { controller, navigation, source } = harness([root, left, right])
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: left.id })
+    await settle()
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'tree' })
+    await settle()
+    controller.navigate({ chatId: CHAT_ID, kind: 'message', messageId: right.id })
+    await settle()
+    let resolveObsolete: (value: Awaited<ReturnType<typeof source.loadInspector>>) => void =
+      () => {}
+    let obsoleteSignal: AbortSignal | undefined
+    source.loadInspector.mockImplementationOnce((_chatId, _messageId, signal) => {
+      obsoleteSignal = signal
+      return new Promise((resolve) => {
+        resolveObsolete = resolve
+      })
+    })
+    const owner = {}
+    controller.setInspectorDemand(owner, { chatId: CHAT_ID, messageId: left.id })
+    expect(obsoleteSignal?.aborted).toBe(false)
+    controller.setInspectorDemand(owner, { chatId: CHAT_ID, messageId: right.id })
+    await settle()
+    expect(obsoleteSignal?.aborted).toBe(true)
+    expect(controller.getSnapshot().active?.inspector.exact?.message.id).toBe(right.id)
+    resolveObsolete({ ...FENCE, value: source.presentations.get(left.id) ?? null })
+    await settle()
+    expect(controller.getSnapshot().active?.inspector.exact?.message.id).toBe(right.id)
+    expect(controller.getSnapshot().active?.inspector.failure).toBeNull()
+    expect(source.loadInspector).toHaveBeenCalledTimes(2)
+    expect(source.loadTranscriptPage).not.toHaveBeenCalled()
+  })
+
+  it('keeps a selected inspector failure visible when a late fork read advances unrelated facts', async () => {
+    const root = message('root', null, 0, 'root body', 1)
+    const left = message('left', root.id, 0, 'left body', 2)
+    const right = message('right', root.id, 1, 'right body', 4)
+    const { controller, navigation, source } = harness([root, left, right])
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: left.id })
+    await settle()
+    let releaseForks = () => {}
+    source.forkCompletionGate = new Promise<void>((resolve) => {
+      releaseForks = resolve
+    })
+    source.loadForks.mockClear()
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'tree' })
+    await settle()
+    const pendingForkSpine = presentedSpine(controller)
+    expect(pendingForkSpine.forkFor(left.id)).toBeUndefined()
+    expect(source.loadForks).toHaveBeenCalledOnce()
+    source.loadInspector.mockRejectedValueOnce(new Error('Selected body unavailable'))
+    controller.setInspectorDemand({}, { chatId: CHAT_ID, messageId: right.id })
+    await settle()
+    const failed = controller.getSnapshot().active?.inspector.failure
+    expect(failed).toMatchObject({
+      messageId: right.id,
+      bodyVersion: 1,
+      reason: { kind: 'inspector', message: 'Selected body unavailable' },
+    })
+    releaseForks()
+    source.forkCompletionGate = null
+    await settle()
+    expect(presentedSpine(controller)).not.toBe(pendingForkSpine)
+    expect(presentedSpine(controller).forkFor(left.id)).toMatchObject({
+      selectedMessageId: left.id,
+      liveCount: 2,
+      nextMessageId: right.id,
+    })
+    const active = controller.getSnapshot().active
+    expect(active?.inspector.resolving).toBe(false)
+    expect(active?.inspector.failure?.reason).toBe(failed?.reason)
+    expect(
+      expectCoherentReadyPresentation(active?.presentation, 'tree').inspector.failure?.reason,
+    ).toBe(failed?.reason)
+    expect(source.loadInspector).toHaveBeenCalledOnce()
+    expect(source.loadTranscriptPage).not.toHaveBeenCalled()
+  })
+
+  it('publishes current-target inspector failure independently of other read failures', async () => {
+    const root = message('root', null, 0, 'root body', 1)
+    const left = message('left', root.id, 0, 'left body', 2)
+    const right = message('right', root.id, 1, 'right body', 4)
+    const { controller, navigation, source } = harness([root, left, right])
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: left.id })
+    await settle()
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'tree' })
+    await settle()
+    controller.navigate({ chatId: CHAT_ID, kind: 'message', messageId: right.id })
+    await settle()
+    source.loadInspector.mockRejectedValueOnce(new Error('Selected body unavailable'))
+    const owner = {}
+    controller.setInspectorDemand(owner, { chatId: CHAT_ID, messageId: left.id })
+    await settle()
+    expect(controller.getSnapshot().active?.inspector).toMatchObject({
+      resolving: false,
+      failure: {
+        messageId: left.id,
+        bodyVersion: 1,
+        reason: { kind: 'inspector', message: 'Selected body unavailable' },
+      },
+    })
+    source.loadPreviews.mockRejectedValueOnce(new Error('Preview unavailable'))
+    controller.setTreePreviewDemand(
+      {},
+      { chatId: CHAT_ID, targets: [{ messageId: root.id, bodyVersion: 1 }] },
+    )
+    await settle()
+    expect(controller.getSnapshot().active?.failure?.kind).toBe('previews')
+    expect(
+      expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'tree')
+        .inspector.failure?.messageId,
+    ).toBe(left.id)
+    controller.setInspectorDemand(owner, { chatId: CHAT_ID, messageId: left.id })
+    await settle()
+    expect(source.loadInspector).toHaveBeenCalledOnce()
+    controller.setInspectorDemand(owner, { chatId: CHAT_ID, messageId: right.id })
+    await settle()
+    expect(controller.getSnapshot().active?.inspector.failure).toBeNull()
+    expect(controller.getSnapshot().active?.inspector.exact?.message.id).toBe(right.id)
   })
 
   it('keeps transcript, tree, inspector, and preview demand separate and bounded', async () => {

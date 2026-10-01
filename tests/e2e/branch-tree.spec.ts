@@ -29,6 +29,31 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
+test('tree inspector revisits former branches after repeated explicit branch activation', async ({
+  page,
+}) => {
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.A2}`)
+  await expect(page.locator('[data-ui="message-list"]')).toContainText('branch A assistant')
+  await page.locator('[data-role="chat-branch-tree"]').click()
+  const node = (messageId: string) =>
+    page.locator(`[data-ui="branch-tree-node"][data-message-id="${messageId}"]`)
+  const inspector = page.locator('[data-ui="branch-tree-inspector"]')
+  for (const [target, former, text] of [
+    [fixture.B2, fixture.A1, 'branch A user'],
+    [fixture.A2, fixture.B1, 'branch B user'],
+    [fixture.B2, fixture.A2, 'branch A assistant'],
+  ] as const) {
+    await node(target).click()
+    await inspector.getByRole('button', { name: 'Open this branch', exact: true }).click()
+    await expect(node(target)).toHaveAttribute('data-current-leaf', 'true')
+    await node(former).click()
+    await expect(inspector).toHaveAttribute('data-message-id', former)
+    await expect(page.locator('[data-ui="branch-tree-inspector-content"]')).toContainText(text)
+    await expect(page.locator('[data-ui="branch-tree-inspector-status"]')).toHaveCount(0)
+  }
+})
+
 test('branching from an intermediate transcript node settles one durable fork', async ({
   page,
 }) => {

@@ -1,11 +1,11 @@
 // Provider-picker row model. Pure data layer so the UI component stays
 // thin and the mapping stays testable without mounting React.
 //
-// Each endpoint becomes exactly one `PickerRow`, tagged with its kept /
+// Each routing identity becomes exactly one `PickerRow`, tagged with its kept /
 // auto-excluded / no-filter status, the resolved `DataPolicy` (or
 // undefined when none could be resolved), the privacy tier, and any
 // exclusion reasons. The picker renders directly from this list — the
-// order matches `endpoints` (the caller decides how to sort upstream).
+// Raw observations remain available for alias resolution and privacy aggregation.
 
 import {
   type ExclusionReason,
@@ -42,17 +42,15 @@ interface BuildPickerRowsOptions {
 }
 
 export function buildPickerRows(
-  endpoints: readonly ModelEndpoint[],
+  endpoints: readonly ModelEndpoint[] | ProviderEndpointIndex,
   filter: PrivacyFilterResult | null,
   opts: BuildPickerRowsOptions = {},
 ): PickerRow[] {
-  // Index the filter result by endpoint identity so duplicate display
-  // names (for example two Anthropic endpoints) stay distinct.
-  // `excluded` wins over `kept` on collision (a name shouldn't appear in
-  // both, but if it did the exclusion state is the one that matters — it
-  // would mean the send is blocked, not the row kept).
+  const endpointIndex =
+    endpoints instanceof ProviderEndpointIndex ? endpoints : new ProviderEndpointIndex(endpoints)
+  const representatives = endpointIndex.orderByRefs(opts.providerPrefs?.order)
   if (!filter) {
-    return endpoints.map((ep) => ({
+    return representatives.map((ep) => ({
       endpoint: ep,
       state: 'no-filter',
       policy: undefined,
@@ -61,40 +59,55 @@ export function buildPickerRows(
       policySynthesized: false,
     }))
   }
-  const kept = new Map<string, (typeof filter.kept)[number]>()
-  for (const k of filter.kept) kept.set(providerEndpointKey(k.endpoint), k)
-  const excluded = new Map<string, (typeof filter.excluded)[number]>()
-  for (const e of filter.excluded) excluded.set(providerEndpointKey(e.endpoint), e)
-  const endpointIndex = new ProviderEndpointIndex(endpoints)
-  const ignoredEndpoints = endpointIndex.endpointsForRefs(opts.providerPrefs?.ignore)
-  const onlyEndpoints = endpointIndex.endpointsForRefs(opts.providerPrefs?.only)
+  const grouped = new Map<string, PickerRow>()
+  const addObservation = (
+    observation: (typeof filter.kept)[number],
+    reasons: readonly ExclusionReason[],
+  ): void => {
+    const row: PickerRow = {
+      endpoint: observation.endpoint,
+      state: reasons.length > 0 ? 'auto-excluded' : 'kept',
+      policy: observation.policy,
+      tier: privacyTierForPolicy(observation.policy, {
+        synthesized: observation.policySynthesized,
+      }),
+      reasons,
+      policySynthesized: observation.policySynthesized,
+    }
+    const key = providerEndpointKey(observation.endpoint)
+    const previous = grouped.get(key)
+    if (!previous) {
+      grouped.set(key, row)
+      return
+    }
+    const worst = worstPickerPrivacyRow([previous, row]) ?? row
+    grouped.set(key, {
+      ...worst,
+      state:
+        previous.state === 'auto-excluded' || row.state === 'auto-excluded'
+          ? 'auto-excluded'
+          : 'kept',
+      reasons: [...new Set([...previous.reasons, ...row.reasons])],
+    })
+  }
+  for (const observation of filter.kept) addObservation(observation, [])
+  for (const observation of filter.excluded) addObservation(observation, observation.reasons)
+  const ignoredEndpoints = endpointIndex.endpointsForRefs(
+    endpointIndex.resolveRoutingRefs(opts.providerPrefs?.ignore),
+  )
+  const onlyEndpoints = endpointIndex.endpointsForRefs(
+    endpointIndex.resolveRoutingRefs(opts.providerPrefs?.only),
+  )
 
-  return endpoints.map((ep) => {
-    const key = providerEndpointKey(ep)
-    const ex = excluded.get(key)
-    if (ex) {
-      const row: PickerRow = {
-        endpoint: ep,
-        state: 'auto-excluded',
-        policy: ex.policy,
-        tier: privacyTierForPolicy(ex.policy, { synthesized: ex.policySynthesized }),
-        reasons: ex.reasons,
-        policySynthesized: ex.policySynthesized,
-      }
-      return applyManualPickerState(row, opts, ignoredEndpoints, onlyEndpoints)
-    }
-    const k = kept.get(key)
-    if (k) {
-      const row: PickerRow = {
-        endpoint: ep,
-        state: 'kept',
-        policy: k.policy,
-        tier: privacyTierForPolicy(k.policy, { synthesized: k.policySynthesized }),
-        reasons: [],
-        policySynthesized: k.policySynthesized,
-      }
-      return applyManualPickerState(row, opts, ignoredEndpoints, onlyEndpoints)
-    }
+  return representatives.map((ep) => {
+    const group = grouped.get(providerEndpointKey(ep))
+    if (group)
+      return applyManualPickerState(
+        { ...group, endpoint: ep },
+        opts,
+        ignoredEndpoints,
+        onlyEndpoints,
+      )
     // An endpoint that made it into `endpoints` but not into `kept` or
     // `excluded` means the filter skipped it — shouldn't happen, but
     // render it as unavailable rather than crashing.
@@ -108,6 +121,27 @@ export function buildPickerRows(
     }
     return applyManualPickerState(row, opts, ignoredEndpoints, onlyEndpoints)
   })
+}
+
+const PRIVACY_TIER_RANK: Record<PrivacyTier, number> = {
+  green: 0,
+  yellow: 1,
+  orange: 2,
+  red: 3,
+  open: -1,
+  unavailable: 4,
+}
+
+export function worstPickerPrivacyRow(rows: readonly PickerRow[]): PickerRow | undefined {
+  return rows.reduce<PickerRow | undefined>((worst, row) => {
+    if (!worst || PRIVACY_TIER_RANK[row.tier] > PRIVACY_TIER_RANK[worst.tier]) return row
+    if (
+      row.tier === worst.tier &&
+      (row.policy?.retentionDays ?? 0) > (worst.policy?.retentionDays ?? 0)
+    )
+      return row
+    return worst
+  }, undefined)
 }
 
 function applyManualPickerState(

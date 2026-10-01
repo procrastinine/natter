@@ -5,7 +5,6 @@
 // non-OpenRouter connections and for free models.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { PrivacyTier } from '../../core/privacy-filter'
 import { ProviderEndpointIndex, providerEndpointKey } from '../../core/provider-identity'
 import type { Chat } from '../../core/types'
 import type { UsePrivacyRoutingResult } from '../../hooks/useModelCatalog'
@@ -16,6 +15,7 @@ import {
   type PickerRow,
   reasonsToTooltip,
   tierToLockLabel,
+  worstPickerPrivacyRow,
 } from '../settings/provider-picker-rows'
 
 interface HeaderPrivacyBadgeProps {
@@ -83,13 +83,13 @@ export function HeaderPrivacyBadge({ chat, routing }: HeaderPrivacyBadgeProps) {
   // (profile, model) pair, a muted lock is rendered rather than jumping
   // from "unavailable" to real tier on arrival.
   const rows = filter
-    ? buildPickerRows(endpoints, filter, {
+    ? buildPickerRows(endpointIndex, filter, {
         providerPrefs: settings?.providerPrefs ?? chat.settings.providerPrefs,
         privacy: settings?.privacy ?? chat.settings.privacy,
       })
     : []
   const kept = rows.filter((r) => r.state === 'kept')
-  const badgeTier: PrivacyTier = kept.length > 0 ? worstTier(kept) : loading ? 'unavailable' : 'red'
+  const badgeTier = worstPickerPrivacyRow(kept)?.tier ?? (loading ? 'unavailable' : 'red')
   const label = kept.length === 0 && !loading ? 'No eligible providers' : tierToLockLabel(badgeTier)
 
   return (
@@ -187,23 +187,4 @@ function PopoverRow({
       </span>
     </li>
   )
-}
-
-// Highest tier rank among kept providers, the badge reflects the
-// worst-case routing target, not the best case. If routing ends up
-// failing over to a worse-tier provider, the badge should reflect that.
-function worstTier(rows: readonly PickerRow[]): PrivacyTier {
-  const rank: Record<PrivacyTier, number> = {
-    green: 0,
-    yellow: 1,
-    orange: 2,
-    red: 3,
-    open: -1,
-    unavailable: 4,
-  }
-  let worst: PrivacyTier = 'green'
-  for (const r of rows) {
-    if (rank[r.tier] > rank[worst]) worst = r.tier
-  }
-  return worst
 }

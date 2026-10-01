@@ -276,6 +276,7 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
         'src/store/browser-repo.ts#STREAM_JOURNAL_INTEGRITY_OPERATION',
         'src/store/browser-repo.ts#TERMINAL_STREAM_RETENTION_OPERATION',
         'src/store/conversation-controller.ts#EMPTY_EXACT_TARGET_PRESENTATION_RECEIPTS',
+        'src/store/conversation-controller.ts#EMPTY_HEADER_KEYS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_COMMIT_FRAME_KEYS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_INLINE_FRAME_KEYS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_PAGE_FRAME_KEYS',

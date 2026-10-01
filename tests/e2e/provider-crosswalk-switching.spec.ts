@@ -12,6 +12,82 @@ test.beforeEach(async ({ page }) => {
   await mockModelLists(page)
 })
 
+test('provider refresh reconciles repeated routing identities across metrics and model switches', async ({
+  page,
+}) => {
+  const modelId = 'z-ai/glm-5.2'
+  const otherModelId = 'openai/gpt-5.4'
+  let revision = 0
+  await page.context().route('https://openrouter.ai/api/v1/models*', async (route) => {
+    if (new URL(route.request().url()).pathname !== '/api/v1/models') return route.fallback()
+    await route.fulfill({ json: { data: [modelRow(modelId), modelRow(otherModelId)] } })
+  })
+  await page.context().route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+    const selected = new URL(route.request().url()).pathname.includes(modelId)
+      ? modelId
+      : otherModelId
+    const endpoint = (provider_name: string, tag: string, throughput: number) => ({
+      provider_name,
+      tag,
+      supported_parameters: ['provider', 'max_tokens'],
+      context_length: 200_000,
+      pricing: { prompt: '0.000001', completion: '0.000002' },
+      throughput_last_30m: { p50: throughput },
+      data_policy: {
+        training: false,
+        trainingOpenRouter: false,
+        retainsPrompts: false,
+        canPublish: false,
+      },
+    })
+    const normal = endpoint('BaseTen', 'baseten/fp8', revision === 0 ? 90 : 300 + revision)
+    const fast = endpoint('BaseTen', 'baseten/fast', revision === 0 ? 200 : 100)
+    const other = endpoint('Other Provider', 'other', 70)
+    const observations =
+      revision % 2 === 0
+        ? [normal, fast, { ...normal }, { ...fast }, other]
+        : [other, fast, normal, { ...fast }, { ...normal }]
+    await route.fulfill({
+      json: {
+        data: {
+          id: selected,
+          endpoints:
+            selected === modelId ? observations : [endpoint('New Model Provider', 'new-model', 50)],
+        },
+      },
+    })
+  })
+  await seedFirstRun(page, { model: modelId })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+  const section = page.locator('[data-ui-section="provider-picker"]')
+  const rows = section.locator('[data-ui="provider-picker-row"]')
+  await expect(rows).toHaveCount(3)
+  const normal = rows.filter({ hasText: 'BaseTen (baseten/fp8)' })
+  const fast = rows.filter({ hasText: 'BaseTen (baseten/fast)' })
+  await fast.getByRole('checkbox').uncheck()
+  await section.getByRole('radio', { name: 'Throughput', exact: true }).check()
+  await expect(rows.first()).toContainText('BaseTen (baseten/fast)')
+  for (revision = 1; revision <= 2; revision += 1) {
+    await section.getByRole('button', { name: 'Reload providers' }).click()
+    await expect(normal).toContainText(`${300 + revision} tok/s`)
+    await expect(rows).toHaveCount(3)
+    await expect(rows.first()).toContainText('BaseTen (baseten/fp8)')
+    await expect(fast.getByRole('checkbox')).not.toBeChecked()
+  }
+  const badge = page.locator('[data-ui="header-privacy-badge"]')
+  await badge.locator('button').click()
+  await expect(page.locator('[data-ui="header-privacy-row"]')).toHaveCount(3)
+  await page.getByRole('button', { name: 'Close privacy summary' }).click()
+  await pickModel(page, otherModelId)
+  await expect(rows).toHaveCount(1)
+  await expect(rows.first()).toContainText('New Model Provider')
+  await expect(section.getByText(/BaseTen/)).toHaveCount(0)
+  await pickModel(page, modelId)
+  await expect(rows).toHaveCount(3)
+  await expect(fast.getByRole('checkbox')).not.toBeChecked()
+})
+
 test('UI crosswalks Claude between OpenRouter and Anthropic in both directions', async ({
   page,
 }) => {

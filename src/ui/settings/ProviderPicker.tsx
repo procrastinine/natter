@@ -90,24 +90,20 @@ export function ProviderPicker({
         ? storedSort.by
         : DEFAULT_OPENROUTER_PROVIDER_SORT
   const endpointIndex = useMemo(() => new ProviderEndpointIndex(endpoints), [endpoints])
-  const manualOrdered = useMemo(
-    () => endpointIndex.orderByRefs(prefs.order),
-    [endpointIndex, prefs.order],
-  )
-  const displayOrdered = useMemo(
-    () => sortEndpointsByMetric(manualOrdered, currentSort),
-    [manualOrdered, currentSort],
-  )
   const rows = useMemo(
     () =>
       loading && !retained && scrapeApplicable && !filter
         ? []
-        : buildPickerRows(displayOrdered, filter, {
-            providerPrefs: prefs,
-            privacy: presentationSettings.privacy,
-          }),
+        : sortPickerRowsByMetric(
+            buildPickerRows(endpointIndex, filter, {
+              providerPrefs: prefs,
+              privacy: presentationSettings.privacy,
+            }),
+            currentSort,
+          ),
     [
-      displayOrdered,
+      endpointIndex,
+      currentSort,
       filter,
       prefs,
       presentationSettings.privacy,
@@ -189,7 +185,7 @@ export function ProviderPicker({
       const current =
         prefs.order && prefs.order.length > 0
           ? endpointIndex.resolveRoutingRefs(prefs.order, { preserveUnknown: true })
-          : manualOrdered.map((e) => providerRoutingRef(e))
+          : endpointIndex.orderByRefs(undefined).map((e) => providerRoutingRef(e))
       const idx = current.indexOf(providerRef)
       if (idx < 0) current.push(providerRef)
       const from = current.indexOf(providerRef)
@@ -199,7 +195,7 @@ export function ProviderPicker({
       current.splice(to, 0, providerRef)
       updatePrefs({ order: current })
     },
-    [endpointIndex, manualOrdered, prefs.order, updatePrefs],
+    [endpointIndex, prefs.order, updatePrefs],
   )
 
   const setSort = useCallback(
@@ -250,7 +246,7 @@ export function ProviderPicker({
               path: ['providerPrefs', 'ignore'],
               value: enabled
                 ? mandatoryIgnore
-                : displayOrdered.map((endpoint) => providerRoutingRef(endpoint)),
+                : rows.map((row) => providerRoutingRef(row.endpoint)),
             },
             { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
             {
@@ -264,7 +260,7 @@ export function ProviderPicker({
           ]),
       })
     },
-    [chat.id, displayOrdered, providerRoutingTarget, rows, runConfigurationWrite],
+    [chat.id, providerRoutingTarget, rows, runConfigurationWrite],
   )
   const selectedLowQuantizationCount = useMemo(
     () =>
@@ -520,14 +516,14 @@ export function ProviderPicker({
   )
 }
 
-function sortEndpointsByMetric(endpoints: readonly ModelEndpoint[], sort: SortBy): ModelEndpoint[] {
-  return endpoints
-    .map((endpoint, index) => ({ endpoint, index, value: endpointSortValue(endpoint, sort) }))
+function sortPickerRowsByMetric(rows: readonly PickerRow[], sort: SortBy): PickerRow[] {
+  return rows
+    .map((row, index) => ({ row, index, value: endpointSortValue(row.endpoint, sort) }))
     .sort((left, right) => {
       if (left.value !== right.value) return left.value - right.value
       return left.index - right.index
     })
-    .map((entry) => entry.endpoint)
+    .map((entry) => entry.row)
 }
 
 function endpointSortValue(endpoint: ModelEndpoint, sort: SortBy): number {

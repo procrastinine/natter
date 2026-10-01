@@ -70,6 +70,7 @@ export class ProviderEndpointIndex {
 
   constructor(endpoints: readonly ModelEndpoint[], visit?: (endpoint: ModelEndpoint) => void) {
     this.endpoints = endpoints
+    const identities = new Set<string>()
     for (const endpoint of endpoints) {
       visit?.(endpoint)
       const slug = cleanRef(endpoint.provider_slug)
@@ -77,8 +78,12 @@ export class ProviderEndpointIndex {
       for (const candidate of providerRefCandidates(endpoint)) {
         appendEndpoint(this.normalizedCandidate, normalizeRef(candidate), endpoint)
       }
-      const display = providerDisplayName(endpoint)
-      this.displayCounts.set(display, (this.displayCounts.get(display) ?? 0) + 1)
+      const key = providerEndpointKey(endpoint)
+      if (!identities.has(key)) {
+        identities.add(key)
+        const display = providerDisplayName(endpoint)
+        this.displayCounts.set(display, (this.displayCounts.get(display) ?? 0) + 1)
+      }
     }
   }
 
@@ -137,7 +142,10 @@ export class ProviderEndpointIndex {
       }
     }
     for (const endpoint of this.endpoints) {
-      if (!seen.has(providerEndpointKey(endpoint))) out.push(endpoint)
+      const key = providerEndpointKey(endpoint)
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(endpoint)
     }
     return out
   }

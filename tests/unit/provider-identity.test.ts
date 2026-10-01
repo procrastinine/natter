@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ProviderEndpointIndex,
   endpointMatchesProviderRef,
   providerDisplayLabel,
   providerDisplayName,
@@ -26,6 +27,24 @@ function endpointAt(endpoints: readonly ModelEndpoint[], index: number): ModelEn
 }
 
 describe('provider identity helpers', () => {
+  it('orders each routing identity once even when discovery repeats unpinned observations', () => {
+    const normal = ep({ provider_name: 'BaseTen', provider_slug: 'baseten/fp8' })
+    const duplicate = { ...normal, throughput_last_30m: { p50: 100 } }
+    const fast = ep({ provider_name: 'BaseTen', provider_slug: 'baseten/fast' })
+    const index = new ProviderEndpointIndex([normal, duplicate, fast, { ...fast }])
+    expect(index.orderByRefs(undefined)).toEqual([normal, fast])
+    expect(index.orderByRefs(['baseten/fast'])).toEqual([fast, normal])
+    expect(index.orderByRefs(['BaseTen', 'baseten/fp8'])).toEqual([normal, fast])
+    expect(index.endpointsForRefs(['baseten/fp8'])).toEqual(new Set([normal, duplicate]))
+  })
+
+  it('disambiguates distinct identities without counting repeated observations as variants', () => {
+    const normal = ep({ provider_name: 'BaseTen', provider_slug: 'baseten/fp8' })
+    expect(new ProviderEndpointIndex([normal, { ...normal }]).displayLabel(normal)).toBe('BaseTen')
+    const legacy = [ep({ id: 'region-a' }), ep({ id: 'region-b' })]
+    expect(new ProviderEndpointIndex(legacy).orderByRefs(undefined)).toEqual(legacy)
+  })
+
   it('uses provider_slug as the canonical routing ref and endpoint key', () => {
     const endpoint = ep({
       provider_display_name: 'Anthropic',

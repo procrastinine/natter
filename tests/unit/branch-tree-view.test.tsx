@@ -700,13 +700,15 @@ const BranchTreeView = Object.assign(
       exact: locallyPresentedInspector ?? controllerInspector?.exact ?? null,
       retained: locallyPresentedInspector === null ? (controllerInspector?.retained ?? null) : null,
       resolving: controllerInspector?.resolving ?? false,
+      failure: controllerInspector?.failure ?? null,
     }
     const priorInspector = inspectorRef.current
     const inspector =
       priorInspector &&
       priorInspector.exact === nextInspector.exact &&
       priorInspector.retained === nextInspector.retained &&
-      priorInspector.resolving === nextInspector.resolving
+      priorInspector.resolving === nextInspector.resolving &&
+      priorInspector.failure?.reason === nextInspector.failure?.reason
         ? priorInspector
         : Object.freeze(nextInspector)
     inspectorRef.current = inspector
@@ -2400,6 +2402,43 @@ describe('BranchTreeView', () => {
       'data-message-id',
       'right',
     )
+  })
+
+  it('shows a current inspector read failure and clears it when another message is selected', async () => {
+    const getMessage = vi.fn(async (messageId: string) => {
+      if (messageId === 'left') throw new Error('Selected body unavailable')
+      return fullMessageFor(messageId)
+    })
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={repository({ getMessage })}
+        onActivateNode={() => undefined}
+      />,
+    )
+    await waitForActiveTree()
+    fireEvent.click(document.querySelector('[data-message-id="left"]') as Element)
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector-status"]')).toHaveTextContent(
+        'Could not load message: Selected body unavailable',
+      ),
+    )
+    expect(document.querySelector('[data-ui="branch-tree-inspector-status"]')).toHaveAttribute(
+      'role',
+      'alert',
+    )
+    expect(getMessage).toHaveBeenCalledTimes(1)
+    fireEvent.click(document.querySelector('[data-message-id="right"]') as Element)
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveTextContent(
+        'Full right',
+      ),
+    )
+    expect(document.querySelector('[data-ui="branch-tree-inspector-status"]')).toBeNull()
+    expect(getMessage).toHaveBeenCalledTimes(2)
   })
 
   it('aborts rapid superseded inspector reads and publishes only the latest selection', async () => {

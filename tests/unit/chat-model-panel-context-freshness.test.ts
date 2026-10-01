@@ -119,7 +119,7 @@ function conversationFrame(
       throw new Error('TreeTopologyMustStayCold')
     },
     transcript: { kind: 'absent', selectionEpoch: 1, resolving: false },
-    inspector: { exact: null, retained: null, resolving: false },
+    inspector: { exact: null, retained: null, resolving: false, failure: null },
     previews: emptyMap,
     failure: null,
     presentation: {

@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from 'vitest'
 import type { PrivacyFilterResult } from '../../src/core/privacy-filter'
+import { ProviderEndpointIndex } from '../../src/core/provider-identity'
 import type { DataPolicy, ModelEndpoint } from '../../src/core/types'
 import {
   buildPickerRows,
@@ -47,6 +48,116 @@ const POLICY_UNKNOWN_RETENTION: DataPolicy = {
 }
 
 describe('buildPickerRows', () => {
+  it('shares one row per routing identity between picker and privacy summary', () => {
+    const normal = ep('BaseTen', { provider_slug: 'baseten/fp8' })
+    const fast = ep('BaseTen', { provider_slug: 'baseten/fast' })
+    const observations = [normal, { ...normal }, fast, { ...fast }]
+    const filter: PrivacyFilterResult = {
+      model: 'z-ai/glm-5.2',
+      kept: observations.map((endpoint) => ({
+        endpoint,
+        policy: POLICY_CLEAN,
+        policySynthesized: false,
+      })),
+      excluded: [],
+      zeroEligible: false,
+    }
+    for (const privacy of [filter, null]) {
+      expect(buildPickerRows(observations, privacy).map((row) => row.endpoint)).toEqual([
+        normal,
+        fast,
+      ])
+    }
+    const refreshed = { ...normal, throughput_last_30m: { p50: 250 } }
+    expect(buildPickerRows([refreshed, { ...refreshed }], null).map((row) => row.endpoint)).toEqual(
+      [refreshed],
+    )
+  })
+
+  it('does not let a repeated soft exclusion replace a hard denial for the same route', () => {
+    const normal = ep('BaseTen', { provider_slug: 'baseten/fp8' })
+    const denied = { ...normal }
+    const soft = { ...normal }
+    const filter: PrivacyFilterResult = {
+      model: 'z-ai/glm-5.2',
+      kept: [{ endpoint: normal, policy: POLICY_CLEAN, policySynthesized: false }],
+      excluded: [
+        {
+          endpoint: denied,
+          policy: { ...POLICY_CLEAN, training: true },
+          policySynthesized: false,
+          reasons: ['training'],
+        },
+        { endpoint: soft, policy: POLICY_CLEAN, policySynthesized: false, reasons: ['dominated'] },
+      ],
+      zeroEligible: true,
+    }
+    for (const excluded of [filter.excluded, [...filter.excluded].reverse()]) {
+      const rows = buildPickerRows(
+        [normal, denied, soft],
+        { ...filter, excluded },
+        {
+          providerPrefs: { ignoreOverridesFilter: true, only: ['baseten/fp8'] },
+        },
+      )
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.state).toBe('auto-excluded')
+      expect(rows[0] && pickerRowIsHardDenied(rows[0])).toBe(true)
+    }
+  })
+
+  it('resolves manual aliases across every observation before selecting a representative', () => {
+    const normal = ep('BaseTen', { id: 'observation-a', provider_slug: 'baseten/fp8' })
+    const duplicate = { ...normal, id: 'observation-b' }
+    const index = new ProviderEndpointIndex([normal, duplicate])
+    const filter: PrivacyFilterResult = {
+      model: 'z-ai/glm-5.2',
+      kept: [normal, duplicate].map((endpoint) => ({
+        endpoint,
+        policy: POLICY_CLEAN,
+        policySynthesized: false,
+      })),
+      excluded: [],
+      zeroEligible: false,
+    }
+    const options = { providerPrefs: { ignoreOverridesFilter: true, only: ['observation-b'] } }
+    expect(buildPickerRows(index, filter, options)).toMatchObject([
+      { endpoint: normal, state: 'kept' },
+    ])
+    expect(
+      buildPickerRows(index, filter, {
+        providerPrefs: { ...options.providerPrefs, ignore: ['observation-b'] },
+      }),
+    ).toMatchObject([{ state: 'auto-excluded', reasons: ['user-ignored'] }])
+  })
+
+  it('shows the worst policy of admitted observations independently of their order', () => {
+    const normal = ep('BaseTen', { provider_slug: 'baseten/fp8' })
+    const duplicate = { ...normal }
+    const kept = [
+      {
+        endpoint: normal,
+        policy: { ...POLICY_CLEAN, retainsPrompts: true, retentionDays: 30 },
+        policySynthesized: false,
+      },
+      { endpoint: duplicate, policy: POLICY_CLEAN, policySynthesized: false },
+    ]
+    for (const observations of [kept, [...kept].reverse()]) {
+      const rows = buildPickerRows([normal, duplicate], {
+        model: 'test/model',
+        kept: observations,
+        excluded: [],
+        zeroEligible: false,
+      })
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({
+        state: 'kept',
+        tier: 'yellow',
+        policy: { retentionDays: 30 },
+      })
+    }
+  })
+
   it('keeps newly discovered providers outside an empty or nonempty manual set', () => {
     const original = ep('Original')
     const added = ep('New Provider')

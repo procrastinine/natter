@@ -222,6 +222,17 @@ interface ConversationTranscriptBindingPayload {
   readonly viewportRevision: number
 }
 
+interface ConversationInspectorProjection {
+  readonly exact: ConversationMessagePresentation | null
+  readonly retained: ConversationMessagePresentation | null
+  readonly resolving: boolean
+  readonly failure: {
+    readonly messageId: MessageId
+    readonly bodyVersion: number
+    readonly reason: ConversationProjectionFailure
+  } | null
+}
+
 interface ConversationTreeBindingPayload {
   readonly surface: 'tree'
   readonly seal: ConversationPresentationSeal
@@ -230,11 +241,7 @@ interface ConversationTreeBindingPayload {
   readonly topology: MessageTreeProjection<StructuralMessageHeader>
   readonly headerChangeRevision: number
   readonly changedHeaderKeys: readonly string[]
-  readonly inspector: {
-    readonly exact: ConversationMessagePresentation | null
-    readonly retained: ConversationMessagePresentation | null
-    readonly resolving: boolean
-  }
+  readonly inspector: ConversationInspectorProjection
   readonly previews: ReadonlyMap<MessageId, MessageTextPreview>
 }
 
@@ -636,11 +643,7 @@ export interface ConversationChatSnapshot {
   readonly changedHeaderKeys: readonly string[]
   readonly topologyLoaded: boolean
   readonly transcript: ConversationTranscriptProjection
-  readonly inspector: {
-    readonly exact: ConversationMessagePresentation | null
-    readonly retained: ConversationMessagePresentation | null
-    readonly resolving: boolean
-  }
+  readonly inspector: ConversationInspectorProjection
   readonly previews: ReadonlyMap<MessageId, MessageTextPreview>
   readonly failure: ConversationProjectionFailure | null
   readonly presentation: ConversationPresentationFrame
@@ -878,6 +881,7 @@ interface ActiveProjection {
   headerFacts: ConversationMessageHeaderLookup
   headerFactsHeaders: PersistentStringMap<MessageHeaderRow>
   headerFactsPath: BranchPathDescriptor<MessageHeaderRow> | null
+  headerFactsTopology: ConversationMessageHeaderLookup | null
   treeHeaderFacts: ConversationMessageHeaderLookup
   treeHeaderFactsSource: ConversationMessageHeaderLookup
   treeHeaderFactsTopology: MessageTreeProjection<StructuralMessageHeader> | null
@@ -946,11 +950,6 @@ interface PendingRead {
   controller: AbortController
 }
 
-interface BlockedRead {
-  readonly key: string
-  readonly observationRevision: number
-}
-
 const TOPOLOGY_OPTIONS: MessageTopologyOptions<StructuralMessageHeader> = {
   sameStructure: sameStructuralHeader,
   sameValue: sameStructuralHeader,
@@ -958,6 +957,11 @@ const TOPOLOGY_OPTIONS: MessageTopologyOptions<StructuralMessageHeader> = {
 
 const EMPTY_TOPOLOGY = createMessageTopologyIndex<StructuralMessageHeader>([], TOPOLOGY_OPTIONS)
 const EMPTY_STRUCTURAL_TOPOLOGY = structuralTopologyView(EMPTY_TOPOLOGY)
+const EMPTY_HEADER_FACTS: ConversationMessageHeaderLookup = Object.freeze({
+  get: (_messageId: MessageId) => undefined,
+  has: (_messageId: MessageId) => false,
+})
+const EMPTY_HEADER_KEYS: readonly string[] = Object.freeze([])
 const ABSENT_TOPOLOGY: ActiveTopologyState = Object.freeze({ kind: 'absent' })
 const FULL_PROJECTION_REFRESH: ConversationProjectionRefresh = Object.freeze({
   chat: true,
@@ -1132,7 +1136,7 @@ class TabConversationController implements ConversationController {
   private readonly inspectorDemands = new Map<object, InspectorDemand>()
   private readonly previewDemands = new Map<object, TreePreviewDemand>()
   private readonly reads = new Map<ReadKind, PendingRead>()
-  private readonly blockedReads = new Map<ReadKind, BlockedRead>()
+  private readonly blockedReads = new Map<ReadKind, ConversationProjectionFailure>()
   private readonly pendingForkParentIds = new Set<MessageId | null>()
   private settledTranscriptBudget = transcriptRowFloorBudget(DEFAULT_TRANSCRIPT_INITIAL_ROW_COUNT)
   private pendingForkChatId: ChatId | null = null
@@ -2549,7 +2553,7 @@ class TabConversationController implements ConversationController {
       topologyChildSlots: active.topology.kind === 'exact' ? active.topology.childSlots : new Map(),
       topologyLoaded: active.topology.kind === 'exact',
       topologyFailed: active.failure?.kind === 'topology',
-      headers: active.topology.kind === 'exact' ? active.topology.headers : active.headers,
+      headers: this.publishedHeaderFacts(active),
       captureMaterial: (headers) =>
         this.acquirePromptMaterial(workspaceFence, active.chatId, headers),
     })
@@ -4369,8 +4373,12 @@ class TabConversationController implements ConversationController {
   }
 
   private releaseTopology(): void {
+    if (this.stageTopologyRelease()) this.publish()
+  }
+
+  private stageTopologyRelease(): boolean {
     const active = this.active
-    if (!active) return
+    if (!active) return false
     const previousHeaders = active.headers
     this.cancelRead('topology')
     this.blockedReads.delete('topology')
@@ -4380,14 +4388,19 @@ class TabConversationController implements ConversationController {
     const releasedFailure = active.failure?.kind === 'topology'
     if (releasedFailure) active.failure = null
     this.compactExactHeaders()
-    if (
+    active.treeHeaderFacts = EMPTY_HEADER_FACTS
+    active.treeHeaderFactsSource = EMPTY_HEADER_FACTS
+    active.treeHeaderFactsTopology = null
+    active.treeChangedHeaderKeys = EMPTY_HEADER_KEYS
+    active.treeChangedHeaderKeysSource = EMPTY_HEADER_KEYS
+    active.treeChangedHeaderKeysTopology = null
+    this.publishedHeaderFacts(active)
+    return (
       releasedLoadedTopology ||
       recycledResident ||
       releasedFailure ||
       active.headers !== previousHeaders
-    ) {
-      this.publish()
-    }
+    )
   }
 
   private recycleTreeResident(active: ActiveProjection): boolean {
@@ -4412,6 +4425,7 @@ class TabConversationController implements ConversationController {
         exact: null,
         retained: retainedInspector,
         resolving: false,
+        failure: null,
       }),
       previews: new Map(),
     })
@@ -5017,6 +5031,35 @@ class TabConversationController implements ConversationController {
     }
   }
 
+  private inspectorProjection(
+    active: ActiveProjection,
+    retained = active.inspector.retained,
+  ): ConversationInspectorProjection {
+    const demand = latestInspectorDemand(this.inspectorDemands, active.chatId)
+    const header = demand ? this.authoritativeHeader(demand.messageId) : undefined
+    const blocked = this.blockedReads.get('inspector')
+    const failure =
+      demand &&
+      header &&
+      blocked?.key === this.inspectorReadKey(active.chatId, demand.messageId, header.bodyVersion)
+        ? Object.freeze({
+            messageId: demand.messageId,
+            bodyVersion: header.bodyVersion,
+            reason: blocked,
+          })
+        : null
+    return Object.freeze({
+      exact: active.inspector.exact,
+      retained,
+      resolving: active.inspector.resolvingKey !== null,
+      failure,
+    })
+  }
+
+  private inspectorReadKey(chatId: ChatId, messageId: MessageId, bodyVersion: number): string {
+    return `${this.workspaceKey()}:${chatId}:${messageId}:${bodyVersion}`
+  }
+
   private requestInspector(): void {
     const active = this.active
     const demand = active ? latestInspectorDemand(this.inspectorDemands, active.chatId) : null
@@ -5046,7 +5089,7 @@ class TabConversationController implements ConversationController {
     ) {
       return
     }
-    const key = `${this.workspaceKey()}:${active.chatId}:${demand.messageId}:${header.bodyVersion}`
+    const key = this.inspectorReadKey(active.chatId, demand.messageId, header.bodyVersion)
     if (this.reads.get('inspector')?.key === key) return
     if (this.readIsBlocked('inspector', key)) return
     if (active.inspector.exact) active.inspector.retained = active.inspector.exact
@@ -5198,21 +5241,29 @@ class TabConversationController implements ConversationController {
 
   private authoritativeHeader(messageId: MessageId): MessageHeaderRow | undefined {
     const active = this.active
-    return active?.headers.get(messageId) ?? this.presentedSpine()?.path.get(messageId)
+    return active ? this.publishedHeaderFacts(active).get(messageId) : undefined
   }
 
   private publishedHeaderFacts(active: ActiveProjection): ConversationMessageHeaderLookup {
     const path = presentedConversationDestinationSpine(active.destination)?.path ?? null
-    if (active.headerFactsHeaders === active.headers && active.headerFactsPath === path) {
+    const topology = active.topology.kind === 'exact' ? active.topology.headers : null
+    if (
+      active.headerFactsHeaders === active.headers &&
+      active.headerFactsPath === path &&
+      active.headerFactsTopology === topology
+    ) {
       return active.headerFacts
     }
     const headers = active.headers
+    const get = (messageId: MessageId) =>
+      headers.get(messageId) ?? path?.get(messageId) ?? topology?.get(messageId)
     active.headerFacts = Object.freeze({
-      get: (messageId: MessageId) => headers.get(messageId) ?? path?.get(messageId),
-      has: (messageId: MessageId) => headers.has(messageId) || Boolean(path?.has(messageId)),
+      get,
+      has: (messageId: MessageId) => get(messageId) !== undefined,
     })
     active.headerFactsHeaders = headers
     active.headerFactsPath = path
+    active.headerFactsTopology = topology
     return active.headerFacts
   }
 
@@ -5227,7 +5278,7 @@ class TabConversationController implements ConversationController {
       })
     }
     const topology = active.topology.projection
-    const source = active.topology.headers
+    const source = this.publishedHeaderFacts(active)
     if (active.treeHeaderFactsSource !== source || active.treeHeaderFactsTopology !== topology) {
       active.treeHeaderFacts = Object.freeze({
         get: (messageId: MessageId) =>
@@ -5343,7 +5394,6 @@ class TabConversationController implements ConversationController {
     code: ConversationProjectionFailure['code'],
     error: unknown,
   ): void {
-    this.blockedReads.set(kind, { key, observationRevision: this.observationRevision })
     const active = this.active
     if (!active) return
     this.stopResolving(kind)
@@ -5354,6 +5404,7 @@ class TabConversationController implements ConversationController {
       observationRevision: this.observationRevision,
       message: projectionFailureMessage(error),
     })
+    this.blockedReads.set(kind, failure)
     active.failure = failure
     if (kind === 'selection' || kind === 'sibling-navigation') {
       this.settleSelectionDestination(
@@ -5559,11 +5610,7 @@ class TabConversationController implements ConversationController {
       topology: active.topology.projection,
       headerChangeRevision: active.headerChangeRevision,
       changedHeaderKeys: treeFacts.changedHeaderKeys,
-      inspector: Object.freeze({
-        exact: active.inspector.exact,
-        retained: active.inspector.retained ?? residentInspector,
-        resolving: active.inspector.resolvingKey !== null,
-      }),
+      inspector: this.inspectorProjection(active, active.inspector.retained ?? residentInspector),
       previews: active.previewSnapshot,
       currency: 'current',
       reveal: eligiblePresentationReveal(
@@ -5848,6 +5895,7 @@ class TabConversationController implements ConversationController {
         }
       }
     }
+    if (!this.activeNeedsTopology(active)) this.stageTopologyRelease()
     const request = Object.freeze({ ...session.presentationRequest })
     const paintedBinding = this.paintedFrame?.binding ?? null
     const transcriptResident =
@@ -6060,11 +6108,7 @@ class TabConversationController implements ConversationController {
             changedHeaderKeys: active.changedHeaderKeys,
             topologyLoaded: active.topology.kind === 'exact',
             transcript,
-            inspector: Object.freeze({
-              exact: active.inspector.exact,
-              retained: active.inspector.retained,
-              resolving: active.inspector.resolvingKey !== null,
-            }),
+            inspector: this.inspectorProjection(active),
             previews: active.previewSnapshot,
             failure: active.failure,
             presentation,
@@ -6375,6 +6419,7 @@ function sameConversationBindingPayload(
         current.inspector.exact === incoming.inspector.exact &&
         current.inspector.retained === incoming.inspector.retained &&
         current.inspector.resolving === incoming.inspector.resolving &&
+        current.inspector.failure?.reason === incoming.inspector.failure?.reason &&
         current.previews === incoming.previews
 }
 
@@ -6803,10 +6848,7 @@ function pointTranscriptMatchesAttempt(
 
 function newActiveProjection(chatId: ChatId): ActiveProjection {
   const headers = PersistentStringMap.empty<MessageHeaderRow>()
-  const headerFacts: ConversationMessageHeaderLookup = Object.freeze({
-    get: (_messageId: MessageId) => undefined,
-    has: (_messageId: MessageId) => false,
-  })
+  const headerFacts = EMPTY_HEADER_FACTS
   return {
     chatId,
     chat: null,
@@ -6816,11 +6858,12 @@ function newActiveProjection(chatId: ChatId): ActiveProjection {
     headerFacts,
     headerFactsHeaders: headers,
     headerFactsPath: null,
+    headerFactsTopology: null,
     treeHeaderFacts: headerFacts,
     treeHeaderFactsSource: headerFacts,
     treeHeaderFactsTopology: null,
-    treeChangedHeaderKeys: Object.freeze([]),
-    treeChangedHeaderKeysSource: Object.freeze([]),
+    treeChangedHeaderKeys: EMPTY_HEADER_KEYS,
+    treeChangedHeaderKeysSource: EMPTY_HEADER_KEYS,
     treeChangedHeaderKeysTopology: null,
     compactableHeaderIds: new Set(),
     forks: PersistentStringMap.empty(),

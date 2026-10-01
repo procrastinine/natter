@@ -763,6 +763,11 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
     workspace.style.setProperty('--branch-tree-canvas-min-width', `${inspectorBounds.canvasMin}px`)
   }, [inspectorBounds.canvasMin, inspectorBounds.min, inspectorWidth])
 
+  const selectedInspectorFailure =
+    binding.inspector.failure?.messageId === inspectedMessageId &&
+    binding.inspector.failure.bodyVersion === selectedBodyVersion
+      ? binding.inspector.failure.reason
+      : null
   const exactInspectedPresentation = binding.inspector.exact
   const retainedInspectedPresentation = binding.inspector.retained
   const exactInspectorBodyReady =
@@ -1825,7 +1830,11 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
               onKeyDown={handleSeparatorKeyDown}
             />
             <div data-ui="branch-tree-inspector-slot">
-              {!inspectedMessage || inspectedMessage.id !== inspectedMessageId ? (
+              {selectedInspectorFailure ? (
+                <div role="alert" data-ui="branch-tree-inspector-status">
+                  Could not load message: {selectedInspectorFailure.message}
+                </div>
+              ) : !inspectedMessage || inspectedMessage.id !== inspectedMessageId ? (
                 <div role="status" data-ui="branch-tree-inspector-status">
                   Loading message…
                 </div>
