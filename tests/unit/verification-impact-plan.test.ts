@@ -563,6 +563,7 @@ describe('verification slice impact planner', () => {
     expect(plan.impactedObligations).toEqual([])
     expect(plan.tasks.vitest).toEqual([])
     expect(plan.structuralBlockers).toEqual([`VerificationChangedPathUnclassified:${script}`])
+    expect(plan.stages.map((stage) => stage.id)).toEqual(['formatting'])
   })
 
   it('bounds an ordinary tooling change to its consumers and registered audit', () => {
@@ -681,9 +682,17 @@ describe('verification slice impact planner', () => {
       opaqueDispositions: [],
       moduleInventory: moduleInventory([]),
     })
-    expect(plan.stages.map((stage) => stage.id)).toEqual(['protocol-contracts', 'vitest'])
-    expect(plan.stages[1]?.prerequisiteIds).toEqual(['protocol-contracts'])
-    expect(plan.stages[0]?.argv).toEqual(PROTOCOL_CONTRACT_STAGE.argv)
+    expect(plan.stages.map((stage) => stage.id)).toEqual([
+      'formatting',
+      'protocol-contracts',
+      'vitest',
+    ])
+    expect(plan.stages.find((stage) => stage.id === 'vitest')?.prerequisiteIds).toEqual([
+      'protocol-contracts',
+    ])
+    expect(plan.stages.find((stage) => stage.id === 'protocol-contracts')?.argv).toEqual(
+      PROTOCOL_CONTRACT_STAGE.argv,
+    )
     const withoutProducer = planSliceVerification({
       base,
       current: mutateFile(base, PROOF_FILE, 'after'),
@@ -727,7 +736,9 @@ describe('verification slice impact planner', () => {
       })
       expect(plan.tasks.vitest).toEqual([PROOF_FILE])
       expect(plan.tasks.playwright).toEqual([])
-      expect(plan.impactedStageIds).toEqual(input === 'vitest.config.ts' ? ['vitest'] : [])
+      expect(plan.impactedStageIds).toEqual(
+        input === 'vitest.config.ts' ? ['formatting', 'vitest'] : ['formatting'],
+      )
       expect(plan.stages.map(({ id }) => id)).toContain('vitest')
       expect(plan.structuralBlockers).toEqual([])
     },
@@ -938,8 +949,47 @@ describe('verification slice impact planner', () => {
     })
     expect(plan.tasks.vitest).toEqual([PROOF_FILE])
     expect(plan.tasks.playwright).toEqual([])
-    expect(plan.impactedStageIds).toEqual(['vitest'])
+    expect(plan.impactedStageIds).toEqual(['formatting', 'vitest'])
     expect(plan.structuralBlockers).toEqual([])
+  })
+
+  it.each([
+    'src/view.tsx',
+    'tests/unit/provider-identity.test.ts',
+    'tests/e2e/branch-tree.spec.ts',
+    'scripts/example.mjs',
+    'src/theme.css',
+    'src/capabilities/model.json',
+    'example.config.ts',
+  ])('includes the canonical Biome check for changes to %s', (path) => {
+    const browser = 'tests/e2e/unrelated.spec.ts'
+    const base = snapshot({
+      files: { [path]: 'before', [browser]: 'unrelated' },
+      dependencies: { [path]: [], [browser]: [] },
+    })
+    const options = {
+      base,
+      obligations: [],
+      proofs: [],
+      globalInputs: [],
+      opaqueDispositions: [],
+      moduleInventory: moduleInventory(path.startsWith('src/') ? [path] : []),
+    }
+    const without = removeFile(base, path)
+    for (const [previous, current] of [
+      [base, mutateFile(base, path, 'after')],
+      [without, base],
+      [base, without],
+    ] as const) {
+      const plan = planSliceVerification({ ...options, base: previous, current })
+      const formatting = plan.stages.filter((stage) => stage.id === 'formatting')
+      expect(formatting).toHaveLength(1)
+      expect(formatting[0]?.argv).toEqual(['pnpm', 'exec', 'biome', 'check', '.'])
+      expect(formatting[0]?.policy).toBe('blocking')
+      expect(plan.tasks.playwright.flatMap((task) => task.files)).not.toContain(browser)
+    }
+    const unchanged = planSliceVerification({ ...options, current: base })
+    expect(unchanged.stages).toEqual([])
   })
 
   it('selects a lint stage for its config without either test runner', () => {
@@ -1035,8 +1085,8 @@ describe('verification slice impact planner', () => {
       moduleInventory: moduleInventory(['src/a.ts']),
     })
     expect(plan.structuralBlockers).toEqual([])
-    expect(plan.impactedStageIds).toEqual([])
-    expect(plan.stages.map((stage) => stage.id)).toEqual(['vitest'])
+    expect(plan.impactedStageIds).toEqual(['formatting'])
+    expect(plan.stages.map((stage) => stage.id)).toEqual(['formatting', 'vitest'])
     expect(plan.tasks.vitest).toEqual([PROOF_FILE])
     expect(plan.tasks.playwright).toEqual([])
   })
@@ -1116,11 +1166,12 @@ describe('verification slice impact planner', () => {
       writeFixture(root, 'src/a.ts', source)
       writeFixture(root, 'src/theme.css', ':root {}')
       writeFixture(root, 'package.json', '{"name":"fixture"}')
+      writeFixture(root, '.vscode/settings.json', '{}')
       const reads = new Map<string, number>()
       const parses = new Map<string, number>()
       const filesystemSource = createFilesystemLocalModuleSource({
         root,
-        additionalPaths: ['package.json'],
+        additionalPaths: ['package.json', '.vscode/settings.json'],
       })
       const current = buildVerificationSnapshot({
         globalInputs: ['package.json', 'src/a.ts'],

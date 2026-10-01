@@ -269,12 +269,18 @@ export async function restoreWorkspaceThroughUi(page, backup, options = {}) {
 }
 
 export async function waitForWorkspaceRunning(page) {
-  await page.waitForFunction(
-    () =>
+  await page.waitForFunction(() => {
+    const failure = document.querySelector('[data-ui="workspace-bootstrap"][data-state="failed"]')
+    if (failure) {
+      const diagnostics = failure.querySelector('[data-ui="workspace-bootstrap-diagnostics"] pre')
+      throw new Error(`WorkspaceStartupFailed: ${diagnostics?.textContent ?? 'No diagnostics'}`)
+    }
+    return (
       document
         .querySelector('[data-ui="app-shell"]')
-        ?.getAttribute('data-workspace-runtime-state') === 'RUNNING',
-  )
+        ?.getAttribute('data-workspace-runtime-state') === 'RUNNING'
+    )
+  })
 }
 
 async function setWorkspaceImportFile(page, backup, filename) {

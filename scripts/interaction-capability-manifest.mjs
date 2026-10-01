@@ -22,7 +22,7 @@ export const INTERACTION_REVIEW_BASELINE = Object.freeze({
   exactSiteIdSha256: 'a410a607e615f346872f8e5389260202e846b1acdf94dab76654323cca4b0e53',
   sourceFactSha256: 'c89c177432b0c92dbaaee5ca0f745d12e74e2ce2b16e18c53230efb143f230a7',
   presentationDefinitionSha256: '149f270b61a932f0ff2c6459725df46c9abc50fc7b9e793436e6b388d0a3b767',
-  interactionOutcomeSha256: '0e05228c668b3160772d236124ae7f605357bf4a47b5a05764bebfeb2726668a',
+  interactionOutcomeSha256: '997754a9f4bbf729864327c4bbd794aad3cbfdd06d4c48926b283896bd55c7da',
   disposition:
     'Any source interaction or analyzed handler-fact drift reopens classification review before the baseline may be updated.',
 })

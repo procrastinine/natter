@@ -1810,76 +1810,74 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
           <TreeDensityToggle placement="canvas" />
         </div>
 
-        {inspectedMessageId ? (
-          <>
-            {/* biome-ignore lint/a11y/useSemanticElements: the interactive full-height drag target must not inherit hr geometry. */}
-            <div
-              role="separator"
-              tabIndex={0}
-              aria-label="Resize message details"
-              aria-orientation="vertical"
-              aria-valuemin={Math.round((inspectorBounds.min / workspaceWidth) * 100)}
-              aria-valuemax={Math.round((inspectorBounds.max / workspaceWidth) * 100)}
-              aria-valuenow={Math.round((inspectorWidth / workspaceWidth) * 100)}
-              data-ui="branch-tree-separator"
-              onPointerDown={handleSeparatorPointerDown}
-              onPointerMove={handleSeparatorPointerMove}
-              onPointerUp={handleSeparatorPointerEnd}
-              onPointerCancel={handleSeparatorPointerEnd}
-              onLostPointerCapture={handleSeparatorPointerEnd}
-              onKeyDown={handleSeparatorKeyDown}
-            />
-            <div data-ui="branch-tree-inspector-slot">
-              {selectedInspectorFailure ? (
-                <div role="alert" data-ui="branch-tree-inspector-status">
-                  Could not load message: {selectedInspectorFailure.message}
-                </div>
-              ) : !inspectedMessage || inspectedMessage.id !== inspectedMessageId ? (
-                <div role="status" data-ui="branch-tree-inspector-status">
-                  Loading message…
-                </div>
-              ) : inspectorMessage ? (
-                <Suspense
-                  fallback={
-                    <div role="status" data-ui="branch-tree-inspector-status">
-                      Loading message renderer…
-                    </div>
-                  }
-                >
-                  <BranchTreeInspector
-                    key={inspectorMessage.id}
-                    message={inspectorMessage}
-                    presentationFence={binding.seal}
-                    bodyVersion={inspectorBodyVersion as number}
-                    bodyReady={exactInspectorBodyReady}
-                    searchQuery={normalizedQuery}
-                    searchMatched={matchSet.has(inspectedMessageId)}
-                    generationSubmissionPending={generationSubmissionPending}
-                    structuralMutationPending={structuralMutationPending}
-                    {...(onCancelGenerationSubmission ? { onCancelGenerationSubmission } : {})}
-                    {...(onCancelStructuralMutation ? { onCancelStructuralMutation } : {})}
-                    streamOnActivePath={activePathIds.has(inspectedMessageId)}
-                    onClose={clearSelection}
-                    onActivate={handleInspectorActivate}
-                    {...(onEditMessage ? { onEdit: onEditMessage } : {})}
-                    {...(onEditAndSendMessage ? { onEditAndSend: onEditAndSendMessage } : {})}
-                    {...(onRegenerateMessage
-                      ? { onRegenerate: () => onRegenerateMessage(inspectorMessage) }
-                      : {})}
-                    {...(onContinueMessage
-                      ? { onContinue: () => onContinueMessage(inspectorMessage) }
-                      : {})}
-                    {...inspectorMessageActions}
-                  />
-                </Suspense>
-              ) : (
-                <div role="status" data-ui="branch-tree-inspector-status">
-                  Loading message…
-                </div>
-              )}
+        {/* biome-ignore lint/a11y/useSemanticElements: the interactive full-height drag target must not inherit hr geometry. */}
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize message details"
+          aria-orientation="vertical"
+          aria-valuemin={Math.round((inspectorBounds.min / workspaceWidth) * 100)}
+          aria-valuemax={Math.round((inspectorBounds.max / workspaceWidth) * 100)}
+          aria-valuenow={Math.round((inspectorWidth / workspaceWidth) * 100)}
+          data-ui="branch-tree-separator"
+          onPointerDown={handleSeparatorPointerDown}
+          onPointerMove={handleSeparatorPointerMove}
+          onPointerUp={handleSeparatorPointerEnd}
+          onPointerCancel={handleSeparatorPointerEnd}
+          onLostPointerCapture={handleSeparatorPointerEnd}
+          onKeyDown={handleSeparatorKeyDown}
+        />
+        <div data-ui="branch-tree-inspector-slot">
+          {!inspectedMessageId ? (
+            <div data-ui="branch-tree-inspector-empty">Select a message to inspect it.</div>
+          ) : selectedInspectorFailure ? (
+            <div role="alert" data-ui="branch-tree-inspector-status">
+              Could not load message: {selectedInspectorFailure.message}
             </div>
-          </>
-        ) : null}
+          ) : !inspectedMessage || inspectedMessage.id !== inspectedMessageId ? (
+            <div role="status" data-ui="branch-tree-inspector-status">
+              Loading message…
+            </div>
+          ) : inspectorMessage ? (
+            <Suspense
+              fallback={
+                <div role="status" data-ui="branch-tree-inspector-status">
+                  Loading message renderer…
+                </div>
+              }
+            >
+              <BranchTreeInspector
+                key={inspectorMessage.id}
+                message={inspectorMessage}
+                presentationFence={binding.seal}
+                bodyVersion={inspectorBodyVersion as number}
+                bodyReady={exactInspectorBodyReady}
+                searchQuery={normalizedQuery}
+                searchMatched={matchSet.has(inspectedMessageId)}
+                generationSubmissionPending={generationSubmissionPending}
+                structuralMutationPending={structuralMutationPending}
+                {...(onCancelGenerationSubmission ? { onCancelGenerationSubmission } : {})}
+                {...(onCancelStructuralMutation ? { onCancelStructuralMutation } : {})}
+                streamOnActivePath={activePathIds.has(inspectedMessageId)}
+                onClose={clearSelection}
+                onActivate={handleInspectorActivate}
+                {...(onEditMessage ? { onEdit: onEditMessage } : {})}
+                {...(onEditAndSendMessage ? { onEditAndSend: onEditAndSendMessage } : {})}
+                {...(onRegenerateMessage
+                  ? { onRegenerate: () => onRegenerateMessage(inspectorMessage) }
+                  : {})}
+                {...(onContinueMessage
+                  ? { onContinue: () => onContinueMessage(inspectorMessage) }
+                  : {})}
+                {...inspectorMessageActions}
+              />
+            </Suspense>
+          ) : (
+            <div role="status" data-ui="branch-tree-inspector-status">
+              Loading message…
+            </div>
+          )}
+        </div>
       </div>
     </section>
   )

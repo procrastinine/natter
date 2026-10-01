@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  ProviderEndpointIndex,
   endpointMatchesProviderRef,
+  ProviderEndpointIndex,
   providerDisplayLabel,
   providerDisplayName,
   providerEndpointKey,

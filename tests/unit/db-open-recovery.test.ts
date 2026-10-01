@@ -987,6 +987,58 @@ describe('openDb recovery events', () => {
     },
   )
 
+  it('adopts a peer repair completed after both contenders queued for selection', async () => {
+    await createLegacyRepairWorkspace()
+    const locks = new RecordingWebLockManager()
+    const coordinator = installStartupRepairRuntime(locks)
+    const selection = 'natter:workspace-slot-selection:v1'
+    const held = startupBoundaryGate()
+    const release = startupBoundaryGate()
+    const queued = startupBoundaryGate()
+    const holder = locks.request(selection, { mode: 'exclusive' }, async () => {
+      held.release()
+      await release.promise
+    })
+    await held.promise
+    let contenders = 0
+    locks.onRequest = (name, options) => {
+      if (name === selection && options.mode === 'exclusive' && ++contenders === 2) queued.release()
+    }
+    const activate = vi.spyOn(browserWorkspaceControl, 'activatePreparedBrowserWorkspaceDatabase')
+    const openings = [0, 1].map(() =>
+      ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal),
+    )
+    const outcomes = Promise.allSettled(openings)
+    try {
+      await queued.promise
+      expect((await locks.query()).pending).toEqual([
+        { name: selection, mode: 'exclusive' },
+        { name: selection, mode: 'exclusive' },
+      ])
+      release.release()
+      await holder
+      const proof = {
+        databaseName: 'natter-workspace-a',
+        activationSequence: 1,
+        physicalVersion: 980,
+      }
+      expect(await outcomes).toEqual([
+        { status: 'fulfilled', value: proof },
+        { status: 'fulfilled', value: proof },
+      ])
+      expect(activate).toHaveBeenCalledTimes(1)
+      expect((await readBrowserWorkspaceDatabaseManifest()).pending?.phase).toBe('cleanup')
+      expect((await indexedDB.databases()).map((database) => database.name)).toContain('natter')
+      expect(await locks.query()).toEqual({ held: [], pending: [] })
+    } finally {
+      locks.onRequest = null
+      release.release()
+      await holder
+      await outcomes
+      disposeBrowserWorkspaceSlotCoordinator(coordinator)
+    }
+  })
+
   it('returns the repaired active source while old-source reclamation waits on an independent holder', async () => {
     await createLegacyRepairWorkspace()
     const locks = new RecordingWebLockManager()

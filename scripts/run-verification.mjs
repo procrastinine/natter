@@ -83,7 +83,7 @@ export const VERIFICATION_STAGES = Object.freeze([
     'Check formatting and Biome lint',
     'blocking',
     ['pnpm', 'exec', 'biome', 'check', '.'],
-    { assurance: 'hygiene', inputPaths: ['biome.json'] },
+    { assurance: 'hygiene', inputPaths: ['biome.json'], impact: 'any-change' },
   ),
   stage(
     'semantic-lint',

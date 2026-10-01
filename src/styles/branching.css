@@ -169,11 +169,7 @@
   min-width: 0;
   min-height: 0;
   flex: 1 1 auto;
-  grid-template-columns: minmax(0, 1fr);
   overflow: hidden;
-}
-
-[data-ui="branch-tree-workspace"][data-inspector-open] {
   grid-template-columns:
     minmax(var(--branch-tree-canvas-min-width), 1fr) 1px
     minmax(var(--branch-tree-inspector-min-width), var(--branch-tree-inspector-width));
@@ -558,6 +554,7 @@
   background: var(--color-bg-surface-1);
 }
 
+[data-ui="branch-tree-inspector-empty"],
 [data-ui="branch-tree-inspector-status"] {
   display: grid;
   min-height: 100%;

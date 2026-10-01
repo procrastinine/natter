@@ -27,6 +27,7 @@ export interface VerificationStage {
   readonly nodeOptions?: readonly string[]
   readonly inputPaths?: readonly string[]
   readonly inputPrefixes?: readonly string[]
+  readonly impact?: 'any-change'
   readonly prerequisites?: readonly { readonly id: string; readonly consumerModules?: readonly string[]; readonly propagateImpact?: boolean }[]
   readonly prerequisiteIds?: readonly string[]
   readonly unitFiles?: readonly string[]

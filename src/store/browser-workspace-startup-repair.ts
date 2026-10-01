@@ -2,7 +2,7 @@ import Dexie from 'dexie'
 import { errorHasName } from '../lib/error'
 import type { BrowserWorkspaceDatabaseName } from '../lib/origin-storage-names'
 import { probeBrowserWorkspaceCurrent } from './browser-workspace-current-probe'
-import { cleanPendingBrowserWorkspaceDatabase } from './browser-workspace-database-cleanup'
+import { cleanPendingBrowserWorkspaceDatabaseWithinSelection } from './browser-workspace-database-cleanup'
 import {
   abandonPreparedBrowserWorkspaceDatabase,
   activatePreparedBrowserWorkspaceDatabase,
@@ -95,157 +95,171 @@ export async function ensureBrowserWorkspaceCurrentForSelection(
       physicalVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion,
     }
   }
-  await runStartupRepairStage('settle-pending-replacement', () =>
-    settlePendingBrowserWorkspaceReplacement(signal),
-  )
   return withBrowserWorkspaceSelectionGate(async (selection) => {
-    if (signal.aborted) throw signal.reason
-    const manifest = await runStartupRepairStage('read-gated-manifest', () =>
-      readBrowserWorkspaceDatabaseManifest(),
-    )
-    if (manifest.pending) throw new Error('BrowserWorkspaceStartupRepairJournalOccupied')
-    let probe = await withBrowserWorkspaceSlotOperation(
-      manifest.activeDatabaseName,
-      {
-        kind: 'transient-probe',
-        run: () =>
-          runStartupRepairStage('probe-gated-database', () =>
-            probeBrowserWorkspaceCurrent(manifest.activeDatabaseName),
-          ),
-      },
-      signal,
-    )
-    if (probe.kind === 'upgrade-required') {
-      probe = await withExclusiveBrowserWorkspaceSlots(
-        selection,
-        [manifest.activeDatabaseName],
-        async () => {
-          const observed = await runStartupRepairStage('probe-exclusive-database', () =>
-            probeBrowserWorkspaceCurrent(manifest.activeDatabaseName),
-          )
-          if (observed.kind !== 'upgrade-required') return observed
-          await upgradeRegisteredBrowserWorkspaceDatabase(manifest.activeDatabaseName, {
-            expectedPhysicalVersion: observed.physicalVersion,
-            signal,
-            ...(onProgress ? { onProgress } : {}),
-            ...(onBlocked ? { onBlocked } : {}),
-          })
-          const upgraded = await probeBrowserWorkspaceCurrent(manifest.activeDatabaseName)
-          if (upgraded.kind !== 'current') {
-            throw new Error(`BrowserWorkspaceRegisteredUpgradeIncomplete:${upgraded.kind}`)
-          }
-          return upgraded
+    for (;;) {
+      if (signal.aborted) throw signal.reason
+      const manifest = await runStartupRepairStage('read-gated-manifest', () =>
+        readBrowserWorkspaceDatabaseManifest(),
+      )
+      let probe = await withBrowserWorkspaceSlotOperation(
+        manifest.activeDatabaseName,
+        {
+          kind: 'transient-probe',
+          run: () =>
+            runStartupRepairStage('probe-gated-database', () =>
+              probeBrowserWorkspaceCurrent(manifest.activeDatabaseName),
+            ),
         },
         signal,
       )
-    }
-    if (probe.kind === 'absent') {
-      return {
-        databaseName: manifest.activeDatabaseName,
-        activationSequence: manifest.activationSequence,
-        physicalVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion,
+      if (probe.kind === 'current') {
+        return {
+          databaseName: manifest.activeDatabaseName,
+          activationSequence: manifest.activationSequence,
+          physicalVersion: probe.physicalVersion,
+        }
       }
-    }
-    if (probe.kind === 'current') {
-      return {
-        databaseName: manifest.activeDatabaseName,
-        activationSequence: manifest.activationSequence,
-        physicalVersion: probe.physicalVersion,
+      if (probe.kind === 'future') {
+        throw new Error(`BrowserWorkspaceSchemaIntegrity:future-version:${probe.physicalVersion}`)
       }
-    }
-    if (probe.kind === 'future') {
-      throw new Error(`BrowserWorkspaceSchemaIntegrity:future-version:${probe.physicalVersion}`)
-    }
-    if (probe.kind === 'strategy-missing') {
-      throw new Error(
-        `BrowserWorkspaceSchemaIntegrity:upgrade-strategy-missing:${probe.physicalVersion}:${CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion}`,
-      )
-    }
-    if (!browserWorkspaceSlotSwitchingSupported()) {
-      throw new Error('BrowserWorkspaceStartupRepairRequiresSlotCoordination')
-    }
-
-    const begin = await runStartupRepairStage('begin-replacement', () =>
-      tryBeginBrowserWorkspaceDatabaseReplacement(),
-    )
-    if (begin.kind === 'occupied') throw new Error('BrowserWorkspaceStartupRepairJournalOccupied')
-    const journal = begin.journal
-    const activation = { completed: false }
-    let disposition: Promise<unknown> | null = null
-    const rejectRepair = async (error: unknown): Promise<never> => {
-      if (activation.completed || error instanceof BrowserWorkspaceActivationOutcomeUncertainError)
-        throw error
-      disposition ??= discardFailedStartupRepair(journal, error)
-      throw await disposition
-    }
-    try {
-      return await withBrowserWorkspaceSlotRound(
-        journal,
-        async (quiesce) => {
-          try {
-            quiesce()
-            await runStartupRepairStage('exclusive-slot-repair', () =>
-              withExclusiveBrowserWorkspaceSlots(
-                selection,
-                [journal.sourceDatabaseName, journal.destinationDatabaseName],
-                async () => {
-                  const copied = await prepareInactiveBrowserWorkspaceRepair(
-                    journal,
-                    probe.physicalVersion,
-                    signal,
-                    onProgress,
-                  )
-                  if (signal.aborted) throw signal.reason
-                  onProgress?.({
-                    kind: 'database-upgrade',
-                    databaseName: journal.destinationDatabaseName,
-                    fromVersion: probe.physicalVersion / 10,
-                    targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
-                    phase: 'inactive-activation',
-                    operation: 'activate-repaired-destination',
-                    processedRows: copied.copiedRows,
-                    processedBytes: copied.estimatedLiveBytes,
-                  })
-                  await activatePreparedBrowserWorkspaceDatabase(journal, {
-                    kind: 'carry-source',
-                    liveBytes: copied.estimatedLiveBytes,
-                  })
-                  activation.completed = true
-                },
-                signal,
-              ),
+      if (probe.kind === 'strategy-missing') {
+        throw new Error(
+          `BrowserWorkspaceSchemaIntegrity:upgrade-strategy-missing:${probe.physicalVersion}:${CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion}`,
+        )
+      }
+      const pending = manifest.pending
+      if (pending) {
+        await runStartupRepairStage('settle-pending-replacement', () =>
+          cleanPendingBrowserWorkspaceDatabaseWithinSelection(selection, pending, signal),
+        )
+        continue
+      }
+      if (probe.kind === 'upgrade-required') {
+        probe = await withExclusiveBrowserWorkspaceSlots(
+          selection,
+          [manifest.activeDatabaseName],
+          async () => {
+            const observed = await runStartupRepairStage('probe-exclusive-database', () =>
+              probeBrowserWorkspaceCurrent(manifest.activeDatabaseName),
             )
-            const repairedManifest = await readBrowserWorkspaceDatabaseManifest()
-            const repaired = await probeBrowserWorkspaceCurrent(repairedManifest.activeDatabaseName)
-            if (repaired.kind !== 'current') {
-              throw new Error(`BrowserWorkspaceStartupRepairSelectionIncomplete:${repaired.kind}`)
+            if (observed.kind !== 'upgrade-required') return observed
+            await upgradeRegisteredBrowserWorkspaceDatabase(manifest.activeDatabaseName, {
+              expectedPhysicalVersion: observed.physicalVersion,
+              signal,
+              ...(onProgress ? { onProgress } : {}),
+              ...(onBlocked ? { onBlocked } : {}),
+            })
+            const upgraded = await probeBrowserWorkspaceCurrent(manifest.activeDatabaseName)
+            if (upgraded.kind !== 'current') {
+              throw new Error(`BrowserWorkspaceRegisteredUpgradeIncomplete:${upgraded.kind}`)
             }
-            return {
-              databaseName: repairedManifest.activeDatabaseName,
-              activationSequence: repairedManifest.activationSequence,
-              physicalVersion: repaired.physicalVersion,
-            }
-          } catch (error) {
-            return rejectRepair(error)
-          }
-        },
-        signal,
+            return upgraded
+          },
+          signal,
+        )
+      }
+      if (probe.kind === 'absent') {
+        return {
+          databaseName: manifest.activeDatabaseName,
+          activationSequence: manifest.activationSequence,
+          physicalVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion,
+        }
+      }
+      if (probe.kind === 'current') {
+        return {
+          databaseName: manifest.activeDatabaseName,
+          activationSequence: manifest.activationSequence,
+          physicalVersion: probe.physicalVersion,
+        }
+      }
+      if (probe.kind === 'future') {
+        throw new Error(`BrowserWorkspaceSchemaIntegrity:future-version:${probe.physicalVersion}`)
+      }
+      if (probe.kind === 'strategy-missing') {
+        throw new Error(
+          `BrowserWorkspaceSchemaIntegrity:upgrade-strategy-missing:${probe.physicalVersion}:${CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion}`,
+        )
+      }
+      if (!browserWorkspaceSlotSwitchingSupported()) {
+        throw new Error('BrowserWorkspaceStartupRepairRequiresSlotCoordination')
+      }
+
+      const begin = await runStartupRepairStage('begin-replacement', () =>
+        tryBeginBrowserWorkspaceDatabaseReplacement(),
       )
-    } catch (error) {
-      return rejectRepair(error)
+      if (begin.kind === 'occupied') throw new Error('BrowserWorkspaceStartupRepairJournalOccupied')
+      const journal = begin.journal
+      const activation = { completed: false }
+      let disposition: Promise<unknown> | null = null
+      const rejectRepair = async (error: unknown): Promise<never> => {
+        if (
+          activation.completed ||
+          error instanceof BrowserWorkspaceActivationOutcomeUncertainError
+        )
+          throw error
+        disposition ??= discardFailedStartupRepair(journal, error)
+        throw await disposition
+      }
+      try {
+        return await withBrowserWorkspaceSlotRound(
+          journal,
+          async (quiesce) => {
+            try {
+              quiesce()
+              await runStartupRepairStage('exclusive-slot-repair', () =>
+                withExclusiveBrowserWorkspaceSlots(
+                  selection,
+                  [journal.sourceDatabaseName, journal.destinationDatabaseName],
+                  async () => {
+                    const copied = await prepareInactiveBrowserWorkspaceRepair(
+                      journal,
+                      probe.physicalVersion,
+                      signal,
+                      onProgress,
+                    )
+                    if (signal.aborted) throw signal.reason
+                    onProgress?.({
+                      kind: 'database-upgrade',
+                      databaseName: journal.destinationDatabaseName,
+                      fromVersion: probe.physicalVersion / 10,
+                      targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
+                      phase: 'inactive-activation',
+                      operation: 'activate-repaired-destination',
+                      processedRows: copied.copiedRows,
+                      processedBytes: copied.estimatedLiveBytes,
+                    })
+                    await activatePreparedBrowserWorkspaceDatabase(journal, {
+                      kind: 'carry-source',
+                      liveBytes: copied.estimatedLiveBytes,
+                    })
+                    activation.completed = true
+                  },
+                  signal,
+                ),
+              )
+              const repairedManifest = await readBrowserWorkspaceDatabaseManifest()
+              const repaired = await probeBrowserWorkspaceCurrent(
+                repairedManifest.activeDatabaseName,
+              )
+              if (repaired.kind !== 'current') {
+                throw new Error(`BrowserWorkspaceStartupRepairSelectionIncomplete:${repaired.kind}`)
+              }
+              return {
+                databaseName: repairedManifest.activeDatabaseName,
+                activationSequence: repairedManifest.activationSequence,
+                physicalVersion: repaired.physicalVersion,
+              }
+            } catch (error) {
+              return rejectRepair(error)
+            }
+          },
+          signal,
+        )
+      } catch (error) {
+        return rejectRepair(error)
+      }
     }
   }, signal)
-}
-
-async function settlePendingBrowserWorkspaceReplacement(signal: AbortSignal): Promise<void> {
-  for (;;) {
-    if (signal.aborted) throw signal.reason
-    const cleanup = await cleanPendingBrowserWorkspaceDatabase(signal)
-    if (cleanup.status === 'none') return
-    if (cleanup.status === 'preparing') {
-      await withBrowserWorkspaceSelectionGate(() => Promise.resolve(), signal)
-    }
-  }
 }
 
 async function discardFailedStartupRepair(

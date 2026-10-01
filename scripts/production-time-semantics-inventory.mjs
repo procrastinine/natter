@@ -244,19 +244,19 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
   covered(
     'workspace-slot-revalidation',
     semantics(
-      'The committed active database name and activation sequence are confirmed under the exact shared slot lease before startup publishes its selection.',
-      'workspace database selection only',
+      'Startup revalidates repair under selection and confirms the committed active database name and activation sequence under the exact shared slot lease before publication.',
+      'workspace database selection and required startup repair',
       'one browser workspace open attempt',
       'browser workspace database selection',
-      'The bootstrap authority aborts lock acquisition; every changed-slot iteration releases its exact shared lease before retrying.',
-      'One selected slot lease per observed control-manifest revision, with no retained work between iterations.',
-      'Every retry requires a different committed active slot or activation sequence; otherwise the selection returns immediately.',
+      'The bootstrap authority aborts lock acquisition and cleanup; every changed-slot iteration releases its exact shared lease before retrying.',
+      'One selected slot lease per observed control-manifest revision; required repair reuses one selection grant and a current destination bypasses physical cleanup.',
+      'Selection repeats only after a changed active slot or activation sequence; required repair repeats only after disposition of the observed journal under selection.',
       'none',
     ),
     {
       retryLoops: [
         'src/store/browser-workspace-database-selection.ts|selectBrowserWorkspaceDatabase|ForStatement|unbounded|1',
-        'src/store/browser-workspace-startup-repair.ts|settlePendingBrowserWorkspaceReplacement|ForStatement|unbounded|1',
+        'src/store/browser-workspace-startup-repair.ts|ensureBrowserWorkspaceCurrentForSelection|ForStatement|unbounded|1',
       ],
     },
   ),

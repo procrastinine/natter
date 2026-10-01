@@ -22,6 +22,7 @@ interface BranchTreeFixture {
   readonly B1: string
   readonly B2: string
   readonly extraA: readonly string[]
+  readonly sideBranches: readonly string[]
 }
 
 test.beforeEach(async ({ page }) => {
@@ -53,6 +54,98 @@ test('tree inspector revisits former branches after repeated explicit branch act
     await expect(page.locator('[data-ui="branch-tree-inspector-status"]')).toHaveCount(0)
   }
 })
+
+for (const width of [1280, 390]) {
+  for (const expanded of [false, true]) {
+    test(`native tree activation keeps selection geometry at ${width}px, expanded=${expanded}`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width, height: 800 })
+      const fixture = await seedBranchTreeChat(page, { sideBranches: 24 })
+      await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.A2}`)
+      await expect(page.locator('[data-ui="message-list"]')).toContainText('branch A assistant')
+      await page.locator('[data-role="chat-branch-tree"]').click()
+      if (expanded) await page.getByRole('button', { name: 'Expand tree nodes' }).click()
+      const canvas = page.locator('[data-ui="branch-tree-scroll"]')
+      const inspector = page.locator('[data-ui="branch-tree-inspector"]')
+      const empty = page.locator('[data-ui="branch-tree-inspector-empty"]')
+      const separator = page.getByRole('separator', { name: 'Resize message details' })
+      await canvas.focus()
+      await page.keyboard.press('Escape')
+      for (const [index, fraction] of [0.5, 0.1, 0.9].entries()) {
+        const targetId = fixture.sideBranches[10 + index]
+        if (!targetId) throw new Error('Missing edge branch fixture')
+        const target = page.locator(`[data-ui="branch-tree-node"][data-message-id="${targetId}"]`)
+        await expect(empty).toBeVisible()
+        await canvas.evaluate((element, fraction) => {
+          element.scrollLeft = (element.scrollWidth - element.clientWidth) * fraction
+        }, 0.5)
+        await expect(target).toBeAttached()
+        const surface = target.locator('[data-ui="branch-tree-node-surface"]')
+        await surface.evaluate((element, fraction) => {
+          const canvas = element.closest('[data-ui="branch-tree-scroll"]')
+          if (!canvas) throw new Error('Missing tree canvas')
+          const box = element.getBoundingClientRect()
+          const bounds = canvas.getBoundingClientRect()
+          canvas.scrollLeft += box.x + box.width / 2 - bounds.x - canvas.clientWidth * fraction
+          canvas.scrollTop += box.y + box.height / 2 - bounds.y - canvas.clientHeight / 2
+        }, fraction)
+        const readGeometry = () =>
+          surface.evaluate((element) => {
+            const canvas = element.closest('[data-ui="branch-tree-scroll"]')
+            if (!canvas) throw new Error('Missing tree canvas')
+            const box = element.getBoundingClientRect()
+            return {
+              x: box.x + box.width / 2,
+              y: box.y + box.height / 2,
+              left: canvas.scrollLeft,
+              top: canvas.scrollTop,
+              width: canvas.clientWidth,
+            }
+          })
+        const before = await readGeometry()
+        const box = await surface.boundingBox()
+        const canvasBox = await canvas.boundingBox()
+        if (!box || !canvasBox) throw new Error('Missing native tree geometry')
+        const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+        expect(Math.abs(point.x - canvasBox.x - before.width * fraction)).toBeLessThan(2)
+        expect(
+          await page.evaluate(
+            ({ x, y }) =>
+              document
+                .elementFromPoint(x, y)
+                ?.closest('[data-ui="branch-tree-node"]')
+                ?.getAttribute('data-message-id'),
+            point,
+          ),
+        ).toBe(targetId)
+
+        await page.mouse.dblclick(point.x, point.y)
+        await expect(target).toHaveAttribute('data-current-leaf', 'true')
+        await expect(inspector).toHaveAttribute('data-message-id', targetId)
+        expect(await readGeometry()).toEqual(before)
+        await page.getByRole('button', { name: 'Close message inspector' }).click()
+        await expect(empty).toBeVisible()
+        expect(await readGeometry()).toEqual(before)
+
+        await page.mouse.click(point.x, point.y)
+        await expect(inspector).toHaveAttribute('data-message-id', targetId)
+        expect(await readGeometry()).toEqual(before)
+        await canvas.focus()
+        await page.keyboard.press('Escape')
+        await expect(empty).toBeVisible()
+        expect(await readGeometry()).toEqual(before)
+      }
+      const beforeResize = await canvas.evaluate((element) => element.clientWidth)
+      await separator.focus()
+      await page.keyboard.press('ArrowLeft')
+      await expect
+        .poll(() => canvas.evaluate((element) => element.clientWidth))
+        .toBeLessThan(beforeResize)
+      await expect(empty).toBeVisible()
+    })
+  }
+}
 
 test('branching from an intermediate transcript node settles one durable fork', async ({
   page,
@@ -1332,7 +1425,7 @@ test('tree shows and follows a pending response before the first byte arrives', 
 
 async function seedBranchTreeChat(
   page: Page,
-  options: { readonly extraBranchRows?: number } = {},
+  options: { readonly extraBranchRows?: number; readonly sideBranches?: number } = {},
 ): Promise<BranchTreeFixture> {
   const now = Date.now()
   const chatId = 'branch-tree-chat'
@@ -1476,6 +1569,22 @@ async function seedBranchTreeChat(
       deleted: false,
     },
   ]
+  for (let index = 0; index < (options.sideBranches ?? 0); index += 1) {
+    sourceMessages.push({
+      id: `side-${index}`,
+      chatId,
+      parentId: 'root',
+      siblingIndex: index + 2,
+      turnId: `turn-side-${index}`,
+      turnIndex: 1,
+      createdAt: now + index + 5,
+      role: 'assistant',
+      origin: 'imported',
+      content: [{ type: 'output_text', text: `Side branch ${index}` }],
+      nodeVersion: 0,
+      deleted: false,
+    })
+  }
   let parentId = 'A2'
   for (let index = 0; index < (options.extraBranchRows ?? 0); index += 1) {
     const id = `A-extra-${index}`
@@ -1524,6 +1633,9 @@ async function seedBranchTreeChat(
     A2: id('A2'),
     B1: id('B1'),
     B2: id('B2'),
+    sideBranches: Array.from({ length: options.sideBranches ?? 0 }, (_, index) =>
+      id(`side-${index}`),
+    ),
     extraA: Array.from({ length: options.extraBranchRows ?? 0 }, (_, index) =>
       id(`A-extra-${index}`),
     ),

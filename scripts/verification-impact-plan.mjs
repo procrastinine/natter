@@ -276,6 +276,7 @@ export function planSliceVerification(options) {
       .filter(
         (stage) =>
           affectedGlobalInputs.length > 0 ||
+          (stage.impact === 'any-change' && impact.changedPaths.length > 0) ||
           stageInputs.get(stage.id).some((path) => affectedSet.has(path)),
       )
       .map((stage) => stage.id),

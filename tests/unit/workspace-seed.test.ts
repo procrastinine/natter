@@ -1,7 +1,10 @@
 import type { BrowserContext, Page } from '@playwright/test'
 import { describe, expect, it, vi } from 'vitest'
 import type * as WorkspaceProviderFixture from '../../scripts/workspace-provider-fixture.mjs'
-import { restoreWorkspaceThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
+import {
+  restoreWorkspaceThroughUi,
+  waitForWorkspaceRunning,
+} from '../../scripts/workspace-provider-fixture.mjs'
 import {
   bindWorkspaceSeedTemplate,
   cloneWorkspaceSeedTemplate,
@@ -46,6 +49,35 @@ function blankWorkspace() {
 }
 
 describe('worker-owned workspace seed template', () => {
+  it('observes terminal startup failure before accepting a retained running shell', async () => {
+    let predicate: (() => boolean) | undefined
+    const page = {
+      waitForFunction: async (observe: () => boolean) => {
+        predicate = observe
+      },
+    } as unknown as Page
+    await waitForWorkspaceRunning(page)
+    if (!predicate) throw new Error('Missing startup observation')
+    try {
+      for (const state of ['opening', 'blocked']) {
+        document.body.innerHTML = `<main data-ui="workspace-bootstrap" data-state="${state}"></main>`
+        expect(predicate()).toBe(false)
+      }
+      document.body.innerHTML =
+        '<main data-ui="app-shell" data-workspace-runtime-state="RUNNING"></main>'
+      expect(predicate()).toBe(true)
+      document.body.insertAdjacentHTML(
+        'beforeend',
+        '<main data-ui="workspace-bootstrap" data-state="failed"><details data-ui="workspace-bootstrap-diagnostics"><pre>{"stage":"database-open","errorNames":["Error"]}</pre></details></main>',
+      )
+      expect(predicate).toThrow(
+        'WorkspaceStartupFailed: {"stage":"database-open","errorNames":["Error"]}',
+      )
+    } finally {
+      document.body.replaceChildren()
+    }
+  })
+
   it('constructs once for concurrent callers and serializes before exposing immutable bytes', async () => {
     const backup = blankWorkspace()
     const produce = vi.fn(async () => backup)

@@ -542,10 +542,10 @@ const RETRY_LOOP_INVENTORY = {
   },
   'workspace-slot-revalidation': {
     rationale:
-      'Startup reads the committed active slot, acquires its shared lease, and confirms the active database plus activation sequence. A failed confirmation proves an actual committed slot transition; the attempt authority cancels lock acquisition and every retry releases its exact lease.',
+      'Startup confirms the committed active slot under its shared lease, releasing that lease after a changed-slot observation. Required repair reuses one selection grant and repeats only after disposition of its observed journal; a current peer destination returns without physical cleanup. The attempt authority cancels lock acquisition and cleanup.',
     ids: [
       'src/store/browser-workspace-database-selection.ts|selectBrowserWorkspaceDatabase|ForStatement|unbounded|1',
-      'src/store/browser-workspace-startup-repair.ts|settlePendingBrowserWorkspaceReplacement|ForStatement|unbounded|1',
+      'src/store/browser-workspace-startup-repair.ts|ensureBrowserWorkspaceCurrentForSelection|ForStatement|unbounded|1',
     ],
   },
   'replacement-contender-readmission': {

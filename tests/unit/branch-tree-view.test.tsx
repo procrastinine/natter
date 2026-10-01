@@ -1413,6 +1413,7 @@ describe('BranchTreeView', () => {
 
   it('keeps inspection distinct from branch activation while preserving real deep links', async () => {
     const activate = vi.fn()
+    const getMessage = vi.fn(async (messageId: string) => fullMessageFor(messageId))
     const open = vi.spyOn(window, 'open').mockReturnValue(null)
     render(
       <BranchTreeView
@@ -1420,11 +1421,16 @@ describe('BranchTreeView', () => {
         headers={smallTree}
         cursor={{ root: 'left' }}
         expanded={false}
-        repository={repository()}
+        repository={repository({ getMessage })}
         onActivateNode={activate}
       />,
     )
 
+    await waitForActiveTree()
+    const empty = screen.getByText('Select a message to inspect it.')
+    const separator = screen.getByRole('separator', { name: 'Resize message details' })
+    expect(empty).not.toHaveAttribute('role', 'status')
+    expect(getMessage).not.toHaveBeenCalled()
     const root = screen.getByRole('link', { name: 'User message' })
     const canvas = document.querySelector<HTMLElement>('[data-ui="branch-tree-scroll"]')
     if (!canvas) throw new Error('Missing tree canvas')
@@ -1452,6 +1458,7 @@ describe('BranchTreeView', () => {
       () => expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toBeInTheDocument(),
       { timeout: 5_000 },
     )
+    expect(screen.getByRole('separator', { name: 'Resize message details' })).toBe(separator)
     fireEvent.doubleClick(root)
     expect(activate).toHaveBeenCalledWith('root', 'right')
 
@@ -1459,6 +1466,9 @@ describe('BranchTreeView', () => {
     await waitFor(() =>
       expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument(),
     )
+    expect(screen.getByText('Select a message to inspect it.')).toBeInTheDocument()
+    expect(screen.getByRole('separator', { name: 'Resize message details' })).toBe(separator)
+    expect(getMessage).toHaveBeenCalledTimes(1)
   })
 
   it('marks context-hidden nodes without hydrating their bodies', async () => {
@@ -3534,6 +3544,11 @@ describe('BranchTreeView', () => {
     expect(canvas).toHaveAttribute('data-panning', 'true')
     fireEvent.lostPointerCapture(canvas, { pointerId: 8 })
     expect(canvas).not.toHaveAttribute('data-panning')
+    fireEvent.pointerDown(canvas, { button: 0, pointerId: 9, clientX: 200, clientY: 180 })
+    fireEvent.pointerCancel(canvas, { pointerId: 9 })
+    expect(canvas).not.toHaveAttribute('data-panning')
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toBeInTheDocument()
+    expect(activate).not.toHaveBeenCalled()
   })
 
   it('leaves native scrollbar gutters available for scrollbar dragging', () => {
