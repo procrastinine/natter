@@ -93,48 +93,68 @@ for (const width of [1280, 390]) {
         const readGeometry = () =>
           surface.evaluate((element) => {
             const canvas = element.closest('[data-ui="branch-tree-scroll"]')
-            if (!canvas) throw new Error('Missing tree canvas')
-            const box = element.getBoundingClientRect()
+            if (!canvas || !(element instanceof SVGGraphicsElement))
+              throw new Error('Missing tree geometry')
+            // Painted bounds include the animated stroke; layout bounds do not.
+            const box = element.getBBox()
+            const matrix = element.getScreenCTM()
+            if (!matrix) throw new Error('Missing tree transform')
+            const center = new DOMPoint(
+              box.x + box.width / 2,
+              box.y + box.height / 2,
+            ).matrixTransform(matrix)
             return {
-              x: box.x + box.width / 2,
-              y: box.y + box.height / 2,
+              center: { x: center.x, y: center.y },
+              bounds: { x: box.x, y: box.y, width: box.width, height: box.height },
+              transform: {
+                a: matrix.a,
+                b: matrix.b,
+                c: matrix.c,
+                d: matrix.d,
+                e: matrix.e,
+                f: matrix.f,
+              },
               left: canvas.scrollLeft,
               top: canvas.scrollTop,
               width: canvas.clientWidth,
+              height: canvas.clientHeight,
             }
           })
         const before = await readGeometry()
-        const box = await surface.boundingBox()
         const canvasBox = await canvas.boundingBox()
-        if (!box || !canvasBox) throw new Error('Missing native tree geometry')
-        const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+        if (!canvasBox) throw new Error('Missing native tree geometry')
+        const point = before.center
         expect(Math.abs(point.x - canvasBox.x - before.width * fraction)).toBeLessThan(2)
-        expect(
-          await page.evaluate(
-            ({ x, y }) =>
-              document
-                .elementFromPoint(x, y)
-                ?.closest('[data-ui="branch-tree-node"]')
-                ?.getAttribute('data-message-id'),
-            point,
-          ),
-        ).toBe(targetId)
+        const expectStablePlacement = async () => {
+          expect(await readGeometry()).toEqual(before)
+          expect(
+            await page.evaluate(
+              ({ x, y }) =>
+                document
+                  .elementFromPoint(x, y)
+                  ?.closest('[data-ui="branch-tree-node"]')
+                  ?.getAttribute('data-message-id'),
+              point,
+            ),
+          ).toBe(targetId)
+        }
+        await expectStablePlacement()
 
         await page.mouse.dblclick(point.x, point.y)
         await expect(target).toHaveAttribute('data-current-leaf', 'true')
         await expect(inspector).toHaveAttribute('data-message-id', targetId)
-        expect(await readGeometry()).toEqual(before)
+        await expectStablePlacement()
         await page.getByRole('button', { name: 'Close message inspector' }).click()
         await expect(empty).toBeVisible()
-        expect(await readGeometry()).toEqual(before)
+        await expectStablePlacement()
 
         await page.mouse.click(point.x, point.y)
         await expect(inspector).toHaveAttribute('data-message-id', targetId)
-        expect(await readGeometry()).toEqual(before)
+        await expectStablePlacement()
         await canvas.focus()
         await page.keyboard.press('Escape')
         await expect(empty).toBeVisible()
-        expect(await readGeometry()).toEqual(before)
+        await expectStablePlacement()
       }
       const beforeResize = await canvas.evaluate((element) => element.clientWidth)
       await separator.focus()
