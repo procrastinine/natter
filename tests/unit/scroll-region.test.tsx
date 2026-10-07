@@ -1059,6 +1059,139 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
+  it.each([
+    { growth: 0, scrollFirst: false },
+    { growth: 40, scrollFirst: false },
+    { growth: 0, scrollFirst: true },
+    { growth: 40, scrollFirst: true },
+  ])(
+    'preserves pending native movement after stream completion: $growth px growth, scrollFirst=$scrollFirst',
+    ({ growth, scrollFirst }) => {
+      const fixture = setup({ streamActive: true, streamFollowKey: 'stream-a' })
+      acquireOpen(fixture)
+      const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+      if (!target) throw new Error('Terminal reading anchor did not mount')
+      let documentBottom = 1_070
+      target.getBoundingClientRect = () =>
+        rect({
+          top: documentBottom - 120 - fixture.region.scrollTop,
+          bottom: documentBottom - fixture.region.scrollTop,
+        })
+      act(() => fixture.rerender({ streamActive: false, streamFollowKey: null }))
+
+      act(() => {
+        fireEvent.wheel(fixture.region, { deltaY: -20 })
+        fixture.region.scrollTop = 980
+        documentBottom += growth
+        fixture.setHeight(1_100 + growth)
+        if (scrollFirst) fireEvent.scroll(fixture.region)
+        deliverResize()
+      })
+
+      expect(fixture.region.scrollTop).toBe(980 + growth)
+      expect(target.getBoundingClientRect().bottom).toBe(90)
+      expect(fixture.ref.current?.getState()).toBe('pinned')
+      act(() => {
+        deliverResize()
+        fireEvent.scroll(fixture.region)
+        fixture.region.dispatchEvent(new Event('scrollend'))
+        deliverResize()
+      })
+      expect(fixture.region.scrollTop).toBe(980 + growth)
+      expect(target.getBoundingClientRect().bottom).toBe(90)
+    },
+  )
+
+  it('preserves pending native movement through both virtualizer measurement phases', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Virtual reading anchor did not mount')
+    let documentBottom = 570
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture, 500)
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -40 })
+      fixture.region.scrollTop = 460
+      fixture.commands().applyVirtualizerOffset(500, 30)
+    })
+    expect(fixture.region.scrollTop).toBe(460)
+
+    act(() => {
+      documentBottom += 30
+      fixture.setHeight(1_130)
+      fixture.commands().reconcileLayoutAnchor()
+    })
+    expect(fixture.region.scrollTop).toBe(490)
+    expect(target.getBoundingClientRect().bottom).toBe(110)
+    act(() => {
+      fixture.commands().reconcileLayoutAnchor()
+      fireEvent.scroll(fixture.region)
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(490)
+  })
+
+  it('keeps native position when virtualizer proposals have no rendered anchor', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -20 })
+      fixture.region.scrollTop = 980
+      fixture.commands().applyVirtualizerOffset(1_000, 30)
+      fixture.commands().applyVirtualizerOffset(1_000, 60)
+    })
+    expect(fixture.commands().getLayoutAnchorMessageId()).toBeNull()
+    expect(fixture.region.scrollTop).toBe(980)
+  })
+
+  it.each([false, true])(
+    'composes native movement after layout clamps at the bottom: scrollFirst=%s',
+    (scrollFirst) => {
+      const fixture = setup()
+      acquireOpen(fixture)
+      const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+      if (!target) throw new Error('Clamped reading anchor did not mount')
+      target.getBoundingClientRect = () =>
+        rect({ top: 950 - fixture.region.scrollTop, bottom: 1_070 - fixture.region.scrollTop })
+      act(() => {
+        fireEvent.wheel(fixture.region, { deltaY: -20 })
+        fixture.setHeight(1_070)
+        fixture.region.scrollTop = 950
+        if (scrollFirst) fireEvent.scroll(fixture.region)
+        deliverResize()
+      })
+      expect(fixture.region.scrollTop).toBe(950)
+      act(() => {
+        fireEvent.scroll(fixture.region)
+        deliverResize()
+      })
+      expect(fixture.region.scrollTop).toBe(950)
+    },
+  )
+
+  it('does not apply movement twice when another wheel captures the moved viewport', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Repeated wheel anchor did not mount')
+    target.getBoundingClientRect = () =>
+      rect({ top: 950 - fixture.region.scrollTop, bottom: 1_070 - fixture.region.scrollTop })
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -20 })
+      fixture.region.scrollTop = 980
+      fireEvent.wheel(fixture.region, { deltaY: -20 })
+      fixture.region.scrollTop = 960
+      deliverResize()
+      fireEvent.scroll(fixture.region)
+    })
+    expect(fixture.region.scrollTop).toBe(960)
+  })
+
   it.each(['body', 'message'])(
     'preserves visible text when the first hit is the %s margin',
     async (firstHit) => {

@@ -292,6 +292,7 @@ type ViewportContinuityLease =
   | (ViewportContinuityLeaseBase & {
       readonly mode: 'preserve'
       readonly displacement: ViewportDisplacement
+      readonly nativeDelta: number
     })
 
 type SemanticFollowClaim =
@@ -528,6 +529,16 @@ function scrollStateFromPosition(
 
 function bottomScrollTop(container: HTMLDivElement): number {
   return Math.max(0, container.scrollHeight - container.clientHeight)
+}
+
+function continuityScrollTop(
+  container: HTMLDivElement,
+  layoutDelta: number,
+  nativeDelta: number,
+): number {
+  const maximum = bottomScrollTop(container)
+  const layoutTop = Math.max(0, Math.min(maximum, container.scrollTop + layoutDelta))
+  return Math.max(0, Math.min(maximum, layoutTop + nativeDelta))
 }
 
 function messageFollowScrollTop(
@@ -782,7 +793,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     const lease = continuityLeaseRef.current
     if (lease?.mode !== 'follow') return
     continuityLeaseRef.current = lease.displacement
-      ? { ...lease, mode: 'preserve', displacement: lease.displacement }
+      ? { ...lease, mode: 'preserve', displacement: lease.displacement, nativeDelta: 0 }
       : null
   }, [])
 
@@ -828,6 +839,15 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         viewportRevision: prepared?.revision ?? committedViewportRevisionRef.current,
         source,
         displacement,
+        nativeDelta: 0,
+      }
+      const container = containerRef.current
+      if (container) {
+        lastNativeScrollTopRef.current = container.scrollTop
+        lastObservedScrollGeometryRef.current = {
+          scrollHeight: container.scrollHeight,
+          clientHeight: container.clientHeight,
+        }
       }
     },
     [],
@@ -946,27 +966,53 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     [capturePinnedLayoutAnchor, installContinuityLease, releaseSemanticClaim],
   )
 
-  const adoptUnclaimedNativeViewportMovement = useCallback((): boolean => {
+  const reconcileNativeViewportMovement = useCallback((): 'none' | 'adopted' | 'rebased' => {
     const container = containerRef.current
     const previousTop = lastNativeScrollTopRef.current
     const previousGeometry = lastObservedScrollGeometryRef.current
-    if (!container || previousTop === null || previousGeometry === null) return false
-    if (Math.abs(container.scrollTop - previousTop) <= 0.5) return false
+    if (!container || previousTop === null || previousGeometry === null) return 'none'
+    if (Math.abs(container.scrollTop - previousTop) <= 0.5) return 'none'
+    const lease = continuityLeaseRef.current
+    const instantIntent = instantScrollIntentRef.current
+    const pendingLayoutScroll =
+      instantIntent?.preserveThroughScrollEnd &&
+      instantIntent.scrollHeight !== container.scrollHeight
+    if (userScrollIntentRef.current && lease?.mode === 'preserve' && !pendingLayoutScroll) {
+      const delta = container.scrollTop - Math.min(previousTop, bottomScrollTop(container))
+      if (Math.abs(delta) <= 0.5) return 'none'
+      continuityLeaseRef.current = {
+        ...lease,
+        nativeDelta: lease.nativeDelta + delta,
+      }
+      clearProgrammaticScrollIntents()
+      lastNativeScrollTopRef.current = container.scrollTop
+      lastObservedScrollGeometryRef.current = {
+        scrollHeight: container.scrollHeight,
+        clientHeight: container.clientHeight,
+      }
+      setScrollStateNow(
+        delta < 0 ? 'pinned' : scrollStateFromPosition(container, thresholdRef.current, 'pinned'),
+        'native-displacement',
+        true,
+      )
+      if (hasScrollDebugSink()) debugScroll('native-scroll-adopted', { previousTop, delta })
+      return 'rebased'
+    }
     if (
       Math.abs(container.scrollHeight - previousGeometry.scrollHeight) > 0.5 ||
       Math.abs(container.clientHeight - previousGeometry.clientHeight) > 0.5
     ) {
-      return false
+      return 'none'
     }
     if (scrollStateFromPosition(container, thresholdRef.current, stateRef.current) !== 'pinned') {
-      return false
+      return 'none'
     }
     if (matchesInstantScrollIntent(instantScrollIntentRef.current, container.scrollTop))
-      return false
+      return 'none'
     if (smoothScrollIntentRef.current) {
       const smooth = advanceSmoothScrollIntent(smoothScrollIntentRef.current, container.scrollTop)
       smoothScrollIntentRef.current = smooth.next
-      if (smooth.programmatic) return false
+      if (smooth.programmatic) return 'none'
     }
     didOpenRef.current = true
     clearProgrammaticScrollIntents()
@@ -981,7 +1027,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (hasScrollDebugSink()) {
       debugScroll('native-scroll-adopted', { previousTop })
     }
-    return true
+    return 'adopted'
   }, [
     cancelViewportOwnership,
     capturePinnedLayoutAnchor,
@@ -992,9 +1038,10 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
 
   const correctContinuityLease = useCallback((): boolean => {
     const container = containerRef.current
+    if (!container || textEditingViewportClaimsRef.current > 0) return false
+    if (reconcileNativeViewportMovement() === 'adopted') return false
     const lease = continuityLeaseRef.current
-    if (!container || !lease || textEditingViewportClaimsRef.current > 0) return false
-    if (adoptUnclaimedNativeViewportMovement()) return false
+    if (!lease) return false
     if (
       !Object.is(lease.selectionKey, selectionKeyRef.current) ||
       lease.workspaceEpoch !== workspaceEpochRef.current ||
@@ -1009,6 +1056,20 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (anchor.kind === 'bottom') {
       const distance = container.scrollHeight - container.scrollTop - container.clientHeight
       const delta = distance - anchor.distance
+      if (lease.mode === 'preserve' && lease.nativeDelta !== 0) {
+        const before = container.scrollTop
+        const target = continuityScrollTop(container, delta, lease.nativeDelta)
+        const actual =
+          Math.abs(target - before) > LAYOUT_ANCHOR_TOLERANCE_PX
+            ? writeScrollTopNow(target, 'layout-anchor')
+            : before
+        continuityLeaseRef.current = {
+          ...lease,
+          nativeDelta: 0,
+          displacement: { kind: 'bottom', distance: bottomScrollTop(container) - actual },
+        }
+        return Math.abs(actual - before) > LAYOUT_ANCHOR_TOLERANCE_PX
+      }
       if (Math.abs(delta) <= LAYOUT_ANCHOR_TOLERANCE_PX) return false
       writeScrollTopNow(container.scrollTop + delta, 'layout-anchor')
       return true
@@ -1058,6 +1119,26 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     const documentCoordinate = current + container.scrollTop
     const elementDocumentCoordinate = elementCoordinate + container.scrollTop
     const delta = current - anchor.coordinate
+    if (lease.mode === 'preserve' && lease.nativeDelta !== 0) {
+      const before = container.scrollTop
+      const target = continuityScrollTop(container, delta, lease.nativeDelta)
+      const actual =
+        Math.abs(target - before) > LAYOUT_ANCHOR_TOLERANCE_PX
+          ? writeScrollTopNow(target, 'layout-anchor')
+          : before
+      continuityLeaseRef.current = {
+        ...lease,
+        nativeDelta: 0,
+        displacement: {
+          ...anchor,
+          element,
+          coordinate: documentCoordinate - actual,
+          documentCoordinate,
+          elementDocumentCoordinate,
+        },
+      }
+      return Math.abs(actual - before) > LAYOUT_ANCHOR_TOLERANCE_PX
+    }
     if (Math.abs(delta) <= LAYOUT_ANCHOR_TOLERANCE_PX) {
       if (
         Math.abs(documentCoordinate - anchor.documentCoordinate) > LAYOUT_ANCHOR_TOLERANCE_PX ||
@@ -1079,7 +1160,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       }
     }
     return true
-  }, [adoptUnclaimedNativeViewportMovement, writeScrollTopNow])
+  }, [reconcileNativeViewportMovement, writeScrollTopNow])
 
   const resolveFollowTargetElement = useCallback(
     (target: MessageFollowTarget): HTMLElement | null => {
@@ -1447,6 +1528,13 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       const previousNativeScrollTop = lastNativeScrollTopRef.current
       const previousGeometry = lastObservedScrollGeometryRef.current
       if (
+        source === 'scroll' &&
+        userScrollIntentRef.current &&
+        reconcileNativeViewportMovement() === 'rebased'
+      ) {
+        correctContinuityLease()
+      }
+      if (
         stateRef.current === 'follow' &&
         previousNativeScrollTop !== null &&
         previousGeometry !== null &&
@@ -1627,9 +1715,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       cancelViewportOwnership,
       capturePinnedLayoutAnchor,
       clearProgrammaticScrollIntents,
+      correctContinuityLease,
       debugScroll,
       recordInstantScrollIntent,
       rebasePreparedTransitionToUser,
+      reconcileNativeViewportMovement,
       setScrollStateNow,
       writeScrollTopNow,
     ],
@@ -1686,7 +1776,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       ) {
         return
       }
-      if (adoptUnclaimedNativeViewportMovement()) {
+      if (reconcileNativeViewportMovement() === 'adopted') {
         layoutCorrectionPendingRef.current = false
         return
       }
@@ -1716,7 +1806,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       layoutCorrectionPendingRef.current = false
     },
     [
-      adoptUnclaimedNativeViewportMovement,
+      reconcileNativeViewportMovement,
       completeOpenScrollIfReady,
       correctContinuityLease,
       debugScroll,
@@ -1784,6 +1874,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         return correctContinuityLease()
       },
       applyVirtualizerOffset(offset, adjustment = 0) {
+        reconcileNativeViewportMovement()
+        if (userScrollIntentRef.current && continuityLeaseRef.current === null) return
         writeScrollTopNow(offset + adjustment, 'virtualizer-layout')
         correctContinuityLease()
       },
@@ -1836,6 +1928,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       clearProgrammaticScrollIntents,
       correctContinuityLease,
       installContinuityLease,
+      reconcileNativeViewportMovement,
       setScrollStateNow,
       updateFromScrollPosition,
       writeScrollTopNow,

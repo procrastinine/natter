@@ -1,3 +1,11 @@
+A local-first LLM playground for people who want complete control over context, API parameters, providers, and conversation structure.
+
+Unlike most chat frontends, Natter treats the browser as part of the interface: chats, branches, and attachments have real URLs, navigation works with tabs/back/forward, data lives locally in IndexedDB; and nearly every part of the model context can be inspected and edited.
+
+[Try it →](https://procrastinine.github.io/natter/)
+
+![A demo conversation in Natter with reasoning and sampling controls open](docs/natter-playground.png)
+
 # Some motivation
 
 There are some relatively specific features that I could not get from other frontends, so I decided to build my own because it's easy with agents now anyways. Some gripes:

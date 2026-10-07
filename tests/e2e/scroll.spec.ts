@@ -205,6 +205,66 @@ test('streaming text keeps the scroll region in follow state; scrolling up flips
   await uiJourney.checkpoint(page, 'jump-to-latest-finished')
 })
 
+test('native scrolling after stream completion preserves movement across late layout', async ({
+  page,
+}) => {
+  const content = Array.from({ length: 80 }, (_, i) => `Completed paragraph ${i}.`).join('\n\n')
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'terminal-scroll', content, finish: 'stop' }]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'Fill the transcript')
+  await waitForAssistantGenerationFinished(page, await firstChatId(page))
+  const region = page.locator('[data-ui="scroll-region"]')
+  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+  await region.evaluate((element) => {
+    const list = element.querySelector<HTMLElement>('[data-ui="message-list"]')
+    const paragraph = list?.querySelector<HTMLElement>('[data-role="assistant"] p:last-child')
+    if (!list || !paragraph) throw new Error('Missing terminal scroll fixture')
+    let gestureTop: number | null = null
+    let sample: { nativeTop: number; paragraphTop: number } | null = null
+    element.addEventListener(
+      'wheel',
+      () => {
+        gestureTop = element.scrollTop
+      },
+      { once: true },
+    )
+    const beforeScroll = (event: Event) => {
+      if (event.target !== element || gestureTop === null || element.scrollTop >= gestureTop) return
+      document.removeEventListener('scroll', beforeScroll, true)
+      sample = { nativeTop: element.scrollTop, paragraphTop: paragraph.getBoundingClientRect().top }
+      const growth = document.createElement('div')
+      growth.style.height = '40px'
+      list.prepend(growth)
+    }
+    document.addEventListener('scroll', beforeScroll, true)
+    const afterScroll = () => {
+      if (!sample) return
+      element.removeEventListener('scroll', afterScroll)
+      element.dataset.nativeScrollSample = JSON.stringify({
+        expectedTop: sample.nativeTop + 40,
+        actualTop: element.scrollTop,
+        expectedParagraphTop: sample.paragraphTop,
+        actualParagraphTop: paragraph.getBoundingClientRect().top,
+      })
+    }
+    element.addEventListener('scroll', afterScroll)
+  })
+  await region.hover()
+  await page.mouse.wheel(0, -20)
+  await expect(region).toHaveAttribute('data-native-scroll-sample', /actualTop/u)
+  const sample = JSON.parse((await region.getAttribute('data-native-scroll-sample')) ?? '{}') as {
+    actualTop: number
+    expectedTop: number
+    actualParagraphTop: number
+    expectedParagraphTop: number
+  }
+  expect(Math.abs(sample.actualTop - sample.expectedTop)).toBeLessThanOrEqual(0.5)
+  expect(Math.abs(sample.actualParagraphTop - sample.expectedParagraphTop)).toBeLessThanOrEqual(0.5)
+  await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+})
+
 test('near-bottom scrolling has one stable Jump state and exact bottom clears it', async ({
   page,
 }) => {
