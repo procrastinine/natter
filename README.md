@@ -1,6 +1,8 @@
-A local-first LLM playground for people who want complete control over context, API parameters, providers, and conversation structure.
+# Natter
 
-Unlike most chat frontends, Natter treats the browser as part of the interface: chats, branches, and attachments have real URLs, navigation works with tabs/back/forward, data lives locally in IndexedDB; and nearly every part of the model context can be inspected and edited.
+Natter is an LLM "playground" that gives the user many tools for controlling the context, API parameters, providers, and conversation structure. I built it explicitly for raw input -> output you can inspect with convenient controls (for me) for viewing and editing everything I want.
+
+Natter is unlike most frontends in that it actually uses what browsers were developed for, which is navigation. For example, chats, branches, and attachments are navigable with URLs and the usual tabs/back/foward/middle click, the storage is local IndexedDB (so no server, static page, information stays private), etc. This makes it easier to compare LLM outputs under the same conditions, and it's just a lot more convenient to have as many views as you want...
 
 [Try it →](https://procrastinine.github.io/natter/)
 
